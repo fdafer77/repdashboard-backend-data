@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: taxrefresh-backend
+    runtime: node
+    plan: starter
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: DATABASE_URL
+        fromDatabase:
+          name: taxrefresh-postgres
+          property: connectionString
+      - key: DB_SSL
+        value: "1"
+      - key: CLIENT_ORIGIN
+        value: https://taxrefreshdashboard.com,https://taxrefresh-auth.com,https://secure.taxrefresh.us
+      - key: PUBLIC_BASE_URL
+        value: https://secure.taxrefresh.us
+      - key: EXPERIENCE_BASE_URL
+        value: https://secure.taxrefresh.us
+      - key: BOLDSIGN_8821_PDF_PATH
+        value: ./assets/f8821.pdf
+
+databases:
+  - name: taxrefresh-postgres
+    databaseName: taxrefresh
+    user: taxrefresh
