@@ -1450,7 +1450,9 @@ function buildConsultationSummary(record) {
   const directLiability = toNumberValue(
     getPrimaryAnswer(answers, ['taxLiability', 'tax_liability', 'totalLiability', 'total_liability', 'ghl_opportunity_value']),
   )
-  const updatedAtRaw = Number(state?.updatedAt || 0) || (record?.updatedAt ? new Date(record.updatedAt).getTime() : 0)
+  const stateUpdatedAt = Number(state?.updatedAt || 0)
+  const recordUpdatedAt = record?.updatedAt ? new Date(record.updatedAt).getTime() : 0
+  const updatedAtRaw = Math.max(stateUpdatedAt, recordUpdatedAt)
   const createdAtRaw = record?.createdAt ? new Date(record.createdAt).getTime() : 0
   const clientName = getPrimaryAnswer(answers, ['full_name', 'name']) || 'Unnamed client'
   const email = getPrimaryAnswer(answers, ['email', 'email_address'])
@@ -1930,7 +1932,7 @@ function getAnswerSsnLast4(answers = {}) {
 }
 
 async function listConsultationRecords({ search = '', limit = 100 } = {}) {
-  const normalizedLimit = Math.max(1, Math.min(250, Number(limit) || 100))
+  const normalizedLimit = Math.max(1, Math.min(1000, Number(limit) || 100))
   if (pool) {
     const like = `%${String(search || '').trim()}%`
     const hasSearch = Boolean(String(search || '').trim())
