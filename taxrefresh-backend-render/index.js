@@ -734,6 +734,7 @@ function getUpdatedExperienceBaseUrl(fallback = '') {
   if (!base) return ''
   try {
     const url = new URL(base)
+    if (url.hostname === 'taxrefreshdashboard.com') return 'https://secure.taxrefresh.us'
     if (url.port === '4173') url.port = '5173'
     return url.origin
   } catch {
@@ -2691,27 +2692,22 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     const logEntries = []
 
     if (documentType === '8821 Document') {
-      const directSigning = await createBoldsign8821SigningLink({
-        sessionCode: roomCode,
-        signerName: clientName,
-        signerEmail: resolvedRecipientEmail,
-        onBehalfOf: String(req.adminUser?.email || '').trim(),
-        persistDocument: true,
-      })
-      if (!directSigning.signingUrl) return res.status(400).json({ error: 'A direct signing link is not available for this document yet.' })
+      if (!links.form8821ClientLink) {
+        return res.status(400).json({ error: 'A custom signing link is not available for this document yet.' })
+      }
       await sendGhlEmailMessage({
         contactId,
         emailTo: resolvedRecipientEmail,
         subject: 'TaxRefresh Signature Request',
-        message: `Open and sign your TaxRefresh Form 8821: ${directSigning.signingUrl}`,
-        html: build8821EmailHtml({ clientName, signingLink: directSigning.signingUrl }),
+        message: `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
+        html: build8821EmailHtml({ clientName, signingLink: links.form8821ClientLink }),
       })
       nextReceipts.push({ name: '8821 Document', status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_client`,
         documentType: '8821 Document',
         recipientEmail: resolvedRecipientEmail,
-        link: directSigning.signingUrl,
+        link: links.form8821ClientLink,
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
@@ -2780,7 +2776,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       ok: true,
       item: refreshedItem,
       sentAt,
-      link: documentType === '8821 Document' ? logEntries[0]?.link || '' : links.clientPortalLink,
+      link: documentType === '8821 Document' ? links.form8821ClientLink : links.clientPortalLink,
       spouseLink: documentType === '8821 Document' && spouseRecipientEmail ? links.form8821SpouseLink : '',
     })
   } catch (error) {
