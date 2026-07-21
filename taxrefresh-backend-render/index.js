@@ -326,6 +326,36 @@ function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
   answers.ea_documents = [documentRecord, ...nextDocuments]
 }
 
+function appendDocumentDeliveryLogEntry(answers = {}, entry = null) {
+  if (!entry || typeof entry.name !== 'string' || !entry.name.trim()) return
+  const current = Array.isArray(answers?.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers?.document_delivery_log, [])
+  answers.document_delivery_log = [entry, ...(Array.isArray(current) ? current : [])]
+}
+
+function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
+  const normalizedNextRoute = String(nextRoute || '').trim()
+  const normalizedPreviousRoute = String(previousRoute || '').trim()
+  if (!normalizedNextRoute || normalizedNextRoute === normalizedPreviousRoute) return false
+  if (normalizedNextRoute !== '/session/sign-form-8821' && normalizedNextRoute !== '/session/sign-form-8821-spouse') return false
+
+  const answers = room?.state?.answers || {}
+  const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  const sentAt = new Date().toISOString()
+  appendDocumentDeliveryLogEntry(answers, {
+    id: `doc_experience_${Date.now().toString(36)}_${normalizedNextRoute.endsWith('-spouse') ? 'spouse' : 'client'}`,
+    name: normalizedNextRoute.endsWith('-spouse') ? '8821 Spouse' : '8821 Document',
+    status: 'Sent',
+    method: 'Experience',
+    sentAt,
+    recipientEmail,
+    sentBy: '',
+    route: normalizedNextRoute,
+    sessionCode: roomCode,
+  })
+  answers.last_document_experience_sent_at = sentAt
+  return true
+}
+
 async function loadSigned8821DocumentPayload(roomCode, room) {
   const answers = room?.state?.answers || {}
   const savedDocument = getSigned8821DocumentRecord(answers)
@@ -2861,6 +2891,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     await ensureGhlContactEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
 
     const documentEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
+    const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
     const hiddenDocumentReceiptNames = (
       Array.isArray(answers.hidden_document_receipt_names)
         ? answers.hidden_document_receipt_names
@@ -2869,6 +2900,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     const sentAt = new Date().toISOString()
     const nextReceipts = []
     const logEntries = []
+    const deliveryEntries = []
 
     if (documentType === '8821 Document') {
       if (!links.form8821ClientLink) {
@@ -2890,6 +2922,15 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
+      deliveryEntries.push({
+        id: `doc_delivery_${Date.now().toString(36)}_client`,
+        name: '8821 Document',
+        status: 'Sent',
+        method: 'Email',
+        sentAt,
+        recipientEmail: resolvedRecipientEmail,
+        sentBy: String(req.adminUser?.email || '').trim(),
+      })
 
       if (isMarriedJointFilingAnswers(answers) && spouseRecipientEmail) {
         await sendGhlEmailMessage({
@@ -2906,6 +2947,15 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
           recipientEmail: spouseRecipientEmail,
           link: links.form8821SpouseLink,
           sentAt,
+          sentBy: String(req.adminUser?.email || '').trim(),
+        })
+        deliveryEntries.push({
+          id: `doc_delivery_${Date.now().toString(36)}_spouse`,
+          name: '8821 Spouse',
+          status: 'Sent',
+          method: 'Email',
+          sentAt,
+          recipientEmail: spouseRecipientEmail,
           sentBy: String(req.adminUser?.email || '').trim(),
         })
       }
@@ -2931,12 +2981,22 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
+      deliveryEntries.push({
+        id: `doc_delivery_${Date.now().toString(36)}_resolution`,
+        name: 'Resolution Documents',
+        status: 'Sent',
+        method: 'Email',
+        sentAt,
+        recipientEmail: resolvedRecipientEmail,
+        sentBy: String(req.adminUser?.email || '').trim(),
+      })
     }
 
     const resentNames = new Set(nextReceipts.map((receipt) => String(receipt?.name || '').trim()).filter(Boolean))
     answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, nextReceipts)
     answers.hidden_document_receipt_names = hiddenDocumentReceiptNames.filter((name) => !resentNames.has(String(name || '').trim()))
     answers.document_email_log = [...logEntries, ...(Array.isArray(documentEmailLog) ? documentEmailLog : [])]
+    answers.document_delivery_log = [...deliveryEntries, ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])]
     answers.last_document_email_sent_at = sentAt
     room.state.updatedAt = Date.now()
 
@@ -2944,6 +3004,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
       { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
       { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
+      { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
       { type: 'setAnswer', questionId: 'last_document_email_sent_at', value: sentAt },
       ...(documentType === '8821 Document'
         ? [{ type: 'setAnswer', questionId: 'onboarding_status', value: answers.onboarding_status }]
@@ -3897,7 +3958,9 @@ io.on('connection', (socket) => {
     }
 
     if (patch?.type === 'setRoute' && typeof patch.route === 'string') {
+      const previousRoute = String(room.state.route || '').trim()
       room.state.route = patch.route.slice(0, 500)
+      maybeTrackExperienceDocumentRoute(roomCode, room, room.state.route, previousRoute)
       room.state.updatedAt = Date.now()
     }
 
