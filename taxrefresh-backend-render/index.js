@@ -785,8 +785,8 @@ function buildExternalDocumentLinks(roomCode, room, baseUrl = '') {
   return {
     experienceBase,
     clientPortalLink: buildClientPortalLoginLink(roomCode, room) || portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
-    form8821ClientLink: experienceBase ? `${experienceBase}/session/sign-form-8821?session=${encodeURIComponent(roomCode)}&direct=1` : '',
-    form8821SpouseLink: experienceBase ? `${experienceBase}/session/sign-form-8821-spouse?session=${encodeURIComponent(roomCode)}&direct=1` : '',
+    form8821ClientLink: experienceBase ? `${experienceBase}/session/sign-form-8821?session=${encodeURIComponent(roomCode)}&document=1` : '',
+    form8821SpouseLink: experienceBase ? `${experienceBase}/session/sign-form-8821-spouse?session=${encodeURIComponent(roomCode)}&document=1` : '',
   }
 }
 
