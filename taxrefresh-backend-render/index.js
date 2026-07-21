@@ -804,7 +804,7 @@ async function sendGhlEmailMessage({ contactId, emailTo, subject, html, message 
       subject: String(subject || '').trim(),
       html: String(html || '').trim(),
       message: String(message || '').trim(),
-      status: 'pending',
+      status: 'delivered',
     },
   })
 }
