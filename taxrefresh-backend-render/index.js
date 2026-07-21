@@ -2681,6 +2681,11 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     await ensureGhlContactEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
 
     const documentEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
+    const hiddenDocumentReceiptNames = (
+      Array.isArray(answers.hidden_document_receipt_names)
+        ? answers.hidden_document_receipt_names
+        : parseStoredObject(answers.hidden_document_receipt_names, [])
+    ).filter((name) => typeof name === 'string' && name.trim())
     const sentAt = new Date().toISOString()
     const nextReceipts = []
     const logEntries = []
@@ -2753,13 +2758,16 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       })
     }
 
+    const resentNames = new Set(nextReceipts.map((receipt) => String(receipt?.name || '').trim()).filter(Boolean))
     answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, nextReceipts)
+    answers.hidden_document_receipt_names = hiddenDocumentReceiptNames.filter((name) => !resentNames.has(String(name || '').trim()))
     answers.document_email_log = [...logEntries, ...(Array.isArray(documentEmailLog) ? documentEmailLog : [])]
     answers.last_document_email_sent_at = sentAt
     room.state.updatedAt = Date.now()
 
     await persistRoomState(roomCode, room, [
       { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
+      { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
       { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
       { type: 'setAnswer', questionId: 'last_document_email_sent_at', value: sentAt },
       ...(documentType === '8821 Document'
