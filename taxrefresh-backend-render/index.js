@@ -602,6 +602,12 @@ function getLifecycleLabel(item = {}) {
   return 'Active Prospect'
 }
 
+function isPortalAuthorizedForAnswers(answers = {}) {
+  const onboardingStatus = String(answers?.onboarding_status || '').trim().toLowerCase()
+  if (onboardingStatus === 'documents_signed') return true
+  return isForm8821FullySigned(answers)
+}
+
 function formatMonthLabel(monthKey = '') {
   if (!/^\d{4}-\d{2}$/.test(monthKey)) return monthKey
   const [year, month] = monthKey.split('-')
@@ -741,9 +747,28 @@ function makePortalLinks(contactId, code, baseUrl = '', opportunityId = '') {
   const oppPart = opportunityId ? `&opportunityId=${encodeURIComponent(opportunityId)}` : ''
   return {
     repLink: contactId ? `${base}/${encodeURIComponent(contactId)}/ti-rep?session=${encodeURIComponent(code)}${oppPart}` : '',
-    clientLink: `${base}/rep/session/${encodeURIComponent(code)}`,
+    clientLink: buildClientPortalLoginLink(code, { contactId, opportunityId, state: { answers: {} } }),
     signingLink: contactId ? `${base}/${encodeURIComponent(contactId)}/signing${opportunityId ? `?opportunityId=${encodeURIComponent(opportunityId)}` : ''}` : '',
   }
+}
+
+function getClientPortalBaseUrl() {
+  return String(process.env.CLIENT_PORTAL_BASE_URL || 'https://taxrefresh-auth.com').trim().replace(/\/+$/, '')
+}
+
+function buildClientPortalLoginLink(roomCode, room = null) {
+  const base = getClientPortalBaseUrl()
+  if (!base) return ''
+  const url = new URL(base)
+  const answers = room?.state?.answers || {}
+  const email = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  const contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
+  const opportunityId = String(room?.opportunityId || answers.ghl_opportunity_id || '').trim()
+  if (email) url.searchParams.set('email', email)
+  if (roomCode) url.searchParams.set('session', String(roomCode).trim())
+  if (contactId) url.searchParams.set('contactId', contactId)
+  if (opportunityId) url.searchParams.set('opportunityId', opportunityId)
+  return url.toString()
 }
 
 function isValidEmailAddress(value = '') {
@@ -758,7 +783,7 @@ function buildExternalDocumentLinks(roomCode, room, baseUrl = '') {
   const portalLinks = makePortalLinks(contactId, roomCode, baseUrl, opportunityId)
   return {
     experienceBase,
-    clientPortalLink: portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
+    clientPortalLink: buildClientPortalLoginLink(roomCode, room) || portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
     form8821ClientLink: experienceBase ? `${experienceBase}/session/sign-form-8821?session=${encodeURIComponent(roomCode)}` : '',
     form8821SpouseLink: experienceBase ? `${experienceBase}/session/sign-form-8821-spouse?session=${encodeURIComponent(roomCode)}` : '',
   }
@@ -2714,7 +2739,15 @@ app.post('/api/client-portal/check-email', (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase()
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email is required.' })
     const row = await findLatestSessionByEmail(email)
-    return res.json({ exists: Boolean(row) })
+    const answers = row?.state?.answers || {}
+    const authorized = Boolean(row?.session_code) && isPortalAuthorizedForAnswers(answers)
+    return res.json({
+      exists: Boolean(row),
+      authorized,
+      message: authorized
+        ? ''
+        : 'Your client portal access will unlock after your signed Form 8821 authorization is received.',
+    })
   })().catch((error) => res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to check email' }))
 })
 
@@ -2729,6 +2762,11 @@ app.post('/api/client-portal/auth', (req, res) => {
     if (!row?.session_code) return res.status(404).json({ error: 'No client portal record found for that email.' })
 
     const answers = row?.state?.answers || {}
+    if (!isPortalAuthorizedForAnswers(answers)) {
+      return res
+        .status(403)
+        .json({ error: 'Your client portal access will unlock after your signed Form 8821 authorization is received.' })
+    }
     const storedLast4 = getAnswerSsnLast4(answers)
     if (storedLast4 && storedLast4 !== ssn4) {
       return res.status(401).json({ error: "We couldn't verify your account with that SSN. Please try again or contact support for help signing in." })
