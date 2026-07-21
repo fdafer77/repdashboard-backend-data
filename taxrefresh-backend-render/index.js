@@ -1143,9 +1143,9 @@ async function ghlFetch(path, { method = 'GET', version = 'v3', query, body } = 
   })
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
+    const rawMessage = data?.message
     const message =
-      data?.message?.[0] ||
-      data?.message ||
+      (Array.isArray(rawMessage) ? rawMessage[0] : rawMessage) ||
       data?.error ||
       `GHL request failed (${response.status})`
     throw new Error(message)
