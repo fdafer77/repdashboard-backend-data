@@ -1078,6 +1078,99 @@ async function loadBoldsign8821PdfDataUri() {
   return `data:application/pdf;base64,${file.toString('base64')}`
 }
 
+async function createBoldsign8821SigningLink({
+  sessionCode,
+  signerName,
+  signerEmail,
+  returnUrl = '',
+  onBehalfOf = '',
+  persistDocument = true,
+} = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) throw new Error('sessionCode is required')
+
+  const roomState = await getSessionStateForCode(normalizedSessionCode)
+  if (!roomState) throw new Error('Session not found')
+
+  const answers = roomState.answers || {}
+  const resolvedSignerName = String(
+    signerName || getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client',
+  ).trim()
+  const resolvedSignerEmail = String(
+    signerEmail || getPrimaryAnswer(answers, ['email', 'email_address']) || '',
+  ).trim()
+  if (!resolvedSignerEmail) throw new Error('A client email is required before launching Form 8821 signing.')
+
+  let resolvedReturnUrl = String(returnUrl || '').trim()
+  if (!resolvedReturnUrl) {
+    const base = safeOrigin(PUBLIC_BASE_URL) || safeOrigin(CLIENT_ORIGIN.split(',')[0]) || ''
+    if (!base) throw new Error('A valid returnUrl is required.')
+    resolvedReturnUrl = `${base}/session/preparing-documents?session=${encodeURIComponent(normalizedSessionCode)}&boldsign=complete`
+  }
+
+  const pdfDataUri = await loadBoldsign8821PdfDataUri()
+  const sendResult = await boldsignFetch('v1/document/send', {
+    method: 'POST',
+    body: {
+      Title: 'Form 8821 - Tax Information Authorization',
+      Message: '',
+      DisableEmails: true,
+      AutoDetectFields: true,
+      EnableEmbeddedSigning: true,
+      UseTextTags: false,
+      Files: [
+        {
+          base64: pdfDataUri,
+          fileName: 'Taxrefresh Form 8821.pdf',
+        },
+      ],
+      Signers: [
+        {
+          Name: resolvedSignerName,
+          EmailAddress: resolvedSignerEmail,
+          SignerType: 'Signer',
+          Locale: 'EN',
+        },
+      ],
+    },
+  })
+
+  const documentId = String(sendResult?.documentId || '').trim()
+  if (!documentId) throw new Error('BoldSign did not return a documentId.')
+
+  if (persistDocument) {
+    const room = await ensureRoom(normalizedSessionCode)
+    room.state.answers.boldsign_8821_document_id = documentId
+    room.state.answers.boldsign_8821_file_name = 'TaxRefresh Form 8821.pdf'
+    room.state.answers.boldsign_8821_sent_at = new Date().toISOString()
+    room.state.answers.boldsign_8821_sender_email = String(onBehalfOf || '').trim()
+    room.state.updatedAt = Date.now()
+    io.to(normalizedSessionCode).emit('room_state', room.state)
+    try {
+      await dbUpsertSession({ code: normalizedSessionCode, state: room.state })
+    } catch {
+      // ignore; room state still updates in-memory
+    }
+  }
+
+  const embedded = await retry(
+    () =>
+      boldsignFetch('v1/document/getEmbeddedSignLink', {
+        query: {
+          documentId,
+          signerEmail: resolvedSignerEmail,
+          redirectUrl: resolvedReturnUrl,
+        },
+      }),
+    { attempts: 8, delayMs: 1500 },
+  )
+
+  return {
+    documentId,
+    signingUrl: embedded?.signLink || '',
+  }
+}
+
 async function retry(fn, { attempts = 8, delayMs = 1200 } = {}) {
   let lastError = null
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -2593,22 +2686,27 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     const logEntries = []
 
     if (documentType === '8821 Document') {
-      if (!links.form8821ClientLink) {
-        return res.status(400).json({ error: 'A public signing link is not available for this document yet.' })
-      }
+      const directSigning = await createBoldsign8821SigningLink({
+        sessionCode: roomCode,
+        signerName: clientName,
+        signerEmail: resolvedRecipientEmail,
+        onBehalfOf: String(req.adminUser?.email || '').trim(),
+        persistDocument: true,
+      })
+      if (!directSigning.signingUrl) return res.status(400).json({ error: 'A direct signing link is not available for this document yet.' })
       await sendGhlEmailMessage({
         contactId,
         emailTo: resolvedRecipientEmail,
-        subject: 'TaxRefresh Form 8821 ready for signature',
-        message: `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
-        html: build8821EmailHtml({ clientName, signingLink: links.form8821ClientLink }),
+        subject: 'TaxRefresh Signature Request',
+        message: `Open and sign your TaxRefresh Form 8821: ${directSigning.signingUrl}`,
+        html: build8821EmailHtml({ clientName, signingLink: directSigning.signingUrl }),
       })
       nextReceipts.push({ name: '8821 Document', status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_client`,
         documentType: '8821 Document',
         recipientEmail: resolvedRecipientEmail,
-        link: links.form8821ClientLink,
+        link: directSigning.signingUrl,
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
@@ -2617,7 +2715,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         await sendGhlEmailMessage({
           contactId,
           emailTo: spouseRecipientEmail,
-          subject: 'TaxRefresh spouse Form 8821 ready for signature',
+          subject: 'TaxRefresh Signature Request',
           message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${links.form8821SpouseLink}`,
           html: build8821EmailHtml({ clientName: String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || 'Spouse'), signingLink: links.form8821SpouseLink }),
         })
@@ -2674,7 +2772,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       ok: true,
       item: refreshedItem,
       sentAt,
-      link: documentType === '8821 Document' ? links.form8821ClientLink : links.clientPortalLink,
+      link: documentType === '8821 Document' ? logEntries[0]?.link || '' : links.clientPortalLink,
       spouseLink: documentType === '8821 Document' && spouseRecipientEmail ? links.form8821SpouseLink : '',
     })
   } catch (error) {
@@ -2720,94 +2818,15 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
   try {
     const sessionCode = String(req.body?.sessionCode || '').trim()
     if (!sessionCode) return res.status(400).json({ error: 'sessionCode is required' })
-
-    const roomState = await getSessionStateForCode(sessionCode)
-    if (!roomState) return res.status(404).json({ error: 'Session not found' })
-
-    const answers = roomState.answers || {}
-    const signerName = String(
-      req.body?.name ||
-        getPrimaryAnswer(answers, ['full_name', 'name']) ||
-        'TaxRefresh Client',
-    ).trim()
-    const signerEmail = String(
-      req.body?.email ||
-        getPrimaryAnswer(answers, ['email', 'email_address']),
-    ).trim()
-    if (!signerEmail) {
-      return res.status(400).json({ error: 'A client email is required before launching Form 8821 signing.' })
-    }
-
-    const requestedReturnUrl = String(req.body?.returnUrl || '').trim()
-    let returnUrl = requestedReturnUrl
-    if (!returnUrl) {
-      const base = safeOrigin(PUBLIC_BASE_URL) || safeOrigin(CLIENT_ORIGIN.split(',')[0]) || safeOrigin(req.headers.origin || '')
-      if (!base) {
-        return res.status(400).json({ error: 'A valid returnUrl is required.' })
-      }
-      returnUrl = `${base}/session/preparing-documents?session=${encodeURIComponent(sessionCode)}&boldsign=complete`
-    }
-
-    const pdfDataUri = await loadBoldsign8821PdfDataUri()
-
-    const sendResult = await boldsignFetch('v1/document/send', {
-      method: 'POST',
-      body: {
-        Title: 'Form 8821 - Tax Information Authorization',
-        Message: '',
-        DisableEmails: true,
-        AutoDetectFields: true,
-        EnableEmbeddedSigning: true,
-        UseTextTags: false,
-        Files: [
-          {
-            base64: pdfDataUri,
-            fileName: 'Taxrefresh Form 8821.pdf',
-          },
-        ],
-        Signers: [
-          {
-            Name: signerName,
-            EmailAddress: signerEmail,
-            SignerType: 'Signer',
-            Locale: 'EN',
-          },
-        ],
-      },
+    const result = await createBoldsign8821SigningLink({
+      sessionCode,
+      signerName: String(req.body?.name || '').trim(),
+      signerEmail: String(req.body?.email || '').trim(),
+      returnUrl: String(req.body?.returnUrl || '').trim(),
+      onBehalfOf: String(req.body?.onBehalfOf || '').trim(),
+      persistDocument: true,
     })
-
-    const documentId = String(sendResult?.documentId || '').trim()
-    if (!documentId) throw new Error('BoldSign did not return a documentId.')
-
-    const room = await ensureRoom(sessionCode)
-    room.state.answers.boldsign_8821_document_id = documentId
-    room.state.answers.boldsign_8821_file_name = 'TaxRefresh Form 8821.pdf'
-    room.state.answers.boldsign_8821_sent_at = new Date().toISOString()
-    room.state.answers.boldsign_8821_sender_email = String(req.body?.onBehalfOf || '').trim()
-    room.state.updatedAt = Date.now()
-    io.to(sessionCode).emit('room_state', room.state)
-    try {
-      await dbUpsertSession({ code: sessionCode, state: room.state })
-    } catch {
-      // ignore; room state still updates in-memory
-    }
-
-    const embedded = await retry(
-      () =>
-        boldsignFetch('v1/document/getEmbeddedSignLink', {
-          query: {
-            documentId,
-            signerEmail,
-            redirectUrl: returnUrl,
-          },
-        }),
-      { attempts: 8, delayMs: 1500 },
-    )
-
-    return res.json({
-      documentId,
-      signingUrl: embedded?.signLink,
-    })
+    return res.json(result)
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('BoldSign 8821 recipient view failed:', error)
