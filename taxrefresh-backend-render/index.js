@@ -1371,6 +1371,23 @@ async function createGhlContactForEmail({ email = '', name = '', phone = '' } = 
   return { id, contact }
 }
 
+async function ensureGhlContactEmail({ contactId = '', email = '', name = '', phone = '' } = {}) {
+  const normalizedContactId = String(contactId || '').trim()
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+  if (!normalizedContactId) throw new Error('A CRM contact id is required before updating contact email.')
+  if (!normalizedEmail || !normalizedEmail.includes('@')) throw new Error('A valid recipient email is required before updating contact email.')
+  await ghlFetch(`contacts/${encodeURIComponent(normalizedContactId)}`, {
+    method: 'PUT',
+    version: 'v3',
+    body: {
+      email: normalizedEmail,
+      name: String(name || '').trim() || undefined,
+      phone: String(phone || '').trim() || undefined,
+      source: 'taxrefresh-dashboard',
+    },
+  })
+}
+
 async function fetchAllGhlOpportunities() {
   if (!hasDirectGhlConfig()) {
     throw new Error('Direct GHL API sync is not configured. Set GHL_API_BASE_URL, GHL_PRIVATE_INTEGRATION_TOKEN, and GHL_LOCATION_ID.')
@@ -2554,9 +2571,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     }
     const links = buildExternalDocumentLinks(roomCode, room, baseUrl)
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
+    const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
     let contactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
     if (!contactId) {
-      const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
       const created = await createGhlContactForEmail({ email: resolvedRecipientEmail, name: clientName, phone })
       contactId = created.id
       room.contactId = contactId
@@ -2568,6 +2585,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         // ignore; state still updates in-memory
       }
     }
+    await ensureGhlContactEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
 
     const documentEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
     const sentAt = new Date().toISOString()
