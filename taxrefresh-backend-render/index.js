@@ -816,16 +816,148 @@ function upsertDocumentReceipts(existingReceipts, nextReceipts) {
   return [...nextReceipts, ...remaining]
 }
 
+function escapeHtml(value = '') {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function getClientFirstName(value = '') {
+  const safeValue = String(value || '').trim()
+  if (!safeValue) return 'Client'
+  return safeValue.split(/\s+/)[0] || 'Client'
+}
+
 function build8821EmailHtml({ clientName, signingLink }) {
-  const safeName = String(clientName || 'Client').trim() || 'Client'
+  const safeName = escapeHtml(getClientFirstName(clientName))
   const safeLink = String(signingLink || '').trim()
-  return [
-    `<p>Hi ${safeName},</p>`,
-    '<p>Your TaxRefresh Form 8821 is ready for signature.</p>',
-    `<p><a href="${safeLink}" style="display:inline-block;padding:12px 18px;border-radius:8px;background:#111827;color:#ffffff;text-decoration:none;font-weight:600;">Open and Sign Form 8821</a></p>`,
-    `<p>If the button does not work, copy and paste this secure link into your browser:<br /><a href="${safeLink}">${safeLink}</a></p>`,
-    '<p>Thank you,<br />TaxRefresh</p>',
-  ].join('')
+  const safeHref = escapeHtml(safeLink || '#')
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TaxRefresh Form 8821 and Service Agreement</title>
+  </head>
+  <body style="margin:0; padding:0; background:#eef3f9; font-family:Arial, Helvetica, sans-serif; color:#182235;">
+    <div style="display:none; max-height:0; overflow:hidden; opacity:0;">
+      Your TaxRefresh Form 8821 and Service Agreement are ready for review and signature.
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#eef3f9; padding:28px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:660px; background:#ffffff; border-radius:24px; overflow:hidden; box-shadow:0 16px 46px rgba(15, 23, 42, 0.10);">
+            <tr>
+              <td style="background:linear-gradient(135deg, #d9ebff 0%, #b9d8ff 100%); padding:14px 38px 8px 38px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                  <tr>
+                    <td align="center">
+                      <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+                        <tr>
+                          <td align="center">
+                            <img
+                              src="https://secure.taxrefresh.us/taxrefreshlogo.png"
+                              alt="TaxRefresh"
+                              width="290"
+                              style="display:block; width:290px; max-width:100%; height:auto; border:0;"
+                            />
+                          </td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px 38px 22px 38px;">
+                <div style="text-align:center; margin:0 0 24px 0;">
+                  <div style="display:inline-block; padding:8px 16px; border-radius:999px; background:#eef6ff; color:#1d5fd1; font-size:12px; font-weight:800; letter-spacing:0.55px; text-transform:uppercase; box-shadow:0 8px 18px rgba(29,95,209,0.08);">
+                    Signature needed
+                  </div>
+                  <h1 style="margin:16px auto 14px auto; max-width:520px; font-size:34px; line-height:1.15; color:#182235; font-weight:800;">
+                    Your documents are ready for review
+                  </h1>
+                  <p style="margin:0 auto 12px auto; max-width:560px; font-size:17px; line-height:1.75; color:#4c5b74;">
+                    Hello <strong style="color:#182235;">${safeName}</strong>,
+                  </p>
+                  <p style="margin:0 auto; max-width:580px; font-size:17px; line-height:1.75; color:#4c5b74;">
+                    Your TaxRefresh <strong style="color:#182235;">Form 8821</strong> and <strong style="color:#182235;">Service Agreement</strong> are now ready for review and signature. These documents allow us to move forward with your case and confirm the authorization and service terms needed to begin.
+                  </p>
+                </div>
+                <div style="margin:30px 0 26px 0; padding:24px 24px 18px 24px; border-radius:18px; background:#f8fbff; border:1px solid #e2ebf7;">
+                  <div style="font-size:15px; font-weight:800; color:#1c3158; margin-bottom:14px; letter-spacing:0.15px;">
+                    What to do next
+                  </div>
+                  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:separate; border-spacing:0 10px;">
+                    <tr>
+                      <td valign="top" style="width:28px; font-size:14px; line-height:1.7; color:#1d5fd1; font-weight:800;">1</td>
+                      <td valign="top" style="font-size:15px; line-height:1.75; color:#4d5b74; font-weight:500;">
+                        Review the Form 8821 and Service Agreement
+                      </td>
+                    </tr>
+                    <tr>
+                      <td valign="top" style="width:28px; font-size:14px; line-height:1.7; color:#1d5fd1; font-weight:800;">2</td>
+                      <td valign="top" style="font-size:15px; line-height:1.75; color:#4d5b74; font-weight:500;">
+                        Sign where prompted in the secure signing flow
+                      </td>
+                    </tr>
+                    <tr>
+                      <td valign="top" style="width:28px; font-size:14px; line-height:1.7; color:#1d5fd1; font-weight:800;">3</td>
+                      <td valign="top" style="font-size:15px; line-height:1.75; color:#4d5b74; font-weight:500;">
+                        Submit it so TaxRefresh can continue working on your file
+                      </td>
+                    </tr>
+                  </table>
+                </div>
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 28px auto;">
+                  <tr>
+                    <td align="center" style="border-radius:14px; background:#1d5fd1; box-shadow:0 8px 18px rgba(29, 95, 209, 0.18);">
+                      <a
+                        href="${safeHref}"
+                        style="display:inline-block; padding:16px 28px; border-radius:14px; color:#ffffff; text-decoration:none; font-size:15px; font-weight:700; letter-spacing:0.15px;"
+                      >
+                        Review and Sign
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:6px 38px 30px 38px;">
+                <div style="height:1px; background:#e6edf6; margin:0 0 18px 0;"></div>
+                <p style="margin:0; font-size:15px; line-height:1.75; color:#4c5b74; text-align:center;">
+                  If you have any questions before signing, reply to this email and our team will help you.
+                </p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 38px 32px 38px;">
+                <div style="margin:0 0 18px 0; padding:18px 20px; border-top:1px solid #d8e1ee; border-bottom:1px solid #d8e1ee; background:#f8fafc; border-radius:14px;">
+                  <p style="margin:0 0 14px 0; font-size:12px; line-height:1.8; color:#5d6a7f;">
+                    <strong style="color:#182235;">Confidential Communication:</strong>
+                    This email and any documents attached may contain confidential and/or legally privileged information, and are for the sole use of the intended recipient named above. If you have received this email in error, please notify the sender and delete the electronic message. Any disclosure, copying, distribution, or use of the contents of the information received in error is strictly prohibited.
+                  </p>
+                  <p style="margin:0; font-size:12px; line-height:1.8; color:#5d6a7f;">
+                    <strong style="color:#182235;">IRS Circular 230 Disclosure:</strong>
+                    To ensure compliance with requirements imposed by the IRS, please be advised that any U.S. federal tax advice contained in this communication, including any attachments, is not intended or written to be used, and cannot be used or relied upon, for the purpose of avoiding penalties under the Internal Revenue Code or promoting, marketing, or recommending to another party any transaction or matter addressed here.
+                  </p>
+                </div>
+                <p style="margin:0; font-size:12px; line-height:1.7; color:#8a97ad; text-align:center;">
+                  TaxRefresh | 949-390-6350 | <a href="https://taxrefresh.us" style="color:#1d5fd1; text-decoration:none;">taxrefresh.us</a>
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`
 }
 
 function buildResolutionEmailHtml({ clientName, portalLink }) {
