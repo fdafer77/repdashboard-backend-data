@@ -311,7 +311,7 @@ function dataUrlToBuffer(dataUrl = '') {
 function getSaved8821Filename(answers = {}) {
   const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'client').trim()
   const safeClientName = clientName.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'client'
-  return `${safeClientName}-signed-8821.pdf`
+  return `${safeClientName}-signed-document.pdf`
 }
 
 function getSigned8821DocumentRecord(answers = {}) {
@@ -324,6 +324,30 @@ function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
   const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   const nextDocuments = Array.isArray(current) ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_form' && doc.category !== 'IRS Form 8821') : []
   answers.ea_documents = [documentRecord, ...nextDocuments]
+}
+
+async function loadSigned8821DocumentPayload(roomCode, room) {
+  const answers = room?.state?.answers || {}
+  const savedDocument = getSigned8821DocumentRecord(answers)
+  const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
+  if (savedPayload?.buffer?.length) {
+    return {
+      fileBuffer: savedPayload.buffer,
+      contentType: savedPayload.mimeType || 'application/pdf',
+      filename: getSaved8821Filename(answers),
+    }
+  }
+
+  const documentId = String(answers.boldsign_8821_document_id || '').trim()
+  if (!documentId) return null
+  const download = await boldsignDownloadDocument(documentId, {
+    onBehalfOf: String(answers.boldsign_8821_sender_email || '').trim() || undefined,
+  })
+  return {
+    fileBuffer: download.fileBuffer,
+    contentType: download.contentType || 'application/pdf',
+    filename: getSaved8821Filename(answers),
+  }
 }
 
 function get8821PdfValues(answers = {}) {
@@ -531,6 +555,9 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   } catch {
     // ignore; state still updates in-memory
   }
+  void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+    console.error('Signed 8821 client email failed:', error)
+  })
   return true
 }
 
@@ -959,6 +986,133 @@ function build8821EmailHtml({ clientName, signingLink }) {
     </table>
   </body>
 </html>`
+}
+
+function buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }) {
+  const safeName = escapeHtml(getClientFirstName(clientName))
+  const safeLink = String(downloadLink || '').trim()
+  const safeHref = escapeHtml(safeLink || '#')
+  const safePortalLink = String(portalLink || '').trim()
+  const safePortalHref = escapeHtml(safePortalLink || '#')
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Your signed TaxRefresh Form 8821 copy</title>
+  </head>
+  <body style="margin:0; padding:0; background:#eef3f9; font-family:Arial, Helvetica, sans-serif; color:#182235;">
+    <div style="display:none; max-height:0; overflow:hidden; opacity:0;">
+      Your signed TaxRefresh Form 8821 copy is ready to download.
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#eef3f9; padding:28px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:660px; background:#ffffff; border-radius:24px; overflow:hidden; box-shadow:0 16px 46px rgba(15, 23, 42, 0.10);">
+            <tr>
+              <td style="background:linear-gradient(135deg, #d9ebff 0%, #b9d8ff 100%); padding:14px 38px 8px 38px; text-align:center;">
+                <img
+                  src="https://secure.taxrefresh.us/taxrefreshlogo.png"
+                  alt="TaxRefresh"
+                  width="290"
+                  style="display:block; width:290px; max-width:100%; height:auto; border:0; margin:0 auto;"
+                />
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px 38px 34px 38px;">
+                <div style="text-align:center; margin:0 0 24px 0;">
+                  <div style="display:inline-block; padding:8px 16px; border-radius:999px; background:#eef6ff; color:#1d5fd1; font-size:12px; font-weight:800; letter-spacing:0.55px; text-transform:uppercase;">
+                    Signed copy ready
+                  </div>
+                  <h1 style="margin:16px auto 14px auto; max-width:520px; font-size:32px; line-height:1.15; color:#182235; font-weight:800;">
+                    Your Signed Document is ready
+                  </h1>
+                  <p style="margin:0 auto 12px auto; max-width:560px; font-size:17px; line-height:1.75; color:#4c5b74;">
+                    Hello <strong style="color:#182235;">${safeName}</strong>,
+                  </p>
+                  <p style="margin:0 auto; max-width:580px; font-size:17px; line-height:1.75; color:#4c5b74;">
+                    We’ve attached your completed authorization to your record and made a copy available for you to download below.
+                  </p>
+                </div>
+                <div style="text-align:center; margin:30px 0 22px 0;">
+                  <a
+                    href="${safeHref}"
+                    style="display:inline-block; padding:16px 28px; border-radius:14px; background:#1d5fd1; color:#ffffff; text-decoration:none; font-size:16px; font-weight:800; letter-spacing:0.01em; box-shadow:0 10px 24px rgba(29,95,209,0.22);"
+                  >
+                    Download Document
+                  </a>
+                </div>
+                <div style="margin:0 auto; max-width:580px; text-align:center;">
+                  <p style="margin:0 0 12px 0; font-size:15px; line-height:1.75; color:#6a768c;">
+                    You can also view your documents anytime in your client portal.
+                  </p>
+                  <a
+                    href="${safePortalHref}"
+                    style="display:inline-block; padding:12px 22px; border-radius:12px; background:#eef6ff; border:1px solid #cfe0ff; color:#1d5fd1; text-decoration:none; font-size:15px; font-weight:800; letter-spacing:0.01em; box-shadow:0 6px 18px rgba(29,95,209,0.10);"
+                  >
+                    Open Client Portal
+                  </a>
+                </div>
+                <div style="margin:26px 0 0 0; padding:18px 20px; border-top:1px solid #d8e1ee; border-bottom:1px solid #d8e1ee; background:#f8fafc; border-radius:14px;">
+                  <p style="margin:0 0 10px 0; font-size:12px; line-height:1.8; color:#5d6a7f; text-align:left;">
+                    TaxRefresh works with IRS-authorized Enrolled Agent representation and secure document handling practices to help protect your tax information.
+                  </p>
+                  <p style="margin:0 0 12px 0; font-size:12px; line-height:1.8; color:#5d6a7f; text-align:left;">
+                    <strong style="color:#182235;">Confidential Communication:</strong>
+                    This email and any documents attached may contain confidential and/or legally privileged information, and are for the sole use of the intended recipient named above. If you have received this email in error, please notify the sender and delete the electronic message. Any disclosure, copying, distribution, or use of the contents of the information received in error is strictly prohibited.
+                  </p>
+                  <p style="margin:0; font-size:12px; line-height:1.8; color:#5d6a7f; text-align:left;">
+                    <strong style="color:#182235;">IRS Circular 230 Disclosure:</strong>
+                    To ensure compliance with requirements imposed by the IRS, please be advised that any U.S. federal tax advice contained in this communication, including any attachments, is not intended or written to be used, and cannot be used or relied upon, for the purpose of avoiding penalties under the Internal Revenue Code or promoting, marketing, or recommending to another party any transaction or matter addressed here.
+                  </p>
+                </div>
+                <p style="margin:16px 0 0 0; font-size:12px; line-height:1.7; color:#8a97ad; text-align:center;">
+                  TaxRefresh | 949-390-6350 | <a href="https://taxrefresh.us" style="color:#1d5fd1; text-decoration:none;">taxrefresh.us</a>
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`
+}
+
+async function sendSigned8821CopyEmail({ roomCode, room }) {
+  const answers = room?.state?.answers || {}
+  if (!isForm8821FullySigned(answers)) return false
+  if (String(answers.signed_8821_client_emailed_at || '').trim()) return false
+
+  const contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
+  const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  if (!contactId || !isValidEmailAddress(recipientEmail)) return false
+
+  const publicBase = safeOrigin(PUBLIC_BASE_URL) || safeOrigin(String(CLIENT_ORIGIN || '').split(',')[0]) || ''
+  if (!publicBase) return false
+
+  const downloadLink = `${publicBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
+  const portalLink = buildClientPortalLoginLink(roomCode, room)
+  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
+  await sendGhlEmailMessage({
+    contactId,
+    emailTo: recipientEmail,
+    subject: 'Your Signed TaxRefresh Document Copy',
+    message: `Your Signed TaxRefresh Document Copy is ready: ${downloadLink}`,
+    html: buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }),
+  })
+
+  answers.signed_8821_client_emailed_at = new Date().toISOString()
+  answers.signed_8821_client_emailed_to = recipientEmail
+  room.state.updatedAt = Date.now()
+  io.to(roomCode).emit('room_state', room.state)
+  try {
+    await dbUpsertSession({ code: roomCode, state: room.state })
+  } catch {
+    // ignore; room state still updates in-memory
+  }
+  return true
 }
 
 function buildResolutionEmailHtml({ clientName, portalLink }) {
@@ -2361,12 +2515,37 @@ app.get('/api/admin/consultations/:code/signed-8821', async (req, res) => {
     })
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'client').trim()
     const safeClientName = clientName.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'client'
-    const filename = `${safeClientName}-signed-8821.pdf`
+    const filename = `${safeClientName}-signed-document.pdf`
 
     res.setHeader('Content-Type', download.contentType || 'application/pdf')
     res.setHeader('Cache-Control', 'no-store')
     res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${filename}"`)
     return res.send(download.fileBuffer)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821.' })
+  }
+})
+
+app.get('/api/session/:code/signed-8821', async (req, res) => {
+  try {
+    const roomCode = String(req.params.code || '').toUpperCase().trim()
+    if (!roomCode) return res.status(400).json({ error: 'Session code is required.' })
+
+    const room = await ensureRoom(roomCode)
+    const answers = room?.state?.answers || {}
+    if (!isForm8821FullySigned(answers)) {
+      return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
+    }
+
+    const payload = await loadSigned8821DocumentPayload(roomCode, room)
+    if (!payload?.fileBuffer?.length) {
+      return res.status(404).json({ error: 'No signed Form 8821 document is available for this session yet.' })
+    }
+
+    res.setHeader('Content-Type', payload.contentType || 'application/pdf')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${payload.filename || 'signed-document.pdf'}"`)
+    return res.send(payload.fileBuffer)
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821.' })
   }
@@ -3029,6 +3208,9 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
     }
     void syncSessionToGhl({ roomCode, room, reason: 'form_8821_completed', force: true }).catch((error) => {
       console.error('GHL form 8821 completion sync failed:', error)
+    })
+    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+      console.error('Signed 8821 client email failed:', error)
     })
     return res.json({ ok: true })
   } catch (error) {
