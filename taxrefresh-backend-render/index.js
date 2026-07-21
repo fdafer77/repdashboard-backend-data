@@ -1970,6 +1970,7 @@ function buildConsultationDetail(record) {
   const state = record?.state || {}
   const answers = state?.answers || {}
   const summary = buildConsultationSummary(record)
+  const links = buildExternalDocumentLinks(summary.sessionCode, record)
   const answerEntries = Object.entries(answers)
     .filter(([key, value]) => !key.startsWith('_ui_') && value !== '' && value !== null && value !== undefined)
     .map(([key, value]) => ({ key, value }))
@@ -1977,6 +1978,7 @@ function buildConsultationDetail(record) {
   return {
     ...summary,
     answers,
+    links,
     answerEntries,
   }
 }
