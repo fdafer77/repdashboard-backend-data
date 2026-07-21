@@ -784,6 +784,15 @@ function getPublicBaseUrl(fallback = '') {
   return safeOrigin(PUBLIC_BASE_URL) || safeOrigin(String(CLIENT_ORIGIN || '').split(',')[0]) || safeOrigin(fallback) || ''
 }
 
+function getBackendBaseUrl(fallback = '') {
+  return (
+    safeOrigin(process.env.BACKEND_PUBLIC_BASE_URL || '') ||
+    safeOrigin(process.env.RENDER_EXTERNAL_URL || '') ||
+    safeOrigin(fallback) ||
+    ''
+  )
+}
+
 function getUpdatedExperienceBaseUrl(fallback = '') {
   const explicit = safeOrigin(EXPERIENCE_BASE_URL)
   if (explicit) return explicit
@@ -1119,10 +1128,10 @@ async function sendSigned8821CopyEmail({ roomCode, room }) {
   const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
   if (!contactId || !isValidEmailAddress(recipientEmail)) return false
 
-  const publicBase = safeOrigin(PUBLIC_BASE_URL) || safeOrigin(String(CLIENT_ORIGIN || '').split(',')[0]) || ''
-  if (!publicBase) return false
+  const backendBase = getBackendBaseUrl()
+  if (!backendBase) return false
 
-  const downloadLink = `${publicBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
+  const downloadLink = `${backendBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
   const portalLink = buildClientPortalLoginLink(roomCode, room)
   const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
   await sendGhlEmailMessage({
