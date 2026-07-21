@@ -598,9 +598,7 @@ function isTrainingLeadItem(item = {}) {
 
 function getLifecycleLabel(item = {}) {
   if (isTrainingLeadItem(item)) return 'Test Lead'
-  if (String(item.form8821Status || '').trim().toLowerCase() === 'completed') return 'Active Client'
-  const onboardingStatus = String(item.onboardingStatus || '').trim().toLowerCase()
-  if (onboardingStatus.includes('signed')) return 'Active Client'
+  if (Boolean(item.hasProcessedPayment)) return 'Active Client'
   return 'Active Prospect'
 }
 
@@ -1433,6 +1431,9 @@ function buildConsultationSummary(record) {
   const email = getPrimaryAnswer(answers, ['email', 'email_address'])
   const phone = getPrimaryAnswer(answers, ['phone', 'phone_number'])
   const liability = Math.max(0, irsBalance + stateBalance, directLiability)
+  const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
+  const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
+  const hasProcessedPayment = processedPaymentCount > 0
   return {
     sessionCode: String(record?.sessionCode || ''),
     contactId: String(record?.contactId || ''),
@@ -1463,6 +1464,8 @@ function buildConsultationSummary(record) {
     liability,
     irsBalance,
     stateBalance,
+    processedPaymentCount,
+    hasProcessedPayment,
     hasPlan: String(getPrimaryAnswer(answers, ['hasPlan', 'has_plan']) || ''),
     paymentPlanSelected: String(getPrimaryAnswer(answers, ['paymentPlanSelected', 'payment_plan_selected']) || ''),
     planPriceOverride: String(getPrimaryAnswer(answers, ['planPriceOverride', 'plan_price_override']) || ''),
