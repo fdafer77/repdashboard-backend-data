@@ -314,10 +314,22 @@ function getSaved8821Filename(answers = {}) {
   return `${safeClientName}-signed-document.pdf`
 }
 
+function getSaved8821FirstPageFilename(answers = {}) {
+  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'client').trim()
+  const safeClientName = clientName.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'client'
+  return `${safeClientName}-signed-8821-page-1.pdf`
+}
+
 function getSigned8821DocumentRecord(answers = {}) {
   const eaDocuments = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   if (!Array.isArray(eaDocuments)) return null
   return eaDocuments.find((doc) => doc && (doc.id === 'system_signed_8821_form' || doc.category === 'IRS Form 8821')) || null
+}
+
+function getSigned8821FirstPageDocumentRecord(answers = {}) {
+  const eaDocuments = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  if (!Array.isArray(eaDocuments)) return null
+  return eaDocuments.find((doc) => doc && (doc.id === 'system_signed_8821_first_page' || doc.category === 'IRS Form 8821 First Page')) || null
 }
 
 function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
@@ -326,9 +338,25 @@ function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
   answers.ea_documents = [documentRecord, ...nextDocuments]
 }
 
+function upsertSigned8821FirstPageDocumentRecord(answers = {}, documentRecord) {
+  const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  const nextDocuments = Array.isArray(current)
+    ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_first_page' && doc.category !== 'IRS Form 8821 First Page')
+    : []
+  answers.ea_documents = [documentRecord, ...nextDocuments]
+}
+
 function clearSigned8821DocumentRecord(answers = {}) {
   const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   const nextDocuments = Array.isArray(current) ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_form' && doc.category !== 'IRS Form 8821') : []
+  answers.ea_documents = nextDocuments
+}
+
+function clearSigned8821FirstPageDocumentRecord(answers = {}) {
+  const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  const nextDocuments = Array.isArray(current)
+    ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_first_page' && doc.category !== 'IRS Form 8821 First Page')
+    : []
   answers.ea_documents = nextDocuments
 }
 
@@ -523,6 +551,42 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   }
 }
 
+async function loadSigned8821FirstPageDocumentPayload(roomCode, room) {
+  const answers = room?.state?.answers || {}
+  const savedDocument = getSigned8821FirstPageDocumentRecord(answers)
+  const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
+  if (savedPayload?.buffer?.length) {
+    const renderVersion = String(answers?.signed_8821_first_page_render_version || '').trim()
+    if (renderVersion !== '1') {
+      try {
+        const refreshed = await refreshSigned8821FirstPageStoredPdf(roomCode, room)
+        if (refreshed?.buffer?.length) {
+          return {
+            fileBuffer: refreshed.buffer,
+            contentType: refreshed.mimeType || 'application/pdf',
+            filename: getSaved8821FirstPageFilename(answers),
+          }
+        }
+      } catch {
+        // fall through
+      }
+    }
+    return {
+      fileBuffer: savedPayload.buffer,
+      contentType: savedPayload.mimeType || 'application/pdf',
+      filename: getSaved8821FirstPageFilename(answers),
+    }
+  }
+  if (!String(answers.boldsign_8821_document_id || '').trim()) return null
+  const refreshed = await refreshSigned8821FirstPageStoredPdf(roomCode, room)
+  if (!refreshed?.buffer?.length) return null
+  return {
+    fileBuffer: refreshed.buffer,
+    contentType: refreshed.mimeType || 'application/pdf',
+    filename: getSaved8821FirstPageFilename(answers),
+  }
+}
+
 function stripPdfWidgetPlaceholders(pdfDoc) {
   try {
     // Remove the AcroForm root if present.
@@ -577,6 +641,32 @@ async function refreshSigned8821StoredPdf(roomCode, room) {
   answers.signed_8821_saved_at = new Date().toISOString()
   answers.signed_8821_file_name = getSaved8821Filename(answers)
   answers.signed_8821_render_version = '3'
+  room.state.updatedAt = Date.now()
+  try {
+    await dbUpsertSession({ code: roomCode, state: room.state })
+  } catch {
+    // ignore
+  }
+  return { buffer: pdfBuffer, mimeType: 'application/pdf' }
+}
+
+async function refreshSigned8821FirstPageStoredPdf(roomCode, room) {
+  const answers = room?.state?.answers || {}
+  const pdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
+  const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
+  upsertSigned8821FirstPageDocumentRecord(answers, {
+    id: 'system_signed_8821_first_page',
+    name: 'Signed Form 8821 Page 1.pdf',
+    category: 'IRS Form 8821 First Page',
+    mimeType: 'application/pdf',
+    size: pdfBuffer.length,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: 'System',
+    dataUrl,
+  })
+  answers.signed_8821_first_page_saved_at = new Date().toISOString()
+  answers.signed_8821_first_page_file_name = getSaved8821FirstPageFilename(answers)
+  answers.signed_8821_first_page_render_version = '1'
   room.state.updatedAt = Date.now()
   try {
     await dbUpsertSession({ code: roomCode, state: room.state })
@@ -1174,21 +1264,17 @@ function wrapTextForWidth(font, text, fontSize, maxWidth) {
   return lines
 }
 
-function drawPacketText(page, font, text, target, { widthScale = 0.78, heightScale = 0.68, minFontSize = 8.5, maxFontSize = 12, multiline = false } = {}) {
+function drawPacketText(page, font, text, target, { widthScale = 0.78, heightScale = 0.68, fontSize = 11, multiline = false } = {}) {
   const value = String(text || '').trim()
   if (!value) return
   const box = shrinkOverlayBox(target, widthScale, heightScale)
   const rect = getPercentBoxRect(page, box)
-  let fontSize = Math.max(minFontSize, Math.min(maxFontSize, rect.height * 0.72))
-  let lines = multiline ? value.split('\n').filter(Boolean) : wrapTextForWidth(font, value, fontSize, rect.width)
-  while (fontSize > minFontSize && lines.length * fontSize * 1.15 > rect.height) {
-    fontSize -= 0.4
-    lines = multiline ? value.split('\n').filter(Boolean) : wrapTextForWidth(font, value, fontSize, rect.width)
-  }
-  let currentY = rect.y + rect.height - fontSize * 0.95
+  const lines = multiline ? value.split('\n').filter(Boolean) : wrapTextForWidth(font, value, fontSize, rect.width)
+  const totalHeight = Math.max(fontSize, lines.length * fontSize)
+  let currentY = rect.y + (rect.height - totalHeight) / 2 + totalHeight - fontSize * 0.82
   lines.forEach((line) => {
     page.drawText(String(line), { x: rect.x, y: currentY, size: fontSize, font, color: rgb(0.1, 0.1, 0.1) })
-    currentY -= fontSize * 1.12
+    currentY -= fontSize
   })
 }
 
@@ -1244,14 +1330,14 @@ async function buildSigned8821PdfBuffer(answers = {}) {
     for (const target of pageDateTargets) {
       const dateValue = dateMap[target.id] || ''
       if (!dateValue) continue
-      drawPacketText(page, font, dateValue, target, { widthScale: 1, heightScale: 1, minFontSize: 8.5, maxFontSize: 11 })
+      drawPacketText(page, boldFont, dateValue, target, { widthScale: 1, heightScale: 1, fontSize: 13 })
     }
 
     const pageFullNameTargets = RED_FULL_NAME_TARGETS.filter((target) => target.page === pageNumber)
     for (const target of pageFullNameTargets) {
       const displayName = target.id === 'cancellation-spouse-print-name' ? context.spouseFullName : context.fullName
       if (!displayName) continue
-      drawPacketText(page, boldFont, displayName, target, { widthScale: 0.76, heightScale: 0.62, minFontSize: 8.5, maxFontSize: 11 })
+      drawPacketText(page, boldFont, displayName, target, { widthScale: 0.76, heightScale: 0.62, fontSize: 11 })
     }
 
     const pageAutofillTargets = RED_AUTOFILL_TARGETS.filter((target) => target.page === pageNumber).filter((target) => {
@@ -1267,11 +1353,11 @@ async function buildSigned8821PdfBuffer(answers = {}) {
       if (!value) continue
       const isCompactNumericField = isCompactNumericFieldTarget(target.id)
       const isLongAddressField = isLongAddressFieldTarget(target.id)
+      const isDiscountFeeField = isDiscountFeeFieldTarget(target.id)
       drawPacketText(page, font, value, target, {
         widthScale: isLongAddressField ? 0.94 : isCompactNumericField ? 0.92 : 0.74,
         heightScale: 0.62,
-        minFontSize: 8,
-        maxFontSize: 10.5,
+        fontSize: isDiscountFeeField ? 14 : isLongAddressField ? 9 : isCompactNumericField ? 10 : 11,
       })
     }
 
@@ -1279,6 +1365,54 @@ async function buildSigned8821PdfBuffer(answers = {}) {
       const pageStrikeTargets = RED_DISCOUNT_STRIKE_TARGETS.filter((target) => target.page === pageNumber)
       pageStrikeTargets.forEach((target) => drawPacketStrike(page, target))
     }
+  }
+
+  return Buffer.from(await outputPdf.save())
+}
+
+async function buildSigned8821FirstPagePdfBuffer(answers = {}) {
+  const outputPdf = await PDFDocument.create()
+  const font = await outputPdf.embedFont(StandardFonts.Helvetica)
+  const boldFont = await outputPdf.embedFont(StandardFonts.HelveticaBold)
+  const signatureMap = parseStoredTargetMap(answers.esign_signatures_by_target)
+  const dateMap = parseStoredTargetMap(answers.esign_dates_by_target)
+  const context = getRedPacketRenderContext(answers)
+
+  const backgroundBytes = await loadRedPacketPageImageBytes(1)
+  const background = await outputPdf.embedPng(backgroundBytes)
+  const page = outputPdf.addPage([background.width, background.height])
+  page.drawImage(background, { x: 0, y: 0, width: background.width, height: background.height })
+
+  for (const target of RED_SIGNATURE_TARGETS.filter((entry) => entry.page === 1)) {
+    const dataUrl = signatureMap[target.id] || ''
+    if (!dataUrl) continue
+    await drawPacketSignature(page, outputPdf, dataUrl, target)
+  }
+
+  for (const target of RED_DATE_TARGETS.filter((entry) => entry.page === 1)) {
+    const dateValue = dateMap[target.id] || ''
+    if (!dateValue) continue
+    drawPacketText(page, boldFont, dateValue, target, { widthScale: 1, heightScale: 1, fontSize: 13 })
+  }
+
+  for (const target of RED_FULL_NAME_TARGETS.filter((entry) => entry.page === 1)) {
+    const displayName = context.fullName
+    if (!displayName) continue
+    drawPacketText(page, boldFont, displayName, target, { widthScale: 0.76, heightScale: 0.62, fontSize: 11 })
+  }
+
+  const pageAutofillTargets = RED_AUTOFILL_TARGETS.filter((entry) => entry.page === 1)
+  for (const target of pageAutofillTargets) {
+    const value = getRedAutofillTargetValue(context, target.id)
+    if (!value) continue
+    const isCompactNumericField = isCompactNumericFieldTarget(target.id)
+    const isLongAddressField = isLongAddressFieldTarget(target.id)
+    const isDiscountFeeField = isDiscountFeeFieldTarget(target.id)
+    drawPacketText(page, font, value, target, {
+      widthScale: isLongAddressField ? 0.94 : isCompactNumericField ? 0.92 : 0.74,
+      heightScale: 0.62,
+      fontSize: isDiscountFeeField ? 14 : isLongAddressField ? 9 : isCompactNumericField ? 10 : 11,
+    })
   }
 
   return Buffer.from(await outputPdf.save())
@@ -1293,7 +1427,9 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   if (!hasPrimarySignature) return false
 
   const pdfBuffer = await buildSigned8821PdfBuffer(answers)
+  const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
   const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
+  const firstPageDataUrl = `data:application/pdf;base64,${firstPagePdfBuffer.toString('base64')}`
   const existingDocument = getSigned8821DocumentRecord(answers)
   upsertSigned8821DocumentRecord(answers, {
     id: 'system_signed_8821_form',
@@ -1305,10 +1441,23 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     uploadedBy: 'System',
     dataUrl,
   })
+  upsertSigned8821FirstPageDocumentRecord(answers, {
+    id: 'system_signed_8821_first_page',
+    name: 'Signed Form 8821 Page 1.pdf',
+    category: 'IRS Form 8821 First Page',
+    mimeType: 'application/pdf',
+    size: firstPagePdfBuffer.length,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: 'System',
+    dataUrl: firstPageDataUrl,
+  })
   const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
   markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
   answers.signed_8821_file_name = getSaved8821Filename(answers)
+  answers.signed_8821_first_page_saved_at = new Date().toISOString()
+  answers.signed_8821_first_page_file_name = getSaved8821FirstPageFilename(answers)
+  answers.signed_8821_first_page_render_version = '1'
   if (!existingDocument) {
     const timeline = Array.isArray(answers.ea_activity_timeline) ? answers.ea_activity_timeline : parseStoredObject(answers.ea_activity_timeline, [])
     answers.ea_activity_timeline = [
@@ -3328,6 +3477,33 @@ app.get('/api/admin/consultations/:code/signed-8821', async (req, res) => {
   }
 })
 
+app.get('/api/admin/consultations/:code/signed-8821-page-1', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const item = await getConsultationRecordByCode(req.params.code)
+    if (!item) return res.status(404).json({ error: 'Consultation not found.' })
+    const answers = item.answers || {}
+    if (!String(answers.boldsign_8821_document_id || '').trim()) {
+      return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this client yet.' })
+    }
+    if (!isForm8821FullySigned(answers)) {
+      return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
+    }
+    const roomCode = String(item.sessionCode || req.params.code || '').toUpperCase().trim()
+    const room = await ensureRoom(roomCode)
+    const payload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
+    if (!payload?.fileBuffer?.length) {
+      return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this client yet.' })
+    }
+    res.setHeader('Content-Type', payload.contentType || 'application/pdf')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${payload.filename || 'signed-8821-page-1.pdf'}"`)
+    return res.send(payload.fileBuffer)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821 page 1.' })
+  }
+})
+
 app.get('/api/session/:code/signed-8821', async (req, res) => {
   try {
     const roomCode = String(req.params.code || '').toUpperCase().trim()
@@ -3350,6 +3526,29 @@ app.get('/api/session/:code/signed-8821', async (req, res) => {
     return res.send(payload.fileBuffer)
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821.' })
+  }
+})
+
+app.get('/api/session/:code/signed-8821-page-1', async (req, res) => {
+  try {
+    const roomCode = String(req.params.code || '').toUpperCase().trim()
+    if (!roomCode) return res.status(400).json({ error: 'Session code is required.' })
+    const room = await ensureRoom(roomCode)
+    if (!room) return res.status(404).json({ error: 'Session not found.' })
+    const answers = room.state.answers || {}
+    if (!isForm8821FullySigned(answers)) {
+      return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
+    }
+    const payload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
+    if (!payload?.fileBuffer?.length) {
+      return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this session.' })
+    }
+    res.setHeader('Content-Type', payload.contentType || 'application/pdf')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${payload.filename || 'signed-8821-page-1.pdf'}"`)
+    return res.send(payload.fileBuffer)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821 page 1.' })
   }
 })
 
@@ -3728,10 +3927,13 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.current_8821_document_code = documentCode
       answers.active_8821_document_code = documentCode
       clearSigned8821DocumentRecord(answers)
+      clearSigned8821FirstPageDocumentRecord(answers)
       answers.boldsign_8821_signed_at = ''
       answers.signed_8821_saved_at = ''
+      answers.signed_8821_first_page_saved_at = ''
       answers.signed_8821_client_emailed_at = ''
       answers.signed_8821_render_version = ''
+      answers.signed_8821_first_page_render_version = ''
       answers.form8821_status = 'launching'
       if (!links.form8821ClientLink) {
         return res.status(400).json({ error: 'A custom signing link is not available for this document yet.' })
@@ -3848,8 +4050,10 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
             { type: 'setAnswer', questionId: 'form8821_status', value: answers.form8821_status },
             { type: 'setAnswer', questionId: 'boldsign_8821_signed_at', value: answers.boldsign_8821_signed_at },
             { type: 'setAnswer', questionId: 'signed_8821_saved_at', value: answers.signed_8821_saved_at },
+            { type: 'setAnswer', questionId: 'signed_8821_first_page_saved_at', value: answers.signed_8821_first_page_saved_at },
             { type: 'setAnswer', questionId: 'signed_8821_client_emailed_at', value: answers.signed_8821_client_emailed_at },
             { type: 'setAnswer', questionId: 'signed_8821_render_version', value: answers.signed_8821_render_version },
+            { type: 'setAnswer', questionId: 'signed_8821_first_page_render_version', value: answers.signed_8821_first_page_render_version },
           ]
         : []),
     ])
