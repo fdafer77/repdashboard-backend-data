@@ -444,8 +444,44 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   const download = await boldsignDownloadDocument(documentId, {
     onBehalfOf: String(answers.boldsign_8821_sender_email || '').trim() || undefined,
   })
+  // BoldSign downloads can still include interactive form widgets whose default
+  // appearance renders placeholder text like "Enter value". Strip those widgets
+  // before serving and persist the cleaned copy for future views.
+  let cleanedBuffer = download.fileBuffer
+  try {
+    const pdfDoc = await PDFDocument.load(download.fileBuffer)
+    stripPdfWidgetPlaceholders(pdfDoc)
+    cleanedBuffer = Buffer.from(await pdfDoc.save())
+  } catch {
+    // ignore; fall back to raw download
+  }
+
+  if (cleanedBuffer?.length) {
+    try {
+      const dataUrl = `data:application/pdf;base64,${Buffer.from(cleanedBuffer).toString('base64')}`
+      upsertSigned8821DocumentRecord(answers, {
+        id: 'system_signed_8821_form',
+        name: 'Signed Form 8821.pdf',
+        category: 'IRS Form 8821',
+        mimeType: 'application/pdf',
+        size: cleanedBuffer.length,
+        uploadedAt: new Date().toISOString(),
+        uploadedBy: 'System',
+        dataUrl,
+      })
+      answers.signed_8821_saved_at = new Date().toISOString()
+      answers.signed_8821_file_name = getSaved8821Filename(answers)
+      const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
+      markSigned8821DeliveryEntries(answers, signedAt)
+      room.state.updatedAt = Date.now()
+      await dbUpsertSession({ code: roomCode, state: room.state })
+    } catch {
+      // ignore persistence errors; still return cleaned PDF
+    }
+  }
+
   return {
-    fileBuffer: download.fileBuffer,
+    fileBuffer: cleanedBuffer,
     contentType: download.contentType || 'application/pdf',
     filename: getSaved8821Filename(answers),
   }
@@ -611,16 +647,19 @@ function drawMultilineText(page, font, lines = [], {
   })
 }
 
+async function load8821BackgroundImageBytes() {
+  // Use the same visual the client signs against (experience-site red packet image),
+  // not the IRS fillable PDF template which contains "Enter value" placeholders baked in.
+  const imageUrl = new URL('./assets/f8821-page-1.png', import.meta.url)
+  return await readFile(imageUrl)
+}
+
 async function buildSigned8821PdfBuffer(answers = {}) {
-  const { pdfPath } = getBoldsignConfig()
-  const resolvedPath =
-    typeof pdfPath === 'string' && !pdfPath.startsWith('/')
-      ? new URL(pdfPath.replace(/^\.\//, './'), new URL('./', import.meta.url))
-      : pdfPath
-  const templateBytes = await readFile(resolvedPath)
-  const outputPdf = await PDFDocument.load(templateBytes)
-  stripPdfWidgetPlaceholders(outputPdf)
-  const page = outputPdf.getPage(0)
+  const outputPdf = await PDFDocument.create()
+  const backgroundBytes = await load8821BackgroundImageBytes()
+  const background = await outputPdf.embedPng(backgroundBytes)
+  const page = outputPdf.addPage([background.width, background.height])
+  page.drawImage(background, { x: 0, y: 0, width: background.width, height: background.height })
 
   const font = await outputPdf.embedFont(StandardFonts.Helvetica)
   const boldFont = await outputPdf.embedFont(StandardFonts.HelveticaBold)
