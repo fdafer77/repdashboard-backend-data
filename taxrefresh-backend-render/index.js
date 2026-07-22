@@ -2748,25 +2748,24 @@ app.get('/api/admin/consultations/:code/signed-8821', async (req, res) => {
     }
 
     const answers = item.answers || {}
-    const documentId = String(answers.boldsign_8821_document_id || '').trim()
-    if (!documentId) {
+    if (!String(answers.boldsign_8821_document_id || '').trim()) {
       return res.status(404).json({ error: 'No signed Form 8821 document is available for this client yet.' })
     }
     if (!isForm8821FullySigned(answers)) {
       return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
     }
 
-    const download = await boldsignDownloadDocument(documentId, {
-      onBehalfOf: String(answers.boldsign_8821_sender_email || '').trim() || undefined,
-    })
-    const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'client').trim()
-    const safeClientName = clientName.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'client'
-    const filename = `${safeClientName}-signed-document.pdf`
+    const roomCode = String(item.sessionCode || req.params.code || '').toUpperCase().trim()
+    const room = await ensureRoom(roomCode)
+    const payload = await loadSigned8821DocumentPayload(roomCode, room)
+    if (!payload?.fileBuffer?.length) {
+      return res.status(404).json({ error: 'No signed Form 8821 document is available for this client yet.' })
+    }
 
-    res.setHeader('Content-Type', download.contentType || 'application/pdf')
+    res.setHeader('Content-Type', payload.contentType || 'application/pdf')
     res.setHeader('Cache-Control', 'no-store')
-    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${filename}"`)
-    return res.send(download.fileBuffer)
+    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${payload.filename || 'signed-document.pdf'}"`)
+    return res.send(payload.fileBuffer)
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821.' })
   }
