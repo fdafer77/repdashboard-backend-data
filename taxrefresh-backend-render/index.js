@@ -413,6 +413,21 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   const savedDocument = getSigned8821DocumentRecord(answers)
   const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
   if (savedPayload?.buffer?.length) {
+    const renderVersion = String(answers?.signed_8821_render_version || '').trim()
+    if (renderVersion !== '2') {
+      try {
+        const refreshed = await refreshSigned8821StoredPdf(roomCode, room)
+        if (refreshed?.buffer?.length) {
+          return {
+            fileBuffer: refreshed.buffer,
+            contentType: refreshed.mimeType || 'application/pdf',
+            filename: getSaved8821Filename(answers),
+          }
+        }
+      } catch {
+        // fall through to probe / return stored payload
+      }
+    }
     // If we previously saved a PDF that still contains the IRS template's interactive form
     // widgets (which render "Enter value" placeholders), regenerate a clean copy on-demand.
     try {
@@ -540,6 +555,7 @@ async function refreshSigned8821StoredPdf(roomCode, room) {
   markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
   answers.signed_8821_file_name = getSaved8821Filename(answers)
+  answers.signed_8821_render_version = '2'
   room.state.updatedAt = Date.now()
   try {
     await dbUpsertSession({ code: roomCode, state: room.state })
