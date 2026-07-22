@@ -845,14 +845,15 @@ function isValidEmailAddress(value = '') {
 
 function buildExternalDocumentLinks(roomCode, room, baseUrl = '') {
   const experienceBase = String(getUpdatedExperienceBaseUrl(baseUrl) || '').replace(/\/+$/, '')
+  const backendBase = String(getBackendBaseUrl(baseUrl) || '').replace(/\/+$/, '')
   const contactId = String(room?.contactId || room?.state?.answers?.ghl_contact_id || '').trim()
   const opportunityId = String(room?.opportunityId || room?.state?.answers?.ghl_opportunity_id || '').trim()
   const portalLinks = makePortalLinks(contactId, roomCode, baseUrl, opportunityId)
   return {
     experienceBase,
     clientPortalLink: buildClientPortalLoginLink(roomCode, room) || portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
-    form8821ClientLink: experienceBase ? `${experienceBase}/session/sign-form-8821?session=${encodeURIComponent(roomCode)}&document=1&packet=red` : '',
-    form8821SpouseLink: experienceBase ? `${experienceBase}/session/sign-form-8821-spouse?session=${encodeURIComponent(roomCode)}&document=1&packet=red` : '',
+    form8821ClientLink: backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-link?target=client` : '',
+    form8821SpouseLink: backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-link?target=spouse` : '',
   }
 }
 
@@ -1272,6 +1273,21 @@ async function loadBoldsign8821PdfDataUri() {
   return `data:application/pdf;base64,${file.toString('base64')}`
 }
 
+async function getBoldsignEmbeddedSignLink({ documentId, signerEmail, redirectUrl }) {
+  const embedded = await retry(
+    () =>
+      boldsignFetch('v1/document/getEmbeddedSignLink', {
+        query: {
+          documentId,
+          signerEmail,
+          redirectUrl,
+        },
+      }),
+    { attempts: 8, delayMs: 1500 },
+  )
+  return String(embedded?.signLink || '').trim()
+}
+
 async function createBoldsign8821SigningLink({
   sessionCode,
   signerName,
@@ -1279,6 +1295,7 @@ async function createBoldsign8821SigningLink({
   returnUrl = '',
   onBehalfOf = '',
   persistDocument = true,
+  documentFieldPrefix = 'boldsign_8821',
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) throw new Error('sessionCode is required')
@@ -1334,10 +1351,10 @@ async function createBoldsign8821SigningLink({
 
   if (persistDocument) {
     const room = await ensureRoom(normalizedSessionCode)
-    room.state.answers.boldsign_8821_document_id = documentId
-    room.state.answers.boldsign_8821_file_name = 'TaxRefresh Form 8821.pdf'
-    room.state.answers.boldsign_8821_sent_at = new Date().toISOString()
-    room.state.answers.boldsign_8821_sender_email = String(onBehalfOf || '').trim()
+    room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
+    room.state.answers[`${documentFieldPrefix}_file_name`] = 'TaxRefresh Form 8821.pdf'
+    room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
+    room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
     room.state.updatedAt = Date.now()
     io.to(normalizedSessionCode).emit('room_state', room.state)
     try {
@@ -1347,21 +1364,13 @@ async function createBoldsign8821SigningLink({
     }
   }
 
-  const embedded = await retry(
-    () =>
-      boldsignFetch('v1/document/getEmbeddedSignLink', {
-        query: {
-          documentId,
-          signerEmail: resolvedSignerEmail,
-          redirectUrl: resolvedReturnUrl,
-        },
-      }),
-    { attempts: 8, delayMs: 1500 },
-  )
-
   return {
     documentId,
-    signingUrl: embedded?.signLink || '',
+    signingUrl: await getBoldsignEmbeddedSignLink({
+      documentId,
+      signerEmail: resolvedSignerEmail,
+      redirectUrl: resolvedReturnUrl,
+    }),
   }
 }
 
@@ -3086,6 +3095,103 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('BoldSign 8821 recipient view failed:', error)
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create BoldSign signing view.' })
+  }
+})
+
+app.get('/api/session/:code/document-complete', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Document complete</title>
+    <style>
+      body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#f4f8fb; color:#16253d; }
+      .wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+      .card { width:min(560px, 100%); background:#fff; border:1px solid rgba(18,32,51,.08); border-radius:24px; padding:32px; box-shadow:0 22px 60px rgba(12,25,45,.12); }
+      .eyebrow { margin:0 0 10px; color:#5d8f41; font-size:11px; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+      h1 { margin:0 0 12px; font-size:32px; line-height:1.05; letter-spacing:-.04em; }
+      p { margin:0; color:#5d6d84; font-size:15px; line-height:1.6; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <p class="eyebrow">Document complete</p>
+        <h1>Document signing finished</h1>
+        <p>This standalone document session is complete. You can close this window now.</p>
+      </div>
+    </div>
+  </body>
+</html>`)
+})
+
+app.get('/api/session/:code/document-link', async (req, res) => {
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const target = String(req.query?.target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+    if (!roomCode) return res.status(400).json({ error: 'sessionCode is required' })
+
+    const roomState = await getSessionStateForCode(roomCode)
+    if (!roomState) return res.status(404).json({ error: 'Session not found' })
+    const answers = roomState.answers || {}
+    const logEntries = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
+    const targetLog = Array.isArray(logEntries)
+      ? logEntries.find((entry) => String(entry?.documentType || '').trim() === (target === 'spouse' ? '8821 Spouse' : '8821 Document'))
+      : null
+    const signerName =
+      target === 'spouse'
+        ? String(
+            req.query?.name ||
+              getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) ||
+              'Spouse',
+          ).trim()
+        : String(req.query?.name || getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim()
+    const signerEmail =
+      target === 'spouse'
+        ? String(req.query?.email || targetLog?.recipientEmail || '').trim()
+        : String(req.query?.email || getPrimaryAnswer(answers, ['email', 'email_address']) || targetLog?.recipientEmail || '').trim()
+    if (!isValidEmailAddress(signerEmail)) {
+      return res.status(400).json({ error: `No valid ${target === 'spouse' ? 'spouse' : 'client'} email is attached to this document yet.` })
+    }
+
+    const backendBase = getBackendBaseUrl()
+    const returnUrl =
+      String(req.query?.returnUrl || '').trim() ||
+      (backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=${target}` : '')
+    const documentFieldPrefix = target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
+    const existingDocumentId = String(answers[`${documentFieldPrefix}_document_id`] || '').trim()
+    let signingUrl = ''
+
+    if (existingDocumentId && returnUrl) {
+      try {
+        signingUrl = await getBoldsignEmbeddedSignLink({
+          documentId: existingDocumentId,
+          signerEmail,
+          redirectUrl: returnUrl,
+        })
+      } catch {
+        signingUrl = ''
+      }
+    }
+
+    if (!signingUrl) {
+      const created = await createBoldsign8821SigningLink({
+        sessionCode: roomCode,
+        signerName,
+        signerEmail,
+        returnUrl,
+        persistDocument: true,
+        documentFieldPrefix,
+      })
+      signingUrl = String(created.signingUrl || '').trim()
+    }
+
+    if (!signingUrl) return res.status(500).json({ error: 'Unable to create a standalone document link.' })
+    return res.redirect(signingUrl)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create document link.' })
   }
 })
 
