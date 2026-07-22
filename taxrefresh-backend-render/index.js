@@ -4408,6 +4408,7 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
     room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
     room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
     markSigned8821DeliveryEntries(room.state.answers, room.state.answers.boldsign_8821_signed_at, completedDocumentCode)
+    await ensureSigned8821StoredOnRecord(roomCode, room)
     room.state.updatedAt = Date.now()
 
     io.to(roomCode).emit('room_state', room.state)
