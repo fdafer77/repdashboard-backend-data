@@ -855,6 +855,9 @@ function getUpdatedExperienceBaseUrl(fallback = '') {
   try {
     const url = new URL(base)
     if (url.hostname === 'taxrefreshdashboard.com') return 'https://secure.taxrefresh.us'
+    // The client portal host is not the same as the experience-site host.
+    // If we accidentally derive a portal origin here, map it to the experience-site.
+    if (url.hostname === 'taxrefresh-auth.com') return 'https://secure.taxrefresh.us'
     if (url.port === '4173') url.port = '5173'
     return url.origin
   } catch {
