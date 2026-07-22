@@ -367,6 +367,23 @@ function markSigned8821DeliveryEntries(answers = {}, signedAt = '') {
   }
 }
 
+function hasPersistedSigned8821Record(answers = {}) {
+  return Boolean(
+    String(answers?.signed_8821_saved_at || answers?.boldsign_8821_signed_at || '').trim() || getSigned8821DocumentRecord(answers),
+  )
+}
+
+function normalizePersistedSigned8821State(answers = {}) {
+  if (!hasPersistedSigned8821Record(answers) && !isForm8821FullySigned(answers)) return false
+  const signedAt = String(answers?.boldsign_8821_signed_at || answers?.completed_at || answers?.signed_8821_saved_at || '').trim() || new Date().toISOString()
+  const beforeDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
+  const beforeReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
+  markSigned8821DeliveryEntries(answers, signedAt)
+  const afterDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
+  const afterReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
+  return beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
+}
+
 function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
   const normalizedNextRoute = String(nextRoute || '').trim()
   const normalizedPreviousRoute = String(previousRoute || '').trim()
@@ -1926,6 +1943,7 @@ async function syncAllGhlOpportunitiesToDashboard() {
 function buildConsultationSummary(record) {
   const state = record?.state || {}
   const answers = state?.answers || {}
+  normalizePersistedSigned8821State(answers)
   const irsBalance = toNumberValue(
     getPrimaryAnswer(answers, ['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount']),
   )
@@ -2018,6 +2036,7 @@ function canEnrolledAgentAccessItem(item, account) {
 function buildConsultationDetail(record) {
   const state = record?.state || {}
   const answers = state?.answers || {}
+  normalizePersistedSigned8821State(answers)
   const summary = buildConsultationSummary(record)
   const links = buildExternalDocumentLinks(summary.sessionCode, record)
   const answerEntries = Object.entries(answers)
