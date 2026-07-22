@@ -332,8 +332,17 @@ function appendDocumentDeliveryLogEntry(answers = {}, entry = null) {
   answers.document_delivery_log = [entry, ...(Array.isArray(current) ? current : [])]
 }
 
-function markSigned8821DeliveryEntries(answers = {}, signedAt = '') {
+function createDocumentInstanceCode(prefix = 'doc') {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function getActive8821DocumentCode(answers = {}) {
+  return String(answers?.active_8821_document_code || answers?.current_8821_document_code || '').trim()
+}
+
+function markSigned8821DeliveryEntries(answers = {}, signedAt = '', documentCode = '') {
   const normalizedSignedAt = String(signedAt || '').trim() || new Date().toISOString()
+  const normalizedDocumentCode = String(documentCode || getActive8821DocumentCode(answers)).trim()
   const targetNames = new Set(['8821 Document', '8821 Spouse'])
 
   const currentDeliveryLog = Array.isArray(answers?.document_delivery_log)
@@ -343,6 +352,8 @@ function markSigned8821DeliveryEntries(answers = {}, signedAt = '') {
     answers.document_delivery_log = currentDeliveryLog.map((entry) => {
       const name = String(entry?.name || '').trim()
       if (!targetNames.has(name)) return entry
+      const entryCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryCode && entryCode !== normalizedDocumentCode) return entry
       return {
         ...(entry || {}),
         status: 'Signed',
@@ -358,6 +369,8 @@ function markSigned8821DeliveryEntries(answers = {}, signedAt = '') {
     answers.document_receipts = currentReceipts.map((entry) => {
       const name = String(entry?.name || '').trim()
       if (!targetNames.has(name)) return entry
+      const entryCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryCode && entryCode !== normalizedDocumentCode) return entry
       return {
         ...(entry || {}),
         status: 'Signed',
@@ -376,9 +389,10 @@ function hasPersistedSigned8821Record(answers = {}) {
 function normalizePersistedSigned8821State(answers = {}) {
   if (!hasPersistedSigned8821Record(answers) && !isForm8821FullySigned(answers)) return false
   const signedAt = String(answers?.boldsign_8821_signed_at || answers?.completed_at || answers?.signed_8821_saved_at || '').trim() || new Date().toISOString()
+  const documentCode = getActive8821DocumentCode(answers)
   const beforeDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
   const beforeReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
-  markSigned8821DeliveryEntries(answers, signedAt)
+  markSigned8821DeliveryEntries(answers, signedAt, documentCode)
   const afterDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
   const afterReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
   return beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
@@ -396,6 +410,7 @@ function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previ
   appendDocumentDeliveryLogEntry(answers, {
     id: `doc_experience_${Date.now().toString(36)}_${normalizedNextRoute.endsWith('-spouse') ? 'spouse' : 'client'}`,
     name: normalizedNextRoute.endsWith('-spouse') ? '8821 Spouse' : '8821 Document',
+    documentCode: getActive8821DocumentCode(answers),
     status: 'Sent',
     method: 'Experience',
     sentAt,
@@ -3167,6 +3182,14 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     const deliveryEntries = []
 
     if (documentType === '8821 Document') {
+      const documentCode = createDocumentInstanceCode('red')
+      answers.current_8821_document_code = documentCode
+      answers.active_8821_document_code = documentCode
+      answers.boldsign_8821_signed_at = ''
+      answers.signed_8821_saved_at = ''
+      answers.signed_8821_client_emailed_at = ''
+      answers.signed_8821_render_version = ''
+      answers.form8821_status = 'launching'
       if (!links.form8821ClientLink) {
         return res.status(400).json({ error: 'A custom signing link is not available for this document yet.' })
       }
@@ -3177,10 +3200,11 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         message: `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
         html: build8821EmailHtml({ clientName, signingLink: links.form8821ClientLink }),
       })
-      nextReceipts.push({ name: '8821 Document', status: 'Sent' })
+      nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_client`,
         documentType: '8821 Document',
+        documentCode,
         recipientEmail: resolvedRecipientEmail,
         link: links.form8821ClientLink,
         sentAt,
@@ -3189,6 +3213,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       deliveryEntries.push({
         id: `doc_delivery_${Date.now().toString(36)}_client`,
         name: '8821 Document',
+        documentCode,
         status: 'Sent',
         method: 'Email',
         sentAt,
@@ -3204,10 +3229,11 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
           message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${links.form8821SpouseLink}`,
           html: build8821EmailHtml({ clientName: String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || 'Spouse'), signingLink: links.form8821SpouseLink }),
         })
-        nextReceipts.push({ name: '8821 Spouse', status: 'Sent' })
+        nextReceipts.push({ name: '8821 Spouse', documentCode, status: 'Sent' })
         logEntries.push({
           id: `doc_email_${Date.now().toString(36)}_spouse`,
           documentType: '8821 Spouse',
+          documentCode,
           recipientEmail: spouseRecipientEmail,
           link: links.form8821SpouseLink,
           sentAt,
@@ -3216,6 +3242,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         deliveryEntries.push({
           id: `doc_delivery_${Date.now().toString(36)}_spouse`,
           name: '8821 Spouse',
+          documentCode,
           status: 'Sent',
           method: 'Email',
           sentAt,
@@ -3271,7 +3298,16 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
       { type: 'setAnswer', questionId: 'last_document_email_sent_at', value: sentAt },
       ...(documentType === '8821 Document'
-        ? [{ type: 'setAnswer', questionId: 'onboarding_status', value: answers.onboarding_status }]
+        ? [
+            { type: 'setAnswer', questionId: 'onboarding_status', value: answers.onboarding_status },
+            { type: 'setAnswer', questionId: 'current_8821_document_code', value: answers.current_8821_document_code },
+            { type: 'setAnswer', questionId: 'active_8821_document_code', value: answers.active_8821_document_code },
+            { type: 'setAnswer', questionId: 'form8821_status', value: answers.form8821_status },
+            { type: 'setAnswer', questionId: 'boldsign_8821_signed_at', value: answers.boldsign_8821_signed_at },
+            { type: 'setAnswer', questionId: 'signed_8821_saved_at', value: answers.signed_8821_saved_at },
+            { type: 'setAnswer', questionId: 'signed_8821_client_emailed_at', value: answers.signed_8821_client_emailed_at },
+            { type: 'setAnswer', questionId: 'signed_8821_render_version', value: answers.signed_8821_render_version },
+          ]
         : []),
     ])
 
@@ -3614,12 +3650,17 @@ app.post('/webhooks/ghl', (req, res) => {
 app.post('/api/boldsign/8821/complete', async (req, res) => {
   try {
     const roomCode = String(req.body?.sessionCode || req.body?.code || '').toUpperCase().trim()
+    const completedDocumentCode = String(req.body?.documentCode || req.body?.document_code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'sessionCode is required' })
     const room = await ensureRoom(roomCode)
+    if (completedDocumentCode) {
+      room.state.answers.active_8821_document_code = completedDocumentCode
+    }
     room.state.answers.form8821_status = 'completed'
     room.state.answers.onboarding_status = 'documents_signed'
     room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
     room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
+    markSigned8821DeliveryEntries(room.state.answers, room.state.answers.boldsign_8821_signed_at, completedDocumentCode)
     room.state.updatedAt = Date.now()
 
     io.to(roomCode).emit('room_state', room.state)
