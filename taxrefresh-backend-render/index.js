@@ -326,6 +326,12 @@ function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
   answers.ea_documents = [documentRecord, ...nextDocuments]
 }
 
+function clearSigned8821DocumentRecord(answers = {}) {
+  const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  const nextDocuments = Array.isArray(current) ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_form' && doc.category !== 'IRS Form 8821') : []
+  answers.ea_documents = nextDocuments
+}
+
 function appendDocumentDeliveryLogEntry(answers = {}, entry = null) {
   if (!entry || typeof entry.name !== 'string' || !entry.name.trim()) return
   const current = Array.isArray(answers?.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers?.document_delivery_log, [])
@@ -3721,6 +3727,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       const documentCode = createDocumentInstanceCode('red')
       answers.current_8821_document_code = documentCode
       answers.active_8821_document_code = documentCode
+      clearSigned8821DocumentRecord(answers)
       answers.boldsign_8821_signed_at = ''
       answers.signed_8821_saved_at = ''
       answers.signed_8821_client_emailed_at = ''
