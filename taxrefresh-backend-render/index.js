@@ -537,14 +537,27 @@ async function buildSigned8821PdfBuffer(answers = {}) {
       ? new URL(pdfPath.replace(/^\.\//, './'), new URL('./', import.meta.url))
       : pdfPath
   const templateBytes = await readFile(resolvedPath)
-  const sourcePdf = await PDFDocument.load(templateBytes)
-  const outputPdf = await PDFDocument.create()
-  const [irsPage] = await outputPdf.copyPages(sourcePdf, [0])
-  outputPdf.addPage(irsPage)
+  const outputPdf = await PDFDocument.load(templateBytes)
+  const page = outputPdf.getPage(0)
+  // The IRS template PDF contains interactive form fields whose default appearance
+  // can show placeholders like "Enter value". Since we draw our own overlay text,
+  // remove those fields so the exported PDF is clean and matches what the client signed.
+  try {
+    const form = outputPdf.getForm()
+    const fields = form.getFields()
+    fields.forEach((field) => {
+      try {
+        form.removeField(field)
+      } catch {
+        // best effort; some field types may not support removal in older pdf-lib builds
+      }
+    })
+  } catch {
+    // ignore; template may not contain an AcroForm
+  }
 
   const font = await outputPdf.embedFont(StandardFonts.Helvetica)
   const boldFont = await outputPdf.embedFont(StandardFonts.HelveticaBold)
-  const page = outputPdf.getPage(0)
   const signatureMap = parseStoredTargetMap(answers.esign_signatures_by_target)
   const primarySignature = signatureMap['agreement-client-signature'] || signatureMap['billing-signature'] || signatureMap['communications-signature'] || ''
   const signaturePayload = dataUrlToBuffer(primarySignature)
