@@ -845,15 +845,18 @@ function isValidEmailAddress(value = '') {
 
 function buildExternalDocumentLinks(roomCode, room, baseUrl = '') {
   const experienceBase = String(getUpdatedExperienceBaseUrl(baseUrl) || '').replace(/\/+$/, '')
-  const backendBase = String(getBackendBaseUrl(baseUrl) || '').replace(/\/+$/, '')
   const contactId = String(room?.contactId || room?.state?.answers?.ghl_contact_id || '').trim()
   const opportunityId = String(room?.opportunityId || room?.state?.answers?.ghl_opportunity_id || '').trim()
   const portalLinks = makePortalLinks(contactId, roomCode, baseUrl, opportunityId)
   return {
     experienceBase,
     clientPortalLink: buildClientPortalLoginLink(roomCode, room) || portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
-    form8821ClientLink: backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-link?target=client` : '',
-    form8821SpouseLink: backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-link?target=spouse` : '',
+    form8821ClientLink: experienceBase
+      ? `${experienceBase}/document/red-signing?session=${encodeURIComponent(roomCode)}&document=1&packet=red&standalone=1`
+      : '',
+    form8821SpouseLink: experienceBase
+      ? `${experienceBase}/document/red-signing-spouse?session=${encodeURIComponent(roomCode)}&document=1&packet=red&standalone=1`
+      : '',
   }
 }
 
