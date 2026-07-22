@@ -11,7 +11,7 @@ import jwt from 'jsonwebtoken'
 import Stripe from 'stripe'
 import { ensureSchema, getPool } from './db.js'
 import crypto from 'node:crypto'
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import { PDFArray, PDFDict, PDFDocument, PDFName, StandardFonts, rgb } from 'pdf-lib'
 
 const PORT = Number(process.env.PORT || 3001)
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*'
@@ -413,6 +413,25 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   const savedDocument = getSigned8821DocumentRecord(answers)
   const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
   if (savedPayload?.buffer?.length) {
+    // If we previously saved a PDF that still contains the IRS template's interactive form
+    // widgets (which render "Enter value" placeholders), regenerate a clean copy on-demand.
+    try {
+      const probe = await PDFDocument.load(savedPayload.buffer)
+      const probeForm = probe.getForm()
+      const hasFields = probeForm.getFields().length > 0
+      if (hasFields) {
+        const refreshed = await refreshSigned8821StoredPdf(roomCode, room)
+        if (refreshed?.buffer?.length) {
+          return {
+            fileBuffer: refreshed.buffer,
+            contentType: refreshed.mimeType || 'application/pdf',
+            filename: getSaved8821Filename(answers),
+          }
+        }
+      }
+    } catch {
+      // ignore; if probe fails, fall back to returning the stored payload
+    }
     return {
       fileBuffer: savedPayload.buffer,
       contentType: savedPayload.mimeType || 'application/pdf',
@@ -430,6 +449,68 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
     contentType: download.contentType || 'application/pdf',
     filename: getSaved8821Filename(answers),
   }
+}
+
+function stripPdfWidgetPlaceholders(pdfDoc) {
+  try {
+    // Remove the AcroForm root if present.
+    try {
+      pdfDoc.catalog.delete(PDFName.of('AcroForm'))
+    } catch {
+      // ignore
+    }
+    const pages = pdfDoc.getPages()
+    pages.forEach((page) => {
+      try {
+        const annots = page.node.lookup(PDFName.of('Annots'), PDFArray)
+        if (!annots) return
+        const kept = []
+        for (let i = 0; i < annots.size(); i += 1) {
+          const ref = annots.get(i)
+          try {
+            const annot = pdfDoc.context.lookup(ref, PDFDict)
+            const subtype = annot.get(PDFName.of('Subtype'))
+            if (subtype === PDFName.of('Widget')) continue
+          } catch {
+            // keep unknown annotation refs
+          }
+          kept.push(ref)
+        }
+        page.node.set(PDFName.of('Annots'), pdfDoc.context.obj(kept))
+      } catch {
+        // ignore
+      }
+    })
+  } catch {
+    // ignore
+  }
+}
+
+async function refreshSigned8821StoredPdf(roomCode, room) {
+  const answers = room?.state?.answers || {}
+  const pdfBuffer = await buildSigned8821PdfBuffer(answers)
+  const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
+  upsertSigned8821DocumentRecord(answers, {
+    id: 'system_signed_8821_form',
+    name: 'Signed Form 8821.pdf',
+    category: 'IRS Form 8821',
+    mimeType: 'application/pdf',
+    size: pdfBuffer.length,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: 'System',
+    dataUrl,
+  })
+  const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
+  markSigned8821DeliveryEntries(answers, signedAt)
+  answers.signed_8821_saved_at = new Date().toISOString()
+  answers.signed_8821_file_name = getSaved8821Filename(answers)
+  room.state.updatedAt = Date.now()
+  try {
+    await dbUpsertSession({ code: roomCode, state: room.state })
+  } catch {
+    // ignore
+  }
+  return { buffer: pdfBuffer, mimeType: 'application/pdf' }
 }
 
 function get8821PdfValues(answers = {}) {
@@ -538,23 +619,8 @@ async function buildSigned8821PdfBuffer(answers = {}) {
       : pdfPath
   const templateBytes = await readFile(resolvedPath)
   const outputPdf = await PDFDocument.load(templateBytes)
+  stripPdfWidgetPlaceholders(outputPdf)
   const page = outputPdf.getPage(0)
-  // The IRS template PDF contains interactive form fields whose default appearance
-  // can show placeholders like "Enter value". Since we draw our own overlay text,
-  // remove those fields so the exported PDF is clean and matches what the client signed.
-  try {
-    const form = outputPdf.getForm()
-    const fields = form.getFields()
-    fields.forEach((field) => {
-      try {
-        form.removeField(field)
-      } catch {
-        // best effort; some field types may not support removal in older pdf-lib builds
-      }
-    })
-  } catch {
-    // ignore; template may not contain an AcroForm
-  }
 
   const font = await outputPdf.embedFont(StandardFonts.Helvetica)
   const boldFont = await outputPdf.embedFont(StandardFonts.HelveticaBold)
