@@ -332,6 +332,41 @@ function appendDocumentDeliveryLogEntry(answers = {}, entry = null) {
   answers.document_delivery_log = [entry, ...(Array.isArray(current) ? current : [])]
 }
 
+function markSigned8821DeliveryEntries(answers = {}, signedAt = '') {
+  const normalizedSignedAt = String(signedAt || '').trim() || new Date().toISOString()
+  const targetNames = new Set(['8821 Document', '8821 Spouse'])
+
+  const currentDeliveryLog = Array.isArray(answers?.document_delivery_log)
+    ? answers.document_delivery_log
+    : parseStoredObject(answers?.document_delivery_log, [])
+  if (Array.isArray(currentDeliveryLog)) {
+    answers.document_delivery_log = currentDeliveryLog.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (!targetNames.has(name)) return entry
+      return {
+        ...(entry || {}),
+        status: 'Signed',
+        signedAt: String(entry?.signedAt || '').trim() || normalizedSignedAt,
+      }
+    })
+  }
+
+  const currentReceipts = Array.isArray(answers?.document_receipts)
+    ? answers.document_receipts
+    : parseStoredObject(answers?.document_receipts, [])
+  if (Array.isArray(currentReceipts)) {
+    answers.document_receipts = currentReceipts.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (!targetNames.has(name)) return entry
+      return {
+        ...(entry || {}),
+        status: 'Signed',
+        sentAt: String(entry?.sentAt || '').trim() || normalizedSignedAt,
+      }
+    })
+  }
+}
+
 function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
   const normalizedNextRoute = String(nextRoute || '').trim()
   const normalizedPreviousRoute = String(previousRoute || '').trim()
@@ -562,6 +597,8 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     uploadedBy: 'System',
     dataUrl,
   })
+  const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
+  markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
   answers.signed_8821_file_name = getSaved8821Filename(answers)
   if (!existingDocument) {
@@ -2786,6 +2823,62 @@ app.delete('/api/admin/consultations/:code/payment-methods/:paymentMethodId', as
   }
 })
 
+function getStripePaymentFailureReason(error) {
+  const raw = error?.raw || {}
+  const declineCode = String(raw.decline_code || error?.decline_code || '').trim().toLowerCase()
+  const code = String(raw.code || error?.code || '').trim().toLowerCase()
+  const message = String(raw.message || error?.message || '').trim()
+  const detector = declineCode || code
+
+  switch (detector) {
+    case 'incorrect_number':
+    case 'invalid_number':
+      return 'Payment failed: invalid card number.'
+    case 'incorrect_cvc':
+    case 'invalid_cvc':
+      return 'Payment failed: incorrect security code (CVC).'
+    case 'expired_card':
+      return 'Payment failed: the card is expired.'
+    case 'incorrect_zip':
+      return 'Payment failed: the billing ZIP/postal code did not match.'
+    case 'insufficient_funds':
+      return 'Payment failed: insufficient funds.'
+    case 'do_not_honor':
+      return 'Payment failed: do not honor. The issuer declined the charge.'
+    case 'generic_decline':
+      return 'Payment failed: the card was declined by the issuer.'
+    case 'processing_error':
+      return 'Payment failed: the processor returned a temporary processing error. Please try again.'
+    case 'card_not_supported':
+      return 'Payment failed: this card does not support this type of charge.'
+    case 'transaction_not_allowed':
+      return 'Payment failed: this transaction is not allowed on the card.'
+    case 'pickup_card':
+    case 'lost_card':
+    case 'stolen_card':
+      return 'Payment failed: the issuer rejected the card.'
+    case 'authentication_required':
+      return 'Payment failed: the card requires authentication before it can be charged.'
+    default:
+      break
+  }
+
+  const normalizedMessage = message.toLowerCase()
+  if (normalizedMessage.includes('insufficient funds')) return 'Payment failed: insufficient funds.'
+  if (normalizedMessage.includes('do not honor')) return 'Payment failed: do not honor. The issuer declined the charge.'
+  if (normalizedMessage.includes('invalid card number')) return 'Payment failed: invalid card number.'
+  if (normalizedMessage.includes('incorrect number')) return 'Payment failed: invalid card number.'
+  if (normalizedMessage.includes('incorrect cvc') || normalizedMessage.includes('invalid cvc')) {
+    return 'Payment failed: incorrect security code (CVC).'
+  }
+  if (normalizedMessage.includes('expired card')) return 'Payment failed: the card is expired.'
+  if (normalizedMessage.includes('authentication required')) {
+    return 'Payment failed: the card requires authentication before it can be charged.'
+  }
+
+  return message || 'Payment failed: processor declined the charge.'
+}
+
 app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   if (!stripe) return res.status(503).json({ error: 'Stripe is not configured.' })
@@ -2838,11 +2931,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
         const room = await ensureRoom(roomCode)
         const rows = Array.isArray(room.state.answers.billing_schedule) ? room.state.answers.billing_schedule.map((row) => ({ ...(row || {}) })) : []
         if (rows[scheduleIndex]) {
-          const reason =
-            error?.raw?.message ||
-            error?.message ||
-            error?.decline_code ||
-            'Processor declined the charge.'
+          const reason = getStripePaymentFailureReason(error)
           rows[scheduleIndex] = {
             ...rows[scheduleIndex],
             status: 'Failed',
@@ -2858,10 +2947,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       }
     }
     return res.status(400).json({
-      error:
-        error?.raw?.message ||
-        error?.message ||
-        'Payment failed',
+      error: getStripePaymentFailureReason(error),
     })
   }
 })
