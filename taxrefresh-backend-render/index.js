@@ -435,7 +435,7 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
   if (savedPayload?.buffer?.length) {
     const renderVersion = String(answers?.signed_8821_render_version || '').trim()
-    if (renderVersion !== '2') {
+    if (renderVersion !== '3') {
       try {
         const refreshed = await refreshSigned8821StoredPdf(roomCode, room)
         if (refreshed?.buffer?.length) {
@@ -576,7 +576,7 @@ async function refreshSigned8821StoredPdf(roomCode, room) {
   markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
   answers.signed_8821_file_name = getSaved8821Filename(answers)
-  answers.signed_8821_render_version = '2'
+  answers.signed_8821_render_version = '3'
   room.state.updatedAt = Date.now()
   try {
     await dbUpsertSession({ code: roomCode, state: room.state })
