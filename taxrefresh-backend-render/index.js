@@ -618,6 +618,114 @@ function get8821PdfValues(answers = {}) {
   }
 }
 
+const RED_PACKET_PAGES = Array.from({ length: 13 }, (_, index) => index + 1)
+
+const RED_SIGNATURE_TARGETS = [
+  { id: '8821-signature', page: 1, top: 80.3, left: 9.6, width: 19.6, height: 2.8 },
+  { id: 'billing-signature', page: 5, top: 89.1, left: 17.4, width: 18.8, height: 2.9 },
+  { id: 'page10-custom-signature', page: 10, top: 22.5, left: 15.6, width: 22.0, height: 2.6 },
+  { id: 'communications-signature', page: 10, top: 76.9, left: 15.4, width: 18.8, height: 2.9 },
+  { id: 'agreement-client-signature', page: 12, top: 16.5, left: 17.4, width: 18.8, height: 2.9 },
+  { id: 'agreement-spouse-signature', page: 12, top: 21.5, left: 23.4, width: 18.8, height: 2.9 },
+  { id: 'cancellation-signature', page: 13, top: 31.8, left: 16.8, width: 24.2, height: 2.9 },
+]
+
+const RED_DATE_TARGETS = [
+  { id: '8821-signature', page: 1, top: 81, left: 72.3, width: 16.4, height: 2.9 },
+  { id: 'billing-signature', page: 5, top: 89.3, left: 82.8, width: 12.0, height: 2.9 },
+  { id: 'page10-custom-signature', page: 10, top: 23.1, left: 69.1, width: 22.0, height: 2.6 },
+  { id: 'communications-signature', page: 10, top: 77.2, left: 82.9, width: 12.0, height: 2.9 },
+  { id: 'agreement-client-signature', page: 12, top: 17.2, left: 82.7, width: 12.0, height: 2.9 },
+  { id: 'agreement-spouse-signature', page: 12, top: 22, left: 82.4, width: 12.0, height: 2.9 },
+  { id: 'cancellation-signature', page: 13, top: 11, left: 16, width: 17.4, height: 2.9 },
+  { id: 'cancellation-signature', page: 13, top: 29.9, left: 19.9, width: 18.2, height: 2.9 },
+]
+
+const RED_FULL_NAME_TARGETS = [
+  { id: 'taxpayer-print-name', page: 1, top: 85.6, left: 6.1, width: 30.2, height: 2.7 },
+  { id: 'cancellation-spouse-print-name', page: 12, top: 18.9, left: 17.2, width: 32.0, height: 2.7 },
+  { id: 'cancellation-client-print-name', page: 13, top: 35.6, left: 20.9, width: 28.0, height: 2.7 },
+]
+
+const RED_DISCOUNT_STRIKE_TARGETS = [
+  { id: 'fee-summary-service-fee-strike', page: 4, top: 60.1, left: 46.8, width: 6.2, height: 0.3 },
+  { id: 'fee-summary-total-fees-strike', page: 4, top: 65.6, left: 46.7, width: 6.2, height: 0.3 },
+  { id: 'fee-summary-balance-strike', page: 4, top: 71, left: 46.8, width: 6.2, height: 0.3 },
+]
+
+const RED_AUTOFILL_TARGETS = [
+  { id: 'custom-1784669349065', page: 1, top: 15.5, left: 0.8, width: 62, height: 2.6 },
+  { id: 'custom-1784669313950', page: 1, top: 14.2, left: 58.3, width: 22, height: 2.6 },
+  { id: 'custom-1784669326548', page: 1, top: 17.2, left: 55.8, width: 22, height: 2.6 },
+  { id: 'custom-1784669186192', page: 1, top: 25.5, left: 0, width: 52, height: 2.6 },
+  { id: 'custom-1784669201362', page: 1, top: 22.2, left: 56.4, width: 22, height: 2.6 },
+  { id: 'custom-1784669211927', page: 1, top: 23.6, left: 54.7, width: 22, height: 2.6 },
+  { id: 'custom-1784669220785', page: 1, top: 25.3, left: 60.3, width: 22, height: 2.6 },
+  { id: 'custom-1784669268807', page: 1, top: 48.5, left: 7, width: 22, height: 2.6 },
+  { id: 'custom-1784669278409', page: 1, top: 48.7, left: 35.7, width: 22, height: 2.6 },
+  { id: 'custom-1784669295728', page: 1, top: 48.7, left: 49.7, width: 22, height: 2.6 },
+  { id: 'agreement-effective-date', page: 2, top: 14, left: 45.2, width: 15.8, height: 1.9 },
+  { id: 'agreement-client-full-name', page: 2, top: 14, left: 65.9, width: 25.0, height: 1.9 },
+  { id: 'client-last-name', page: 2, top: 31.3, left: 6.7, width: 16.5, height: 2.4 },
+  { id: 'client-first-name', page: 2, top: 31.3, left: 22, width: 16.5, height: 2.4 },
+  { id: 'client-mi', page: 2, top: 31.4, left: 41.4, width: 4.6, height: 2.4 },
+  { id: 'client-ssn', page: 2, top: 31.5, left: 54.4, width: 13.6, height: 2.4 },
+  { id: 'client-dob', page: 2, top: 31.4, left: 68.9, width: 11.8, height: 2.4 },
+  { id: 'spouse-last-name', page: 2, top: 34.7, left: 6.7, width: 16.5, height: 2.4 },
+  { id: 'spouse-first-name', page: 2, top: 34.8, left: 22, width: 16.5, height: 2.4 },
+  { id: 'spouse-ssn', page: 2, top: 34.7, left: 39.1, width: 13.5, height: 2.4 },
+  { id: 'spouse-dob', page: 2, top: 34.8, left: 53.7, width: 11.8, height: 2.4 },
+  { id: 'physical-address', page: 2, top: 38, left: 7.7, width: 16.5, height: 2.4 },
+  { id: 'physical-city', page: 2, top: 37.9, left: 23.7, width: 16.5, height: 2.4 },
+  { id: 'physical-state', page: 2, top: 37.9, left: 41.5, width: 13.5, height: 2.4 },
+  { id: 'physical-zip', page: 2, top: 37.9, left: 58.7, width: 11.8, height: 2.4 },
+  { id: 'mailing-address', page: 2, top: 41.2, left: 8, width: 16.5, height: 2.4 },
+  { id: 'mailing-city', page: 2, top: 41.3, left: 23.8, width: 16.5, height: 2.4 },
+  { id: 'mailing-state', page: 2, top: 41.2, left: 41.5, width: 13.5, height: 2.4 },
+  { id: 'mailing-zip', page: 2, top: 41.3, left: 58.1, width: 11.8, height: 2.4 },
+  { id: 'client-email', page: 2, top: 44.8, left: 7.1, width: 16.5, height: 2.4 },
+  { id: 'client-cell-phone', page: 2, top: 44.6, left: 23.6, width: 16.5, height: 2.4 },
+  { id: 'client-home-phone', page: 2, top: 44.7, left: 39.2, width: 13.5, height: 2.4 },
+  { id: 'spouse-phone', page: 2, top: 44.6, left: 57.4, width: 19.8, height: 2.4 },
+  { id: 'business-name', page: 2, top: 48.1, left: 7.6, width: 16.5, height: 4.8 },
+  { id: 'business-ein', page: 2, top: 49.1, left: 22.4, width: 16.5, height: 2.4 },
+  { id: 'business-work-phone', page: 2, top: 49.1, left: 41.9, width: 13.5, height: 2.4 },
+  { id: 'section2-tax-type', page: 2, top: 64.1, left: 7.3, width: 20.0, height: 2.4 },
+  { id: 'section2-tax-agency', page: 2, top: 64.3, left: 26.5, width: 18.2, height: 2.4 },
+  { id: 'section2-estimated-liability', page: 2, top: 64.2, left: 46.3, width: 17.8, height: 2.4 },
+  { id: 'section2-unfiled-years', page: 2, top: 64.3, left: 65, width: 18.0, height: 2.4 },
+  { id: 'fee-summary-service-fee', page: 4, top: 59.2, left: 54.3, width: 16.0, height: 2.3 },
+  { id: 'fee-summary-total-fees', page: 4, top: 64.7, left: 54.4, width: 16.0, height: 2.3 },
+  { id: 'fee-summary-balance', page: 4, top: 70.1, left: 54.3, width: 16.0, height: 2.3 },
+  { id: 'payment-card-type', page: 5, top: 30.4, left: 7.0, width: 16.0, height: 2.4 },
+  { id: 'payment-cardholder-name', page: 5, top: 30.3, left: 23.4, width: 27.0, height: 2.4 },
+  { id: 'payment-card-number', page: 5, top: 34, left: 6.8, width: 17.4, height: 2.4 },
+  { id: 'payment-card-expiration', page: 5, top: 33.9, left: 38.8, width: 11.2, height: 2.4 },
+  { id: 'payment-card-cvv', page: 5, top: 33.5, left: 57.2, width: 8.8, height: 2.4 },
+  { id: 'payment-bank-name', page: 5, top: 41.6, left: 7.4, width: 24.2, height: 2.4 },
+  { id: 'payment-account-holder-name', page: 5, top: 41.8, left: 46.7, width: 23.2, height: 2.4 },
+  { id: 'payment-account-number', page: 5, top: 45.2, left: 6.1, width: 24.2, height: 2.4 },
+  { id: 'payment-routing-number', page: 5, top: 45.3, left: 48.6, width: 23.2, height: 2.4 },
+  { id: 'custom-1784670092270', page: 5, top: 33.7, left: 25.5, width: 22, height: 2.6 },
+  { id: 'custom-1784672403784', page: 5, top: 55, left: 10.6, width: 22, height: 2.6 },
+  { id: 'custom-1784672412360', page: 5, top: 55.1, left: 51.4, width: 22, height: 2.6 },
+  { id: 'custom-1784672419999', page: 5, top: 57.6, left: 10.5, width: 22, height: 2.6 },
+  { id: 'custom-1784672432443', page: 5, top: 60.3, left: 10.6, width: 22, height: 2.6 },
+  { id: 'custom-1784672467904', page: 5, top: 57.7, left: 51.4, width: 22, height: 2.6 },
+  { id: 'custom-1784672476809', page: 5, top: 60.3, left: 51.4, width: 22, height: 2.6 },
+]
+
+function shrinkOverlayBox(target, widthScale = 0.78, heightScale = 0.68) {
+  const nextWidth = target.width * widthScale
+  const nextHeight = target.height * heightScale
+  return {
+    top: target.top + (target.height - nextHeight) / 2,
+    left: target.left + (target.width - nextWidth) / 2,
+    width: nextWidth,
+    height: nextHeight,
+  }
+}
+
 function getTopY(pageHeight, topRatio, height = 0) {
   return pageHeight * (1 - topRatio) - height
 }
@@ -685,59 +793,487 @@ async function load8821BackgroundImageBytes() {
   return await readFile(imageUrl)
 }
 
+async function loadRedPacketPageImageBytes(pageNumber) {
+  const imageUrl = new URL(`./assets/f8821-page-${pageNumber}.png`, import.meta.url)
+  return await readFile(imageUrl)
+}
+
+function getRedPacketRenderContext(answers = {}) {
+  const fullName = String(getPrimaryAnswer(answers, ['full_name', 'name', 'client_name', 'clientName']) || 'Client').trim()
+  const nameParts = fullName.split(/\s+/).filter(Boolean)
+  const firstName = nameParts[0] || 'Client'
+  const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : ''
+  const middleInitial = nameParts.length > 2 ? String(nameParts[1] || '').slice(0, 1).toUpperCase() : ''
+  const email = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number', 'mobile', 'mobile_phone', 'cell', 'cell_phone']) || '').trim()
+  const street = String(getPrimaryAnswer(answers, ['street', 'address1', 'address']) || '').trim()
+  const apt = String(getPrimaryAnswer(answers, ['apt', 'address2', 'unit', 'apartment']) || '').trim()
+  const city = String(getPrimaryAnswer(answers, ['city']) || '').trim()
+  const stateCode = String(getPrimaryAnswer(answers, ['state', 'stateCode', 'expenseState']) || '').trim()
+  const zipCode = String(getPrimaryAnswer(answers, ['zip', 'zipCode', 'postalCode', 'mailingZip', 'mailing_zip']) || '').trim()
+  const mailingStreet = String(getPrimaryAnswer(answers, ['mailing_address', 'mailingAddress', 'mailing_street', 'mailingStreet']) || street).trim()
+  const mailingCity = String(getPrimaryAnswer(answers, ['mailing_city', 'mailingCity']) || city).trim()
+  const mailingState = String(getPrimaryAnswer(answers, ['mailing_state', 'mailingState']) || stateCode).trim()
+  const mailingZip = String(getPrimaryAnswer(answers, ['mailing_zip', 'mailingZip']) || zipCode).trim()
+  const dob = formatDobLabel(getPrimaryAnswer(answers, ['dob', 'date_of_birth', 'birthDate']))
+  const ssn = formatSsnLabel(getPrimaryAnswer(answers, ['ssn']))
+  const spouseFirstName = String(getPrimaryAnswer(answers, ['spouseFirstName', 'spouse_first_name']) || '').trim()
+  const spouseLastName = String(getPrimaryAnswer(answers, ['spouseLastName', 'spouse_last_name']) || '').trim()
+  const spouseFullName = String(
+    getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || [spouseFirstName, spouseLastName].filter(Boolean).join(' '),
+  ).trim()
+  const spouseSsn = formatSsnLabel(getPrimaryAnswer(answers, ['spouse_ssn', 'spouseSsn']))
+  const spouseDob = formatDobLabel(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
+  const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || '').trim()
+  const taxTypeValue = String(getPrimaryAnswer(answers, ['taxType']) || '').trim().toLowerCase()
+  const taxTypeLabel = taxTypeValue === 'personal' ? 'Personal' : taxTypeValue === 'business' ? 'Business' : taxTypeValue === 'both' ? 'Both' : ''
+  const taxAgencyLabel = normalizeTaxAgencyLabel(String(getPrimaryAnswer(answers, ['taxAgency', 'tax_agency']) || getPrimaryAnswer(answers, ['owe']) || '').trim())
+  const irs = Number(typeof answers['irsBalance'] === 'string' ? digitsOnly(answers['irsBalance']) : answers['irsBalance'] || 0)
+  const state = Number(typeof answers['stateBalance'] === 'string' ? digitsOnly(answers['stateBalance']) : answers['stateBalance'] || 0)
+  const aliasTotal = Number(
+    typeof answers['taxLiability'] === 'string'
+      ? digitsOnly(answers['taxLiability'])
+      : typeof answers['tax_liability'] === 'string'
+        ? digitsOnly(answers['tax_liability'])
+        : typeof answers['totalLiability'] === 'string'
+          ? digitsOnly(answers['totalLiability'])
+          : typeof answers['total_liability'] === 'string'
+            ? digitsOnly(answers['total_liability'])
+            : typeof answers['ghl_opportunity_value'] === 'string'
+              ? digitsOnly(answers['ghl_opportunity_value'])
+              : answers['taxLiability'] || answers['tax_liability'] || answers['totalLiability'] || answers['total_liability'] || answers['ghl_opportunity_value'] || 0,
+  )
+  const totalLiability = irs + state || aliasTotal
+  const estimatedLiabilityLabel = formatUsdLabel(totalLiability)
+  const unfiledYearsLabel = formatYearsLabel(
+    getPrimaryAnswer(answers, ['oweYears', 'yearsUnfiled', 'years_unfiled', 'years']) || answers['years'] || '',
+  )
+  const storedInvoice = toPositiveNumber(answers['billing_invoice_amount'])
+  const paymentPlanSelected = String(answers['paymentPlanSelected'] || answers['payment_plan_selected'] || '').trim().toLowerCase()
+  const effectiveInvoiceAmount = storedInvoice > 0 ? storedInvoice : paymentPlanSelected === 'payment_plan' ? 500 : Math.max(toPositiveNumber(answers['planPriceOverride']), 500)
+  const discountedFeeLabel = formatUsdLabel(effectiveInvoiceAmount)
+  const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
+  const billingScheduleDate1Label = formatCurrentDateLabel(billingSchedule[0]?.date || '')
+  const billingScheduleAmount1Label = String(billingSchedule[0]?.amount || '').trim()
+  const billingScheduleDate2Label = formatCurrentDateLabel(billingSchedule[1]?.date || '')
+  const billingScheduleAmount2Label = String(billingSchedule[1]?.amount || '').trim()
+  const billingScheduleDate3Label = formatCurrentDateLabel(billingSchedule[2]?.date || '')
+  const billingScheduleAmount3Label = String(billingSchedule[2]?.amount || '').trim()
+  const paymentMethod = (() => {
+    const direct = parseStoredObject(answers['billing_payment_method'], null)
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct
+    const storedMethods = parseStoredObject(answers['billing_payment_methods'], []).filter((method) => method && typeof method === 'object' && !Array.isArray(method))
+    return storedMethods[storedMethods.length - 1] || null
+  })()
+  const paymentCardTypeLabel = formatCardTypeLabel(
+    String(
+      getPrimaryAnswer(answers, ['brand', '_ui_pay_cardBrand']) ||
+        (typeof paymentMethod?.cardType === 'string' ? paymentMethod.cardType : '') ||
+        '',
+    ),
+  )
+  const paymentCardholderNameLabel = String(
+    getPrimaryAnswer(answers, ['payment_cardholder_name', '_ui_pay_nameOnCard']) ||
+      (typeof paymentMethod?.cardholderName === 'string' ? paymentMethod.cardholderName : '') ||
+      '',
+  )
+  const paymentCardNumberLabel = formatEndingInLabel(
+    String(
+      getPrimaryAnswer(answers, ['payment_card_number', '_ui_pay_cardNumber']) ||
+        (typeof paymentMethod?.cardNumber === 'string' ? paymentMethod.cardNumber : '') ||
+        (typeof answers['last4'] === 'string' ? answers['last4'] : '') ||
+        '',
+    ),
+  )
+  const paymentCardExpirationLabel = String(
+    getPrimaryAnswer(answers, ['payment_card_expiration', '_ui_pay_expiry']) ||
+      (typeof paymentMethod?.expiration === 'string' ? paymentMethod.expiration : '') ||
+      '',
+  )
+  const paymentCardCvvLabel = String(
+    getPrimaryAnswer(answers, ['payment_card_cvv', 'paymentCardCvv', 'payment_cvv', '_ui_pay_cvv', 'cvv', 'cvc']) ||
+      (typeof paymentMethod?.cvv === 'string' ? paymentMethod.cvv : '') ||
+      (typeof paymentMethod?.cvc === 'string' ? paymentMethod.cvc : '') ||
+      (typeof paymentMethod?.securityCode === 'string' ? paymentMethod.securityCode : '') ||
+      '',
+  ).trim()
+  const paymentBankNameLabel = String(
+    getPrimaryAnswer(answers, ['payment_bank_name']) || (typeof paymentMethod?.institutionName === 'string' ? paymentMethod.institutionName : '') || '',
+  )
+  const paymentAccountHolderNameLabel = String(
+    getPrimaryAnswer(answers, ['payment_account_holder_name', '_ui_pay_accountHolderName']) ||
+      (typeof paymentMethod?.accountHolderName === 'string' ? paymentMethod.accountHolderName : '') ||
+      '',
+  )
+  const paymentAccountNumberLabel = formatEndingInLabel(
+    String(
+      getPrimaryAnswer(answers, ['payment_account_number', '_ui_pay_accountNumber']) ||
+        (typeof paymentMethod?.accountNumber === 'string' ? paymentMethod.accountNumber : '') ||
+        (typeof answers['last4'] === 'string' ? answers['last4'] : '') ||
+        '',
+    ),
+  )
+  const paymentRoutingNumberLabel = formatEndingInLabel(
+    String(getPrimaryAnswer(answers, ['payment_routing_number', '_ui_pay_routingNumber']) || (typeof paymentMethod?.routingNumber === 'string' ? paymentMethod.routingNumber : '') || ''),
+  )
+  const primaryPaymentMethodKind = (() => {
+    const explicit = String(answers['payment_method_type'] || answers['pay'] || '').trim().toLowerCase()
+    if (explicit === 'card') return 'card'
+    if (explicit === 'bank') return 'bank'
+    const methodType = String(typeof paymentMethod?.type === 'string' ? paymentMethod.type : '').trim().toLowerCase()
+    if (methodType === 'card') return 'card'
+    if (methodType === 'ach' || methodType === 'bank') return 'bank'
+    const hasCardData = Boolean(paymentCardTypeLabel || paymentCardholderNameLabel || paymentCardNumberLabel || paymentCardExpirationLabel || paymentCardCvvLabel)
+    const hasBankData = Boolean(paymentBankNameLabel || paymentAccountHolderNameLabel || paymentAccountNumberLabel || paymentRoutingNumberLabel)
+    if (hasCardData && !hasBankData) return 'card'
+    if (hasBankData && !hasCardData) return 'bank'
+    return null
+  })()
+  return {
+    fullName,
+    firstName,
+    lastName,
+    middleInitial,
+    email,
+    phone,
+    city,
+    stateCode,
+    zipCode,
+    mailingCity,
+    mailingState,
+    mailingZip,
+    dob,
+    ssn,
+    spouseFirstName,
+    spouseLastName,
+    spouseFullName,
+    spouseSsn,
+    spouseDob,
+    spousePhone,
+    businessName: String(getPrimaryAnswer(answers, ['business_name', 'businessName']) || '').trim(),
+    businessEin: String(getPrimaryAnswer(answers, ['business_ein', 'businessEin', 'ein']) || '').trim(),
+    businessWorkPhone: String(getPrimaryAnswer(answers, ['business_phone', 'business_work_phone', 'businessWorkPhone']) || '').trim(),
+    physicalAddress: [street, apt].filter(Boolean).join(', '),
+    mailingAddress: [mailingStreet].filter(Boolean).join(', '),
+    taxTypeLabel,
+    taxAgencyLabel,
+    estimatedLiabilityLabel,
+    unfiledYearsLabel,
+    effectiveInvoiceAmount,
+    discountedFeeLabel,
+    paymentCardTypeLabel,
+    paymentCardholderNameLabel,
+    paymentCardNumberLabel,
+    paymentCardExpirationLabel,
+    paymentCardCvvLabel,
+    paymentBankNameLabel,
+    paymentAccountHolderNameLabel,
+    paymentAccountNumberLabel,
+    paymentRoutingNumberLabel,
+    billingScheduleDate1Label,
+    billingScheduleAmount1Label,
+    billingScheduleDate2Label,
+    billingScheduleAmount2Label,
+    billingScheduleDate3Label,
+    billingScheduleAmount3Label,
+    paymentPlanSelected,
+    showSpouseFields: isMarriedJointFilingAnswers(answers),
+    showBusinessFields: taxTypeLabel === 'Business' || taxTypeLabel === 'Both',
+    showPaymentScheduleFields: paymentPlanSelected === 'payment_plan' && billingSchedule.length > 0,
+    primaryPaymentMethodKind,
+  }
+}
+
+function isSpouseFieldTarget(id = '') {
+  return ['spouse-last-name', 'spouse-first-name', 'spouse-ssn', 'spouse-dob', 'spouse-phone'].includes(id)
+}
+
+function isBusinessFieldTarget(id = '') {
+  return ['business-name', 'business-ein', 'business-work-phone'].includes(id)
+}
+
+function isDiscountFeeFieldTarget(id = '') {
+  return ['fee-summary-service-fee', 'fee-summary-total-fees', 'fee-summary-balance'].includes(id)
+}
+
+function isBillingScheduleFieldTarget(id = '') {
+  return ['custom-1784672403784', 'custom-1784672412360', 'custom-1784672419999', 'custom-1784672432443', 'custom-1784672467904', 'custom-1784672476809'].includes(id)
+}
+
+function isCardPaymentFieldTarget(id = '') {
+  return ['payment-card-type', 'payment-cardholder-name', 'payment-card-number', 'payment-card-expiration', 'payment-card-cvv'].includes(id)
+}
+
+function isBankPaymentFieldTarget(id = '') {
+  return ['payment-bank-name', 'payment-account-holder-name', 'payment-account-number', 'payment-routing-number'].includes(id)
+}
+
+function isLongAddressFieldTarget(id = '') {
+  return ['physical-address', 'mailing-address'].includes(id)
+}
+
+function isCompactNumericFieldTarget(id = '') {
+  return ['client-ssn', 'spouse-ssn', 'client-cell-phone', 'client-home-phone', 'spouse-phone', 'business-work-phone'].includes(id)
+}
+
+function getRedAutofillTargetValue(context, id = '') {
+  switch (id) {
+    case 'agreement-effective-date':
+      return getCurrentDateLabel()
+    case 'agreement-client-full-name':
+      return context.fullName
+    case 'custom-1784669349065':
+      return [context.fullName, context.mailingAddress, `${context.mailingCity}${context.mailingCity && context.mailingState ? ', ' : ''}${context.mailingState} ${context.mailingZip}`.trim()].filter(Boolean).join(' ')
+    case 'custom-1784669201362':
+      return '0317-33812'
+    case 'custom-1784669313950':
+      return context.showBusinessFields ? [context.ssn, context.businessEin].filter(Boolean).join(' & ') : context.ssn
+    case 'custom-1784669326548':
+      return context.phone
+    case 'custom-1784669211927':
+      return 'P03152236'
+    case 'custom-1784669186192':
+      return 'Caprizio Fornaro 23652 Lexington Ct, Laguna Niguel CA 92677'
+    case 'custom-1784669220785':
+      return '949-590-6731'
+    case 'custom-1784669268807':
+      return 'Income'
+    case 'custom-1784669278409':
+      return '1040'
+    case 'custom-1784669295728':
+      return context.unfiledYearsLabel
+    case 'custom-1784670092270':
+      return context.paymentCardTypeLabel || context.paymentCardholderNameLabel || context.paymentCardNumberLabel || context.paymentCardExpirationLabel || context.paymentCardCvvLabel ? 'Yes' : ''
+    case 'client-last-name':
+      return context.lastName
+    case 'client-first-name':
+      return context.firstName
+    case 'client-mi':
+      return context.middleInitial
+    case 'client-ssn':
+      return context.ssn
+    case 'client-dob':
+      return context.dob
+    case 'spouse-last-name':
+      return context.spouseLastName
+    case 'spouse-first-name':
+      return context.spouseFirstName
+    case 'spouse-ssn':
+      return context.spouseSsn
+    case 'spouse-dob':
+      return context.spouseDob
+    case 'physical-address':
+      return context.physicalAddress
+    case 'mailing-address':
+      return context.mailingAddress
+    case 'physical-city':
+      return context.city
+    case 'mailing-city':
+      return context.mailingCity
+    case 'physical-state':
+      return context.stateCode
+    case 'mailing-state':
+      return context.mailingState
+    case 'physical-zip':
+      return context.zipCode
+    case 'mailing-zip':
+      return context.mailingZip
+    case 'client-email':
+      return context.email
+    case 'client-cell-phone':
+    case 'client-home-phone':
+      return context.phone
+    case 'business-work-phone':
+      return context.businessWorkPhone
+    case 'spouse-phone':
+      return context.spousePhone
+    case 'business-name':
+      return context.businessName
+    case 'business-ein':
+      return context.businessEin
+    case 'fee-summary-service-fee':
+    case 'fee-summary-total-fees':
+    case 'fee-summary-balance':
+      return context.effectiveInvoiceAmount < 500 ? context.discountedFeeLabel : ''
+    case 'section2-tax-type':
+      return context.taxTypeLabel
+    case 'section2-tax-agency':
+      return context.taxAgencyLabel
+    case 'section2-estimated-liability':
+      return context.estimatedLiabilityLabel
+    case 'section2-unfiled-years':
+      return context.unfiledYearsLabel
+    case 'payment-card-type':
+      return context.paymentCardTypeLabel
+    case 'payment-cardholder-name':
+      return context.paymentCardholderNameLabel
+    case 'payment-card-number':
+      return context.paymentCardNumberLabel
+    case 'payment-card-expiration':
+      return context.paymentCardExpirationLabel
+    case 'payment-card-cvv':
+      return context.paymentCardCvvLabel
+    case 'custom-1784672403784':
+      return context.billingScheduleDate1Label
+    case 'custom-1784672412360':
+      return context.billingScheduleAmount1Label
+    case 'custom-1784672419999':
+      return context.billingScheduleDate2Label
+    case 'custom-1784672467904':
+      return context.billingScheduleAmount2Label
+    case 'custom-1784672432443':
+      return context.billingScheduleDate3Label
+    case 'custom-1784672476809':
+      return context.billingScheduleAmount3Label
+    case 'payment-bank-name':
+      return context.paymentBankNameLabel
+    case 'payment-account-holder-name':
+      return context.paymentAccountHolderNameLabel
+    case 'payment-account-number':
+      return context.paymentAccountNumberLabel
+    case 'payment-routing-number':
+      return context.paymentRoutingNumberLabel
+    default:
+      return ''
+  }
+}
+
+function getPercentBoxRect(page, target) {
+  const pageWidth = page.getWidth()
+  const pageHeight = page.getHeight()
+  return {
+    x: pageWidth * (target.left / 100),
+    y: pageHeight * (1 - (target.top + target.height) / 100),
+    width: pageWidth * (target.width / 100),
+    height: pageHeight * (target.height / 100),
+  }
+}
+
+function wrapTextForWidth(font, text, fontSize, maxWidth) {
+  const value = String(text || '').trim()
+  if (!value) return []
+  const words = value.split(/\s+/)
+  const lines = []
+  let currentLine = ''
+  for (const word of words) {
+    const candidate = currentLine ? `${currentLine} ${word}` : word
+    if (!currentLine || font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
+      currentLine = candidate
+    } else {
+      lines.push(currentLine)
+      currentLine = word
+    }
+  }
+  if (currentLine) lines.push(currentLine)
+  return lines
+}
+
+function drawPacketText(page, font, text, target, { widthScale = 0.78, heightScale = 0.68, minFontSize = 8.5, maxFontSize = 12, multiline = false } = {}) {
+  const value = String(text || '').trim()
+  if (!value) return
+  const box = shrinkOverlayBox(target, widthScale, heightScale)
+  const rect = getPercentBoxRect(page, box)
+  let fontSize = Math.max(minFontSize, Math.min(maxFontSize, rect.height * 0.72))
+  let lines = multiline ? value.split('\n').filter(Boolean) : wrapTextForWidth(font, value, fontSize, rect.width)
+  while (fontSize > minFontSize && lines.length * fontSize * 1.15 > rect.height) {
+    fontSize -= 0.4
+    lines = multiline ? value.split('\n').filter(Boolean) : wrapTextForWidth(font, value, fontSize, rect.width)
+  }
+  let currentY = rect.y + rect.height - fontSize * 0.95
+  lines.forEach((line) => {
+    page.drawText(String(line), { x: rect.x, y: currentY, size: fontSize, font, color: rgb(0.1, 0.1, 0.1) })
+    currentY -= fontSize * 1.12
+  })
+}
+
+async function drawPacketSignature(page, pdfDoc, dataUrl, target) {
+  const payload = dataUrlToBuffer(dataUrl)
+  if (!payload?.buffer?.length) return
+  let signatureImage = null
+  if (payload.mimeType.includes('png')) signatureImage = await pdfDoc.embedPng(payload.buffer)
+  else if (payload.mimeType.includes('jpeg') || payload.mimeType.includes('jpg')) signatureImage = await pdfDoc.embedJpg(payload.buffer)
+  if (!signatureImage) return
+  const rect = getPercentBoxRect(page, target)
+  page.drawImage(signatureImage, {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+  })
+}
+
+function drawPacketStrike(page, target) {
+  const rect = getPercentBoxRect(page, target)
+  const midY = rect.y + rect.height / 2
+  page.drawLine({
+    start: { x: rect.x, y: midY },
+    end: { x: rect.x + rect.width, y: midY },
+    thickness: Math.max(1, rect.height),
+    color: rgb(0.12, 0.12, 0.12),
+  })
+}
+
 async function buildSigned8821PdfBuffer(answers = {}) {
   const outputPdf = await PDFDocument.create()
-  const backgroundBytes = await load8821BackgroundImageBytes()
-  const background = await outputPdf.embedPng(backgroundBytes)
-  const page = outputPdf.addPage([background.width, background.height])
-  page.drawImage(background, { x: 0, y: 0, width: background.width, height: background.height })
-
   const font = await outputPdf.embedFont(StandardFonts.Helvetica)
   const boldFont = await outputPdf.embedFont(StandardFonts.HelveticaBold)
   const signatureMap = parseStoredTargetMap(answers.esign_signatures_by_target)
-  const primarySignature = signatureMap['agreement-client-signature'] || signatureMap['billing-signature'] || signatureMap['communications-signature'] || ''
-  const signaturePayload = dataUrlToBuffer(primarySignature)
-  const values = get8821PdfValues(answers)
+  const dateMap = parseStoredTargetMap(answers.esign_dates_by_target)
+  const context = getRedPacketRenderContext(answers)
 
-  drawMultilineText(page, font, values.taxpayerBlock.split('\n'), {
-    leftRatio: 0.108,
-    topRatio: 0.152,
-    fontSize: 10.5,
-    lineHeight: 12,
-  })
-  drawWrappedText(page, font, values.taxpayerTin, { leftRatio: 0.595, topRatio: 0.152, maxWidthRatio: 0.16, fontSize: 10.5 })
-  drawWrappedText(page, font, values.taxpayerPhone, { leftRatio: 0.595, topRatio: 0.191, maxWidthRatio: 0.18, fontSize: 10.5 })
-  drawMultilineText(page, font, values.designeeBlock.split('\n'), {
-    leftRatio: 0.108,
-    topRatio: 0.279,
-    fontSize: 10.5,
-    lineHeight: 12,
-  })
-  drawWrappedText(page, font, values.designeePhone, { leftRatio: 0.61, topRatio: 0.39, maxWidthRatio: 0.18, fontSize: 10 })
-  drawWrappedText(page, font, values.taxTypeLabel, { leftRatio: 0.08, topRatio: 0.488, maxWidthRatio: 0.2, fontSize: 9.5 })
-  drawWrappedText(page, font, values.formNumberLabel, { leftRatio: 0.325, topRatio: 0.488, maxWidthRatio: 0.16, fontSize: 9.5 })
-  drawWrappedText(page, font, values.yearsLabel, { leftRatio: 0.555, topRatio: 0.488, maxWidthRatio: 0.15, fontSize: 9.5 })
-  drawWrappedText(page, font, values.specificMattersLabel, { leftRatio: 0.742, topRatio: 0.488, maxWidthRatio: 0.17, fontSize: 9 })
+  for (const pageNumber of RED_PACKET_PAGES) {
+    const backgroundBytes = await loadRedPacketPageImageBytes(pageNumber)
+    const background = await outputPdf.embedPng(backgroundBytes)
+    const page = outputPdf.addPage([background.width, background.height])
+    page.drawImage(background, { x: 0, y: 0, width: background.width, height: background.height })
 
-  if (signaturePayload?.buffer?.length) {
-    let signatureImage = null
-    if (signaturePayload.mimeType.includes('png')) {
-      signatureImage = await outputPdf.embedPng(signaturePayload.buffer)
-    } else if (signaturePayload.mimeType.includes('jpeg') || signaturePayload.mimeType.includes('jpg')) {
-      signatureImage = await outputPdf.embedJpg(signaturePayload.buffer)
+    const pageSignatureTargets = RED_SIGNATURE_TARGETS.filter((target) => target.page === pageNumber)
+    for (const target of pageSignatureTargets) {
+      const dataUrl = signatureMap[target.id] || ''
+      if (!dataUrl) continue
+      await drawPacketSignature(page, outputPdf, dataUrl, target)
     }
-    if (signatureImage) {
-      page.drawImage(signatureImage, {
-        x: page.getWidth() * 0.1,
-        y: page.getHeight() * 0.114,
-        width: page.getWidth() * 0.2,
-        height: page.getHeight() * 0.05,
+
+    const pageDateTargets = RED_DATE_TARGETS.filter((target) => target.page === pageNumber)
+    for (const target of pageDateTargets) {
+      const dateValue = dateMap[target.id] || ''
+      if (!dateValue) continue
+      drawPacketText(page, font, dateValue, target, { widthScale: 1, heightScale: 1, minFontSize: 8.5, maxFontSize: 11 })
+    }
+
+    const pageFullNameTargets = RED_FULL_NAME_TARGETS.filter((target) => target.page === pageNumber)
+    for (const target of pageFullNameTargets) {
+      const displayName = target.id === 'cancellation-spouse-print-name' ? context.spouseFullName : context.fullName
+      if (!displayName) continue
+      drawPacketText(page, boldFont, displayName, target, { widthScale: 0.76, heightScale: 0.62, minFontSize: 8.5, maxFontSize: 11 })
+    }
+
+    const pageAutofillTargets = RED_AUTOFILL_TARGETS.filter((target) => target.page === pageNumber).filter((target) => {
+      if (isSpouseFieldTarget(target.id)) return context.showSpouseFields
+      if (isBusinessFieldTarget(target.id)) return context.showBusinessFields
+      if (isBillingScheduleFieldTarget(target.id)) return context.showPaymentScheduleFields
+      if (isCardPaymentFieldTarget(target.id)) return context.primaryPaymentMethodKind !== 'bank'
+      if (isBankPaymentFieldTarget(target.id)) return context.primaryPaymentMethodKind !== 'card'
+      return true
+    })
+    for (const target of pageAutofillTargets) {
+      const value = getRedAutofillTargetValue(context, target.id)
+      if (!value) continue
+      const isCompactNumericField = isCompactNumericFieldTarget(target.id)
+      const isLongAddressField = isLongAddressFieldTarget(target.id)
+      drawPacketText(page, font, value, target, {
+        widthScale: isLongAddressField ? 0.94 : isCompactNumericField ? 0.92 : 0.74,
+        heightScale: 0.62,
+        minFontSize: 8,
+        maxFontSize: 10.5,
       })
     }
-  }
 
-  drawWrappedText(page, font, values.signatureDateLabel, { leftRatio: 0.705, topRatio: 0.836, maxWidthRatio: 0.14, fontSize: 10.5 })
-  drawWrappedText(page, boldFont, values.printNameLabel, { leftRatio: 0.108, topRatio: 0.889, maxWidthRatio: 0.36, fontSize: 10.5 })
+    if (context.effectiveInvoiceAmount === 375) {
+      const pageStrikeTargets = RED_DISCOUNT_STRIKE_TARGETS.filter((target) => target.page === pageNumber)
+      pageStrikeTargets.forEach((target) => drawPacketStrike(page, target))
+    }
+  }
 
   return Buffer.from(await outputPdf.save())
 }
