@@ -2388,6 +2388,69 @@ function getBoldsignConfig() {
   }
 }
 
+function summarizeBoldsignRequest({ path = '', query, body } = {}) {
+  const normalizedPath = String(path || '').trim()
+  const summary = {
+    path: normalizedPath,
+    query: query && typeof query === 'object' ? { ...query } : {},
+  }
+  if (!body || typeof body !== 'object') return summary
+
+  if (normalizedPath === 'v1/template/send') {
+    summary.body = {
+      Title: body.Title,
+      DisableEmails: body.DisableEmails,
+      EnableEmbeddedSigning: body.EnableEmbeddedSigning,
+      EnableSigningOrder: body.EnableSigningOrder,
+      roleCount: Array.isArray(body.Roles) ? body.Roles.length : 0,
+      roles: Array.isArray(body.Roles)
+        ? body.Roles.map((role) => ({
+            RoleIndex: role?.RoleIndex,
+            SignerName: role?.SignerName,
+            SignerEmail: role?.SignerEmail,
+            SignerType: role?.SignerType,
+            Locale: role?.Locale,
+            existingFormFieldCount: Array.isArray(role?.ExistingFormFields) ? role.ExistingFormFields.length : 0,
+          }))
+        : [],
+    }
+    return summary
+  }
+
+  if (normalizedPath === 'v1/document/getEmbeddedSignLink') {
+    summary.body = undefined
+    summary.query = {
+      documentId: query?.documentId,
+      signerEmail: query?.signerEmail,
+      redirectUrl: query?.redirectUrl,
+    }
+    return summary
+  }
+
+  if (normalizedPath === 'v1/document/send') {
+    summary.body = {
+      Title: body.Title,
+      DisableEmails: body.DisableEmails,
+      AutoDetectFields: body.AutoDetectFields,
+      EnableEmbeddedSigning: body.EnableEmbeddedSigning,
+      UseTextTags: body.UseTextTags,
+      fileCount: Array.isArray(body.Files) ? body.Files.length : 0,
+      signers: Array.isArray(body.Signers)
+        ? body.Signers.map((signer) => ({
+            Name: signer?.Name,
+            EmailAddress: signer?.EmailAddress,
+            SignerType: signer?.SignerType,
+            Locale: signer?.Locale,
+          }))
+        : [],
+    }
+    return summary
+  }
+
+  summary.body = body
+  return summary
+}
+
 async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
   const config = getBoldsignConfig()
   if (!config.ready) {
@@ -2425,6 +2488,14 @@ async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
     error.status = response.status
     if (retryAfterSeconds) error.retryAfterSeconds = retryAfterSeconds
     if (response.status === 429) error.noRetry = true
+    error.boldsign = {
+      path,
+      method,
+      status: response.status,
+      retryAfterSeconds,
+      response: data,
+      request: summarizeBoldsignRequest({ path, query, body }),
+    }
     throw error
   }
   return data
@@ -4685,6 +4756,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       spouseLink: documentType === '8821 Document' && spouseRecipientEmail ? links.form8821SpouseLink : '',
     })
   } catch (error) {
+    if (error?.boldsign) {
+      console.error('BoldSign send-document-email debug:', error.boldsign)
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to send document email.' })
   }
 })
@@ -4739,6 +4813,9 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('BoldSign 8821 recipient view failed:', error)
+    if (error?.boldsign) {
+      console.error('BoldSign 8821 recipient view debug:', error.boldsign)
+    }
     const status = typeof error?.status === 'number' ? error.status : 500
     if (status === 429) {
       const retryAfterSeconds = typeof error?.retryAfterSeconds === 'number' && Number.isFinite(error.retryAfterSeconds) ? error.retryAfterSeconds : 60
