@@ -432,6 +432,26 @@ function getSigned8821FirstPageDocumentRecord(answers = {}) {
   return eaDocuments.find((doc) => doc && (doc.id === 'system_signed_8821_first_page' || doc.category === 'IRS Form 8821 First Page')) || null
 }
 
+function stripSigned8821DocumentPayloads(answers = {}) {
+  const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  if (!Array.isArray(current) || !current.length) return false
+  let changed = false
+  const nextDocuments = current.map((doc) => {
+    if (!doc || typeof doc !== 'object') return doc
+    const isSigned8821Doc =
+      String(doc.id || '').trim() === 'system_signed_8821_form' || String(doc.category || '').trim() === 'IRS Form 8821'
+    const isSigned8821Page1 =
+      String(doc.id || '').trim() === 'system_signed_8821_first_page' || String(doc.category || '').trim() === 'IRS Form 8821 First Page'
+    if (!isSigned8821Doc && !isSigned8821Page1) return doc
+    if (!('dataUrl' in doc) || !doc.dataUrl) return doc
+    changed = true
+    const { dataUrl, ...rest } = doc
+    return rest
+  })
+  if (changed) answers.ea_documents = nextDocuments
+  return changed
+}
+
 function upsertSigned8821DocumentRecord(answers = {}, documentRecord) {
   const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   const nextDocuments = Array.isArray(current) ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_form' && doc.category !== 'IRS Form 8821') : []
@@ -529,7 +549,8 @@ function hasPersistedSigned8821Record(answers = {}) {
 }
 
 function normalizePersistedSigned8821State(answers = {}) {
-  if (!hasPersistedSigned8821Record(answers) && !isForm8821FullySigned(answers)) return false
+  const strippedPayloads = stripSigned8821DocumentPayloads(answers)
+  if (!hasPersistedSigned8821Record(answers) && !isForm8821FullySigned(answers)) return strippedPayloads
   const signedAt = String(answers?.boldsign_8821_signed_at || answers?.completed_at || answers?.signed_8821_saved_at || '').trim() || new Date().toISOString()
   const documentCode = getActive8821DocumentCode(answers)
   const beforeDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
@@ -537,7 +558,7 @@ function normalizePersistedSigned8821State(answers = {}) {
   markSigned8821DeliveryEntries(answers, signedAt, documentCode)
   const afterDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
   const afterReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
-  return beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
+  return strippedPayloads || beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
 }
 
 function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
@@ -570,6 +591,7 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
   const savedDocument = getSigned8821DocumentRecord(answers)
   const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
   if (savedPayload?.buffer?.length) {
+    let shouldPersistStrippedPayload = stripSigned8821DocumentPayloads(answers)
     const renderVersion = String(answers?.signed_8821_render_version || '').trim()
     if (renderVersion !== '3') {
       try {
@@ -604,6 +626,14 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
     } catch {
       // ignore; if probe fails, fall back to returning the stored payload
     }
+    if (shouldPersistStrippedPayload) {
+      room.state.updatedAt = Date.now()
+      try {
+        await dbUpsertSession({ code: roomCode, state: room.state })
+      } catch {
+        // ignore; still return the legacy payload for this request
+      }
+    }
     return {
       fileBuffer: savedPayload.buffer,
       contentType: savedPayload.mimeType || 'application/pdf',
@@ -630,7 +660,6 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
 
   if (cleanedBuffer?.length) {
     try {
-      const dataUrl = `data:application/pdf;base64,${Buffer.from(cleanedBuffer).toString('base64')}`
       upsertSigned8821DocumentRecord(answers, {
         id: 'system_signed_8821_form',
         name: 'Signed Form 8821.pdf',
@@ -639,8 +668,8 @@ async function loadSigned8821DocumentPayload(roomCode, room) {
         size: cleanedBuffer.length,
         uploadedAt: new Date().toISOString(),
         uploadedBy: 'System',
-        dataUrl,
       })
+      stripSigned8821DocumentPayloads(answers)
       answers.signed_8821_saved_at = new Date().toISOString()
       answers.signed_8821_file_name = getSaved8821Filename(answers)
       const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
@@ -664,6 +693,7 @@ async function loadSigned8821FirstPageDocumentPayload(roomCode, room) {
   const savedDocument = getSigned8821FirstPageDocumentRecord(answers)
   const savedPayload = dataUrlToBuffer(savedDocument?.dataUrl || '')
   if (savedPayload?.buffer?.length) {
+    let shouldPersistStrippedPayload = stripSigned8821DocumentPayloads(answers)
     const renderVersion = String(answers?.signed_8821_first_page_render_version || '').trim()
     if (renderVersion !== '1') {
       try {
@@ -677,6 +707,14 @@ async function loadSigned8821FirstPageDocumentPayload(roomCode, room) {
         }
       } catch {
         // fall through
+      }
+    }
+    if (shouldPersistStrippedPayload) {
+      room.state.updatedAt = Date.now()
+      try {
+        await dbUpsertSession({ code: roomCode, state: room.state })
+      } catch {
+        // ignore; still return the legacy payload for this request
       }
     }
     return {
@@ -733,7 +771,6 @@ function stripPdfWidgetPlaceholders(pdfDoc) {
 async function refreshSigned8821StoredPdf(roomCode, room) {
   const answers = room?.state?.answers || {}
   const pdfBuffer = await buildSigned8821PdfBuffer(answers)
-  const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
   upsertSigned8821DocumentRecord(answers, {
     id: 'system_signed_8821_form',
     name: 'Signed Form 8821.pdf',
@@ -742,8 +779,8 @@ async function refreshSigned8821StoredPdf(roomCode, room) {
     size: pdfBuffer.length,
     uploadedAt: new Date().toISOString(),
     uploadedBy: 'System',
-    dataUrl,
   })
+  stripSigned8821DocumentPayloads(answers)
   const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
   markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
@@ -761,7 +798,6 @@ async function refreshSigned8821StoredPdf(roomCode, room) {
 async function refreshSigned8821FirstPageStoredPdf(roomCode, room) {
   const answers = room?.state?.answers || {}
   const pdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
-  const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
   upsertSigned8821FirstPageDocumentRecord(answers, {
     id: 'system_signed_8821_first_page',
     name: 'Signed Form 8821 Page 1.pdf',
@@ -770,8 +806,8 @@ async function refreshSigned8821FirstPageStoredPdf(roomCode, room) {
     size: pdfBuffer.length,
     uploadedAt: new Date().toISOString(),
     uploadedBy: 'System',
-    dataUrl,
   })
+  stripSigned8821DocumentPayloads(answers)
   answers.signed_8821_first_page_saved_at = new Date().toISOString()
   answers.signed_8821_first_page_file_name = getSaved8821FirstPageFilename(answers)
   answers.signed_8821_first_page_render_version = '1'
@@ -1553,8 +1589,6 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     pdfBuffer = await buildSigned8821PdfBuffer(answers)
   }
   const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
-  const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
-  const firstPageDataUrl = `data:application/pdf;base64,${firstPagePdfBuffer.toString('base64')}`
   const existingDocument = getSigned8821DocumentRecord(answers)
   upsertSigned8821DocumentRecord(answers, {
     id: 'system_signed_8821_form',
@@ -1564,7 +1598,6 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     size: pdfBuffer.length,
     uploadedAt: new Date().toISOString(),
     uploadedBy: 'System',
-    dataUrl,
   })
   upsertSigned8821FirstPageDocumentRecord(answers, {
     id: 'system_signed_8821_first_page',
@@ -1574,8 +1607,8 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     size: firstPagePdfBuffer.length,
     uploadedAt: new Date().toISOString(),
     uploadedBy: 'System',
-    dataUrl: firstPageDataUrl,
   })
+  stripSigned8821DocumentPayloads(answers)
   const signedAt = String(answers.boldsign_8821_signed_at || answers.completed_at || '').trim() || new Date().toISOString()
   markSigned8821DeliveryEntries(answers, signedAt)
   answers.signed_8821_saved_at = new Date().toISOString()
