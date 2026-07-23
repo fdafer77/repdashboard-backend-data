@@ -328,6 +328,11 @@ function formatCurrentDateLabel(value = '') {
   return `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}/${now.getFullYear()}`
 }
 
+function isBoldsignCompletedDocumentError(error) {
+  const message = String(error?.message || '').trim().toLowerCase()
+  return message.includes('already been completed') || message.includes('document already complete')
+}
+
 function formatDobValue(value = '') {
   const normalized = String(value || '').trim()
   if (!normalized) return ''
@@ -1218,7 +1223,7 @@ function isCompactNumericFieldTarget(id = '') {
 function getRedAutofillTargetValue(context, id = '') {
   switch (id) {
     case 'agreement-effective-date':
-      return getCurrentDateLabel()
+      return formatCurrentDateLabel()
     case 'agreement-client-full-name':
       return context.fullName
     case 'custom-1784669349065':
@@ -2752,6 +2757,7 @@ async function createBoldsign8821SigningLink({
   documentFieldPrefix = 'boldsign_8821',
   spouseSignerEmail = '',
   spouseSignerName = '',
+  forceNewDocument = false,
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) throw new Error('sessionCode is required')
@@ -2791,11 +2797,13 @@ async function createBoldsign8821SigningLink({
   const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
 
   const existingDocumentId = String(answers?.[`${documentFieldPrefix}_document_id`] || '').trim()
-  const shouldReuseExistingDocument = Boolean(existingDocumentId) && !isForm8821FullySigned(answers)
+  const shouldReuseExistingDocument = !forceNewDocument && Boolean(existingDocumentId) && !isForm8821FullySigned(answers)
 
-  const sendResult = shouldReuseExistingDocument
-    ? { documentId: existingDocumentId }
-    : isTemplateConfigured
+  let documentId = ''
+  if (shouldReuseExistingDocument) {
+    documentId = existingDocumentId
+  } else {
+    const sendResult = isTemplateConfigured
       ? await boldsignFetch('v1/template/send', {
           method: 'POST',
           query: { templateId: selectedTemplateId },
@@ -2867,9 +2875,10 @@ async function createBoldsign8821SigningLink({
               ],
             },
           })
-        })()
+        })
 
-  const documentId = String(sendResult?.documentId || '').trim()
+    documentId = String(sendResult?.documentId || '').trim()
+  }
   if (!documentId) throw new Error('BoldSign did not return a documentId.')
 
   if (persistDocument) {
@@ -2889,13 +2898,43 @@ async function createBoldsign8821SigningLink({
     }
   }
 
-  return {
-    documentId,
-    signingUrl: await getBoldsignEmbeddedSignLink({
+  try {
+    return {
       documentId,
-      signerEmail: resolvedSignerEmail,
-      redirectUrl: resolvedReturnUrl,
-    }),
+      signingUrl: await getBoldsignEmbeddedSignLink({
+        documentId,
+        signerEmail: resolvedSignerEmail,
+        redirectUrl: resolvedReturnUrl,
+      }),
+    }
+  } catch (error) {
+    if (shouldReuseExistingDocument && isBoldsignCompletedDocumentError(error)) {
+      const room = await ensureRoom(normalizedSessionCode)
+      room.state.answers[`${documentFieldPrefix}_document_id`] = ''
+      room.state.answers[`${documentFieldPrefix}_file_name`] = ''
+      room.state.answers[`${documentFieldPrefix}_sent_at`] = ''
+      room.state.answers[`${documentFieldPrefix}_sender_email`] = ''
+      room.state.updatedAt = Date.now()
+      io.to(normalizedSessionCode).emit('room_state', room.state)
+      try {
+        await dbUpsertSession({ code: normalizedSessionCode, state: room.state })
+      } catch {
+        // ignore; room state still updates in-memory
+      }
+      return createBoldsign8821SigningLink({
+        sessionCode: normalizedSessionCode,
+        signerName: resolvedSignerName,
+        signerEmail: resolvedSignerEmail,
+        returnUrl: resolvedReturnUrl,
+        onBehalfOf,
+        persistDocument,
+        documentFieldPrefix,
+        spouseSignerEmail: spouseEmail,
+        spouseSignerName: spouseName,
+        forceNewDocument: true,
+      })
+    }
+    throw error
   }
 }
 
@@ -4603,6 +4642,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         onBehalfOf: String(req.adminUser?.email || '').trim(),
         persistDocument: true,
         documentFieldPrefix: 'boldsign_8821',
+        forceNewDocument: true,
       })
 
       const clientSigningUrl = String(created?.signingUrl || '').trim()
