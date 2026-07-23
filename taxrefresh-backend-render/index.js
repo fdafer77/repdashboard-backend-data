@@ -333,6 +333,24 @@ function isBoldsignCompletedDocumentError(error) {
   return message.includes('already been completed') || message.includes('document already complete')
 }
 
+function logMemoryDiagnostics(label = '', details = {}) {
+  try {
+    const usage = process.memoryUsage()
+    const toMb = (value) => Math.round((Number(value || 0) / (1024 * 1024)) * 10) / 10
+    console.log('8821 memory diagnostics:', {
+      label: String(label || '').trim(),
+      rssMb: toMb(usage.rss),
+      heapTotalMb: toMb(usage.heapTotal),
+      heapUsedMb: toMb(usage.heapUsed),
+      externalMb: toMb(usage.external),
+      arrayBuffersMb: toMb(usage.arrayBuffers),
+      ...details,
+    })
+  } catch {
+    // ignore logging failures
+  }
+}
+
 function formatDobValue(value = '') {
   const normalized = String(value || '').trim()
   if (!normalized) return ''
@@ -1592,6 +1610,10 @@ async function buildSigned8821FirstPagePdfBuffer(answers = {}) {
 async function ensureSigned8821StoredOnRecord(roomCode, room) {
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
+  logMemoryDiagnostics('ensureSigned8821StoredOnRecord:start', {
+    roomCode,
+    hasDocumentId: Boolean(String(answers.boldsign_8821_document_id || '').trim()),
+  })
 
   let pdfBuffer = null
   const documentId = String(answers.boldsign_8821_document_id || '').trim()
@@ -1608,14 +1630,28 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
       } catch {
         // ignore cleaning errors; fall back to the raw BoldSign payload
       }
+      logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-download', {
+        roomCode,
+        documentId,
+        pdfBytes: pdfBuffer?.length || 0,
+      })
     } catch {
       pdfBuffer = null
     }
   }
   if (!pdfBuffer?.length) {
     pdfBuffer = await buildSigned8821PdfBuffer(answers)
+    logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-build-main', {
+      roomCode,
+      pdfBytes: pdfBuffer?.length || 0,
+    })
   }
   const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
+  logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-build-page1', {
+    roomCode,
+    pdfBytes: pdfBuffer?.length || 0,
+    page1Bytes: firstPagePdfBuffer?.length || 0,
+  })
   const existingDocument = getSigned8821DocumentRecord(answers)
   upsertSigned8821DocumentRecord(answers, {
     id: 'system_signed_8821_form',
@@ -1664,6 +1700,11 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   } catch {
     // ignore; state still updates in-memory
   }
+  logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-persist', {
+    roomCode,
+    pdfBytes: pdfBuffer?.length || 0,
+    page1Bytes: firstPagePdfBuffer?.length || 0,
+  })
   void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
     console.error('Signed 8821 client email failed:', error)
   })
@@ -2274,6 +2315,11 @@ async function sendSigned8821CopyEmail({ roomCode, room }) {
 
 async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '', target = 'client' }) {
   const room = await ensureRoom(roomCode)
+  logMemoryDiagnostics('markBoldsign8821Completed:start', {
+    roomCode,
+    target: String(target || 'client'),
+    completedDocumentCode: String(completedDocumentCode || ''),
+  })
   if (completedDocumentCode) {
     room.state.answers.active_8821_document_code = completedDocumentCode
   }
@@ -2293,7 +2339,15 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
     room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
     markSigned8821DeliveryEntries(room.state.answers, room.state.answers.boldsign_8821_signed_at, completedDocumentCode)
+    logMemoryDiagnostics('markBoldsign8821Completed:before-store', {
+      roomCode,
+      target: normalizedTarget,
+    })
     await ensureSigned8821StoredOnRecord(roomCode, room)
+    logMemoryDiagnostics('markBoldsign8821Completed:after-store', {
+      roomCode,
+      target: normalizedTarget,
+    })
     void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
       console.error('Signed 8821 client email failed:', error)
     })
@@ -2306,6 +2360,10 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
   } catch {
     // ignore; session still works in-memory
   }
+  logMemoryDiagnostics('markBoldsign8821Completed:after-persist', {
+    roomCode,
+    target: normalizedTarget,
+  })
   void syncSessionToGhl({ roomCode, room, reason: 'form_8821_completed', force: true }).catch((error) => {
     console.error('GHL form 8821 completion sync failed:', error)
   })
@@ -2824,6 +2882,12 @@ async function createBoldsign8821SigningLink({
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) throw new Error('sessionCode is required')
+  logMemoryDiagnostics('createBoldsign8821SigningLink:start', {
+    sessionCode: normalizedSessionCode,
+    forceNewDocument: Boolean(forceNewDocument),
+    createReceiptOnCreate: Boolean(createReceiptOnCreate),
+    target: String(target || 'client'),
+  })
 
   const roomState = await getSessionStateForCode(normalizedSessionCode)
   if (!roomState) throw new Error('Session not found')
@@ -2941,6 +3005,11 @@ async function createBoldsign8821SigningLink({
         })
 
     documentId = String(sendResult?.documentId || '').trim()
+    logMemoryDiagnostics('createBoldsign8821SigningLink:after-document-create', {
+      sessionCode: normalizedSessionCode,
+      documentId,
+      target: String(target || 'client'),
+    })
   }
   if (!documentId) throw new Error('BoldSign did not return a documentId.')
 
@@ -3025,6 +3094,12 @@ async function createBoldsign8821SigningLink({
       }),
     }
   } catch (error) {
+    logMemoryDiagnostics('createBoldsign8821SigningLink:error', {
+      sessionCode: normalizedSessionCode,
+      documentId,
+      target: String(target || 'client'),
+      message: String(error?.message || ''),
+    })
     if (shouldReuseExistingDocument && isBoldsignCompletedDocumentError(error)) {
       const room = await ensureRoom(normalizedSessionCode)
       room.state.answers[`${documentFieldPrefix}_document_id`] = ''
