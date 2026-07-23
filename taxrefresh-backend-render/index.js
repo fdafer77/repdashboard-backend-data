@@ -67,6 +67,61 @@ let fallbackStoreLoaded = false
 let fallbackStoreLoadPromise = null
 let fallbackStoreWritePromise = Promise.resolve()
 
+function serializeCrashError(error) {
+  if (error instanceof Error) {
+    const plain = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    }
+    for (const key of Object.keys(error)) {
+      try {
+        plain[key] = error[key]
+      } catch {
+        // ignore unserializable fields
+      }
+    }
+    return plain
+  }
+  if (typeof error === 'object' && error !== null) {
+    try {
+      return JSON.parse(JSON.stringify(error))
+    } catch {
+      return { value: String(error) }
+    }
+  }
+  return { value: String(error) }
+}
+
+function logGlobalCrash(eventName, error) {
+  try {
+    const usage = process.memoryUsage()
+    const toMb = (value) => Math.round((Number(value || 0) / (1024 * 1024)) * 10) / 10
+    console.error(`Global crash detected: ${eventName}`, {
+      pid: process.pid,
+      node: process.version,
+      uptimeSec: Math.round(process.uptime()),
+      rssMb: toMb(usage.rss),
+      heapTotalMb: toMb(usage.heapTotal),
+      heapUsedMb: toMb(usage.heapUsed),
+      externalMb: toMb(usage.external),
+      arrayBuffersMb: toMb(usage.arrayBuffers),
+      error: serializeCrashError(error),
+    })
+  } catch (loggingError) {
+    console.error(`Global crash detected: ${eventName}`, error)
+    console.error('Crash logger failure:', loggingError)
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  logGlobalCrash('uncaughtException', error)
+})
+
+process.on('unhandledRejection', (reason) => {
+  logGlobalCrash('unhandledRejection', reason)
+})
+
 function getCodeVariants(code = '') {
   const normalized = String(code || '').trim()
   if (!normalized) return []
