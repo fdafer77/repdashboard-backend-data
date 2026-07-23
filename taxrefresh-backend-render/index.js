@@ -2522,7 +2522,6 @@ async function createBoldsign8821SigningLink({
                     ExistingFormFields: existingFormFields,
                   },
                 ],
-                RoleRemovalIndices: [2],
               }),
         },
       })
