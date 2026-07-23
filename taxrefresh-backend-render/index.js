@@ -450,6 +450,19 @@ function getSigned8821FirstPageDocumentRecord(answers = {}) {
   return eaDocuments.find((doc) => doc && (doc.id === 'system_signed_8821_first_page' || doc.category === 'IRS Form 8821 First Page')) || null
 }
 
+const signed8821StoreInFlight = new Map()
+
+function hasFreshSigned8821StoredRecord(answers = {}) {
+  return Boolean(
+    getSigned8821DocumentRecord(answers) &&
+      getSigned8821FirstPageDocumentRecord(answers) &&
+      String(answers?.signed_8821_saved_at || '').trim() &&
+      String(answers?.signed_8821_first_page_saved_at || '').trim() &&
+      String(answers?.signed_8821_render_version || '').trim() === '3' &&
+      String(answers?.signed_8821_first_page_render_version || '').trim() === '1',
+  )
+}
+
 function stripSigned8821DocumentPayloads(answers = {}) {
   const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   if (!Array.isArray(current) || !current.length) return false
@@ -1608,10 +1621,22 @@ async function buildSigned8821FirstPagePdfBuffer(answers = {}) {
 }
 
 async function ensureSigned8821StoredOnRecord(roomCode, room) {
+  const normalizedRoomCode = String(roomCode || '').trim().toUpperCase()
+  if (!normalizedRoomCode) return false
+  if (signed8821StoreInFlight.has(normalizedRoomCode)) {
+    logMemoryDiagnostics('ensureSigned8821StoredOnRecord:skip-inflight', { roomCode: normalizedRoomCode })
+    return signed8821StoreInFlight.get(normalizedRoomCode)
+  }
+
+  const task = (async () => {
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
+  if (hasFreshSigned8821StoredRecord(answers)) {
+    logMemoryDiagnostics('ensureSigned8821StoredOnRecord:skip-fresh', { roomCode: normalizedRoomCode })
+    return false
+  }
   logMemoryDiagnostics('ensureSigned8821StoredOnRecord:start', {
-    roomCode,
+    roomCode: normalizedRoomCode,
     hasDocumentId: Boolean(String(answers.boldsign_8821_document_id || '').trim()),
   })
 
@@ -1631,7 +1656,7 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
         // ignore cleaning errors; fall back to the raw BoldSign payload
       }
       logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-download', {
-        roomCode,
+        roomCode: normalizedRoomCode,
         documentId,
         pdfBytes: pdfBuffer?.length || 0,
       })
@@ -1642,13 +1667,13 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   if (!pdfBuffer?.length) {
     pdfBuffer = await buildSigned8821PdfBuffer(answers)
     logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-build-main', {
-      roomCode,
+      roomCode: normalizedRoomCode,
       pdfBytes: pdfBuffer?.length || 0,
     })
   }
   const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
   logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-build-page1', {
-    roomCode,
+    roomCode: normalizedRoomCode,
     pdfBytes: pdfBuffer?.length || 0,
     page1Bytes: firstPagePdfBuffer?.length || 0,
   })
@@ -1696,19 +1721,27 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   room.state.updatedAt = Date.now()
   io.to(roomCode).emit('room_state', room.state)
   try {
-    await dbUpsertSession({ code: roomCode, state: room.state })
+    await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
   } catch {
     // ignore; state still updates in-memory
   }
   logMemoryDiagnostics('ensureSigned8821StoredOnRecord:after-persist', {
-    roomCode,
+    roomCode: normalizedRoomCode,
     pdfBytes: pdfBuffer?.length || 0,
     page1Bytes: firstPagePdfBuffer?.length || 0,
   })
-  void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+  void sendSigned8821CopyEmail({ roomCode: normalizedRoomCode, room }).catch((error) => {
     console.error('Signed 8821 client email failed:', error)
   })
   return true
+  })()
+
+  signed8821StoreInFlight.set(normalizedRoomCode, task)
+  try {
+    return await task
+  } finally {
+    signed8821StoreInFlight.delete(normalizedRoomCode)
+  }
 }
 
 function parseStoredObject(value, fallback) {
