@@ -4473,6 +4473,14 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       const documentCode = createDocumentInstanceCode('red')
       answers.current_8821_document_code = documentCode
       answers.active_8821_document_code = documentCode
+      answers.boldsign_8821_document_id = ''
+      answers.boldsign_8821_spouse_document_id = ''
+      answers.boldsign_8821_file_name = ''
+      answers.boldsign_8821_spouse_file_name = ''
+      answers.boldsign_8821_sent_at = ''
+      answers.boldsign_8821_spouse_sent_at = ''
+      answers.boldsign_8821_sender_email = ''
+      answers.boldsign_8821_spouse_sender_email = ''
       clearSigned8821DocumentRecord(answers)
       clearSigned8821FirstPageDocumentRecord(answers)
       answers.boldsign_8821_signed_at = ''
