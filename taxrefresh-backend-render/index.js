@@ -2534,35 +2534,56 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const roomCode = String(row.session_code || '').trim().toUpperCase()
   const room = await ensureRoom(roomCode)
   const answers = room.state.answers || {}
+  const clientDocumentId = String(answers.boldsign_8821_document_id || '').trim()
+  const spouseDocumentId = String(answers.boldsign_8821_spouse_document_id || '').trim()
+  const matchedTarget = spouseDocumentId && spouseDocumentId === documentId ? 'spouse' : clientDocumentId && clientDocumentId === documentId ? 'client' : ''
   const activeDocumentCode = String(answers.active_8821_document_code || answers.current_8821_document_code || '').trim()
+  const resolvedDocumentCode = activeDocumentCode || createDocumentInstanceCode('red')
   const sentAt = new Date().toISOString()
   const normalizedType = eventType.toLowerCase()
   const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
   const spouseEmail = String(getSpouseSignerEmailFromAnswers(answers) || answers.spouse_email || '').trim().toLowerCase()
-  const target = signerEmail && spouseEmail && signerEmail === spouseEmail ? 'spouse' : 'client'
+  const target = matchedTarget || (signerEmail && spouseEmail && signerEmail === spouseEmail ? 'spouse' : 'client')
+  const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
+  answers.current_8821_document_code = answers.current_8821_document_code || resolvedDocumentCode
+  answers.active_8821_document_code = answers.active_8821_document_code || resolvedDocumentCode
 
   if (normalizedType.includes('verification')) return { handled: true, reason: 'verification', roomCode, eventType }
 
   if (normalizedType.includes('sent') || normalizedType.includes('created')) {
-    const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
     const receiptEntry = {
       id: `boldsign_${documentId}_${normalizedType}_${target}`,
       name: receiptName,
-      documentCode: activeDocumentCode,
+      documentCode: resolvedDocumentCode,
       status: 'Sent',
-      method: 'Email',
+      method: 'Experience',
       sentAt,
       recipientEmail: signerEmail,
       sentBy: 'BoldSign',
     }
     answers.document_delivery_log = [receiptEntry, ...parseStoredObject(answers.document_delivery_log, [])]
     answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
-      { name: receiptName, documentCode: activeDocumentCode, status: 'Sent' },
+      {
+        name: receiptName,
+        documentCode: resolvedDocumentCode,
+        status: 'Sent',
+        method: 'Experience',
+        sentAt,
+        recipientEmail: signerEmail,
+        sentBy: 'BoldSign',
+      },
     ])
+    if (target === 'spouse') {
+      answers.form8821_spouse_status = answers.form8821_spouse_status || 'launching'
+    } else {
+      answers.form8821_status = answers.form8821_status || 'launching'
+    }
+    answers.onboarding_status = String(answers.onboarding_status || '').trim() || 'documents_ready_for_signature'
   }
 
   if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
-    await markBoldsign8821Completed({ roomCode, completedDocumentCode: activeDocumentCode, target })
+    await markBoldsign8821Completed({ roomCode, completedDocumentCode: resolvedDocumentCode, target })
+    emitDashboardRecordsUpdated({ reason: 'boldsign_webhook_completed', roomCode, eventType, target, documentCode: resolvedDocumentCode })
     return { handled: true, reason: 'completed', roomCode, eventType, target }
   }
 
@@ -2572,7 +2593,7 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   } catch {
     // ignore; room state is still updated in memory
   }
-  emitDashboardRecordsUpdated({ reason: 'boldsign_webhook', roomCode, eventType, target })
+  emitDashboardRecordsUpdated({ reason: 'boldsign_webhook', roomCode, eventType, target, documentCode: resolvedDocumentCode })
   return { handled: true, reason: 'updated', roomCode, eventType, target }
 }
 
