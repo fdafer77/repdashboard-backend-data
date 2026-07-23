@@ -290,6 +290,23 @@ function formatCurrentDateLabel(value = '') {
   return `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}/${now.getFullYear()}`
 }
 
+function formatDobValue(value = '') {
+  const normalized = String(value || '').trim()
+  if (!normalized) return ''
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(normalized)) return normalized
+  if (/^\d{8}$/.test(normalized)) {
+    const month = normalized.slice(0, 2)
+    const day = normalized.slice(2, 4)
+    const year = normalized.slice(4)
+    return `${month}/${day}/${year}`
+  }
+  if (/^\d{4}-\d{2}-\d{2}/.test(normalized)) {
+    const [year, month, day] = normalized.slice(0, 10).split('-')
+    return `${month}/${day}/${year}`
+  }
+  return normalized
+}
+
 function formatYearsLabel(value) {
   if (Array.isArray(value)) return value.map((entry) => String(entry).trim()).filter(Boolean).join(', ')
   return String(value || '')
@@ -911,7 +928,7 @@ function getRedPacketRenderContext(answers = {}) {
   const mailingCity = String(getPrimaryAnswer(answers, ['mailing_city', 'mailingCity']) || city).trim()
   const mailingState = String(getPrimaryAnswer(answers, ['mailing_state', 'mailingState']) || stateCode).trim()
   const mailingZip = String(getPrimaryAnswer(answers, ['mailing_zip', 'mailingZip']) || zipCode).trim()
-  const dob = formatDobLabel(getPrimaryAnswer(answers, ['dob', 'date_of_birth', 'birthDate']))
+  const dob = formatDobValue(getPrimaryAnswer(answers, ['dob', 'date_of_birth', 'birthDate']))
   const ssn = formatSsnLabel(getPrimaryAnswer(answers, ['ssn']))
   const spouseFirstName = String(getPrimaryAnswer(answers, ['spouseFirstName', 'spouse_first_name']) || '').trim()
   const spouseLastName = String(getPrimaryAnswer(answers, ['spouseLastName', 'spouse_last_name']) || '').trim()
@@ -919,7 +936,7 @@ function getRedPacketRenderContext(answers = {}) {
     getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || [spouseFirstName, spouseLastName].filter(Boolean).join(' '),
   ).trim()
   const spouseSsn = formatSsnLabel(getPrimaryAnswer(answers, ['spouse_ssn', 'spouseSsn']))
-  const spouseDob = formatDobLabel(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
+  const spouseDob = formatDobValue(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
   const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || '').trim()
   const taxTypeValue = String(getPrimaryAnswer(answers, ['taxType']) || '').trim().toLowerCase()
   const taxTypeLabel = taxTypeValue === 'personal' ? 'Personal' : taxTypeValue === 'business' ? 'Business' : taxTypeValue === 'both' ? 'Both' : ''
