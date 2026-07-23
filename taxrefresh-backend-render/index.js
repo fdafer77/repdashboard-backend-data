@@ -296,12 +296,12 @@ function parseStoredTargetMap(value) {
 }
 
 function getNormalizedFilingStatus(answers = {}) {
-  const direct = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim().toLowerCase()
-  if (direct) return direct
   const profilePayload = parseStoredObject(answers?.client_portal_financial_profile_payload, null)
   const payloadValue =
     profilePayload && typeof profilePayload === 'object' ? String(profilePayload.filing_status || profilePayload.filingStatus || '').trim().toLowerCase() : ''
-  return payloadValue
+  if (payloadValue) return payloadValue
+  const direct = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim().toLowerCase()
+  return direct
 }
 
 function formatSsnLabel(value = '') {
