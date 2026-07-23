@@ -2326,10 +2326,11 @@ function getSpouseSignerNameFromAnswers(answers = {}) {
 
 function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
   const context = getRedPacketRenderContext(answers)
+  const isMarriedJoint = isMarriedJointFilingAnswers(answers)
   const fullName = [String(context.firstName || '').trim(), String(context.lastName || '').trim()].filter(Boolean).join(' ')
 
-  const spouseFirstName = String(context.spouseFirstName || '').trim()
-  const spouseLastName = String(context.spouseLastName || '').trim()
+  const spouseFirstName = isMarriedJoint ? String(context.spouseFirstName || '').trim() : ''
+  const spouseLastName = isMarriedJoint ? String(context.spouseLastName || '').trim() : ''
   const spouseFullName = [spouseFirstName, spouseLastName].filter(Boolean).join(' ')
 
   const mailingFull = [String(context.mailingAddress || '').trim(), String(context.mailingCity || '').trim(), String(context.mailingState || '').trim(), String(context.mailingZip || '').trim()]
@@ -2421,9 +2422,9 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
   const spouseFields = {
     Spouse_First_Name: spouseFirstName,
     Spouse_Last_Name: spouseLastName,
-    Spouse_SSN: String(context.spouseSsn || '').trim(),
-    Spouse_DOB: String(context.spouseDob || '').trim(),
-    Spouse_Phone_Number: String(context.spousePhone || '').trim(),
+    Spouse_SSN: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
+    Spouse_DOB: isMarriedJoint ? String(context.spouseDob || '').trim() : '',
+    Spouse_Phone_Number: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
   }
 
   return {
