@@ -23,6 +23,7 @@ const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || ''
 const GHL_SYNC_WEBHOOK_URL = String(process.env.GHL_SYNC_WEBHOOK_URL || '').trim()
 const GHL_SYNC_WEBHOOK_SECRET = String(process.env.GHL_SYNC_WEBHOOK_SECRET || '').trim()
 const GHL_SYNC_WEBHOOK_HEADER = String(process.env.GHL_SYNC_WEBHOOK_HEADER || 'x-webhook-secret').trim()
+const BOLDSIGN_WEBHOOK_SECRET = String(process.env.BOLDSIGN_WEBHOOK_SECRET || '').trim()
 const GHL_API_BASE_URL = String(process.env.GHL_API_BASE_URL || 'https://services.leadconnectorhq.com').trim().replace(/\/$/, '')
 const GHL_PRIVATE_INTEGRATION_TOKEN = String(process.env.GHL_PRIVATE_INTEGRATION_TOKEN || '').trim()
 const GHL_LOCATION_ID = String(process.env.GHL_LOCATION_ID || '').trim()
@@ -201,6 +202,34 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+app.post('/webhooks/boldsign', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
+  let payload = {}
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : {}
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON payload' })
+  }
+
+  const eventPayload = payload?.event && typeof payload.event === 'object' ? payload.event : payload
+  const eventType = String(eventPayload?.eventType || eventPayload?.event_type || '').trim()
+  if (eventType.toLowerCase() === 'verification') {
+    return res.status(200).json({ ok: true })
+  }
+
+  if (!verifyBoldsignWebhookSignature(rawBody, req.headers['x-boldsign-signature'])) {
+    return res.status(401).json({ error: 'Invalid BoldSign webhook signature' })
+  }
+
+  try {
+    await applyBoldsignWebhookEvent(eventPayload)
+    return res.status(200).json({ ok: true })
+  } catch (error) {
+    console.error('BoldSign webhook processing failed:', error)
+    return res.status(200).json({ ok: true })
+  }
+})
+
 const nanoid = customAlphabet('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 6)
 
 function generateSessionId() {
@@ -264,6 +293,15 @@ function parseStoredTargetMap(value) {
   return Object.fromEntries(
     Object.entries(parsed || {}).filter((entry) => typeof entry[0] === 'string' && typeof entry[1] === 'string'),
   )
+}
+
+function getNormalizedFilingStatus(answers = {}) {
+  const direct = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim().toLowerCase()
+  if (direct) return direct
+  const profilePayload = parseStoredObject(answers?.client_portal_financial_profile_payload, null)
+  const payloadValue =
+    profilePayload && typeof profilePayload === 'object' ? String(profilePayload.filing_status || profilePayload.filingStatus || '').trim().toLowerCase() : ''
+  return payloadValue
 }
 
 function formatSsnLabel(value = '') {
@@ -2178,6 +2216,124 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
   return room
 }
 
+function timingSafeEqualHex(a = '', b = '') {
+  const left = String(a || '').trim()
+  const right = String(b || '').trim()
+  if (!left || !right || left.length !== right.length) return false
+  try {
+    return crypto.timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+function verifyBoldsignWebhookSignature(rawBody, headerValue = '') {
+  if (!BOLDSIGN_WEBHOOK_SECRET) return true
+  const header = String(headerValue || '').trim()
+  if (!header) return false
+  const parts = header.split(',').map((part) => part.trim()).filter(Boolean)
+  let timestamp = ''
+  const signatures = []
+  parts.forEach((part) => {
+    const [key, value] = part.split('=')
+    if (key === 't') timestamp = String(value || '').trim()
+    if (key === 's0' || key === 'v1' || key === 'sig') signatures.push(String(value || '').trim())
+  })
+  if (!timestamp || !signatures.length) return false
+  const ageSeconds = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp || 0))
+  if (!Number.isFinite(ageSeconds) || ageSeconds > 60 * 10) return false
+  const payload = `${timestamp}.${rawBody}`
+  const expected = crypto.createHmac('sha256', BOLDSIGN_WEBHOOK_SECRET).update(payload).digest('hex')
+  return signatures.some((signature) => timingSafeEqualHex(expected, signature))
+}
+
+async function findSessionByBoldsignDocumentId(documentId = '') {
+  const normalized = String(documentId || '').trim()
+  if (!normalized) return null
+  if (pool) {
+    const res = await pool.query(
+      `select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+       from ti_sessions
+       where state->'answers'->>'boldsign_8821_document_id' = $1
+          or state->'answers'->>'boldsign_8821_spouse_document_id' = $1
+       order by updated_at desc
+       limit 1`,
+      [normalized],
+    )
+    if (res.rows[0]) return res.rows[0]
+  }
+  await ensureFallbackStoreLoaded()
+  for (const entry of fallbackSessions.values()) {
+    const answers = entry?.state?.answers || {}
+    if (String(answers.boldsign_8821_document_id || '').trim() === normalized || String(answers.boldsign_8821_spouse_document_id || '').trim() === normalized) {
+      return {
+        session_code: entry.sessionCode,
+        ghl_contact_id: entry.contactId,
+        ghl_opportunity_id: entry.opportunityId,
+        state: entry.state,
+        created_at: entry.createdAt,
+        updated_at: entry.updatedAt,
+      }
+    }
+  }
+  return null
+}
+
+async function applyBoldsignWebhookEvent(eventPayload = {}) {
+  const eventType = String(eventPayload?.eventType || eventPayload?.event_type || '').trim()
+  const data = eventPayload?.data && typeof eventPayload.data === 'object' ? eventPayload.data : {}
+  const document = data?.document && typeof data.document === 'object' ? data.document : data
+  const documentId = String(document?.documentId || document?.id || data?.documentId || data?.id || '').trim()
+  if (!documentId) return { handled: false, reason: 'missing_document_id', eventType }
+
+  const row = await findSessionByBoldsignDocumentId(documentId)
+  if (!row) return { handled: false, reason: 'session_not_found', eventType, documentId }
+
+  const roomCode = String(row.session_code || '').trim().toUpperCase()
+  const room = await ensureRoom(roomCode)
+  const answers = room.state.answers || {}
+  const activeDocumentCode = String(answers.active_8821_document_code || answers.current_8821_document_code || '').trim()
+  const sentAt = new Date().toISOString()
+  const normalizedType = eventType.toLowerCase()
+  const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
+  const spouseEmail = String(getSpouseSignerEmailFromAnswers(answers) || answers.spouse_email || '').trim().toLowerCase()
+  const target = signerEmail && spouseEmail && signerEmail === spouseEmail ? 'spouse' : 'client'
+
+  if (normalizedType.includes('verification')) return { handled: true, reason: 'verification', roomCode, eventType }
+
+  if (normalizedType.includes('sent') || normalizedType.includes('created')) {
+    const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
+    const receiptEntry = {
+      id: `boldsign_${documentId}_${normalizedType}_${target}`,
+      name: receiptName,
+      documentCode: activeDocumentCode,
+      status: 'Sent',
+      method: 'Email',
+      sentAt,
+      recipientEmail: signerEmail,
+      sentBy: 'BoldSign',
+    }
+    answers.document_delivery_log = [receiptEntry, ...parseStoredObject(answers.document_delivery_log, [])]
+    answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
+      { name: receiptName, documentCode: activeDocumentCode, status: 'Sent' },
+    ])
+  }
+
+  if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
+    await markBoldsign8821Completed({ roomCode, completedDocumentCode: activeDocumentCode, target })
+    return { handled: true, reason: 'completed', roomCode, eventType, target }
+  }
+
+  room.state.updatedAt = Date.now()
+  try {
+    await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+  } catch {
+    // ignore; room state is still updated in memory
+  }
+  emitDashboardRecordsUpdated({ reason: 'boldsign_webhook', roomCode, eventType, target })
+  return { handled: true, reason: 'updated', roomCode, eventType, target }
+}
+
 function buildResolutionEmailHtml({ clientName, portalLink }) {
   const safeName = String(clientName || 'Client').trim() || 'Client'
   const safeLink = String(portalLink || '').trim()
@@ -3209,7 +3365,7 @@ function isEnrolledAgentHandoffSent(value) {
 }
 
 function isMarriedJointFilingAnswers(answers = {}) {
-  const filingStatus = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim().toLowerCase()
+  const filingStatus = getNormalizedFilingStatus(answers)
   return filingStatus === 'married_joint'
 }
 
