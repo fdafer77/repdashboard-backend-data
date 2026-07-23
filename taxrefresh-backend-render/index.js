@@ -4630,6 +4630,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       createdAt: room.state?.updatedAt || Date.now(),
       updatedAt: room.state?.updatedAt || Date.now(),
     })
+    emitDashboardRecordsUpdated({ reason: 'document_sent', sessionCode: roomCode })
     return res.json({
       ok: true,
       item: refreshedItem,
