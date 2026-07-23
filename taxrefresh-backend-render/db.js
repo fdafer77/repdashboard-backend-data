@@ -16,12 +16,24 @@ function isPlaceholderDatabaseUrl(url = '') {
 export function getPool() {
   const url = process.env.DATABASE_URL
   if (!url || isPlaceholderDatabaseUrl(url)) return null
-  return new Pool({
+  const pool = new Pool({
     connectionString: url,
     // Fly + many managed Postgres providers require SSL in production.
     ssl: process.env.DB_SSL === '0' ? false : { rejectUnauthorized: false },
     max: Number(process.env.DB_POOL_MAX || 10),
+    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 30000),
+    connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 10000),
+    keepAlive: true,
+    keepAliveInitialDelayMillis: Number(process.env.DB_KEEPALIVE_INITIAL_DELAY_MS || 10000),
   })
+  pool.on('error', (error) => {
+    console.error('Postgres pool error:', {
+      name: error?.name || 'Error',
+      message: error?.message || String(error || ''),
+      stack: error?.stack || '',
+    })
+  })
+  return pool
 }
 
 export async function ensureSchema(pool) {
