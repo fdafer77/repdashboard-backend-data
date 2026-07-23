@@ -3167,10 +3167,7 @@ async function createBoldsign8821SigningLink({
       const normalizedTarget = String(target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
       const nextReceiptEmail = String(receiptRecipientEmail || resolvedSignerEmail || '').trim()
       const nextSentAt = new Date().toISOString()
-      const nextDocumentCode =
-        createReceiptOnCreate || !String(room.state.answers.current_8821_document_code || room.state.answers.active_8821_document_code || '').trim()
-          ? createDocumentInstanceCode('red')
-          : String(room.state.answers.active_8821_document_code || room.state.answers.current_8821_document_code || '').trim()
+      const nextDocumentCode = String(room.state.answers.active_8821_document_code || room.state.answers.current_8821_document_code || '').trim() || createDocumentInstanceCode('red')
       room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
       room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
       room.state.answers[`${documentFieldPrefix}_sent_at`] = nextSentAt
