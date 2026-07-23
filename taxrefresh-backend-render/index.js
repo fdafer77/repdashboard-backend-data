@@ -2977,6 +2977,14 @@ async function createBoldsign8821SigningLink({
       } catch {
         // ignore; room state still updates in-memory
       }
+      if (createReceiptOnCreate) {
+        emitDashboardRecordsUpdated({
+          reason: 'experience_document_sent',
+          sessionCode: normalizedSessionCode,
+          target: normalizedTarget,
+          documentCode: nextDocumentCode,
+        })
+      }
     }
   }
 
