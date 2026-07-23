@@ -2413,13 +2413,19 @@ async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
   })
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
+    const retryAfterHeader = String(response.headers.get('retry-after') || '').trim()
+    const retryAfterSeconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Number(retryAfterHeader) : 0
     const message =
       data?.error ||
       data?.title ||
       data?.errors?.[0]?.message ||
       data?.errors?.[0] ||
       `BoldSign request failed (${response.status})`
-    throw new Error(message)
+    const error = new Error(message)
+    error.status = response.status
+    if (retryAfterSeconds) error.retryAfterSeconds = retryAfterSeconds
+    if (response.status === 429) error.noRetry = true
+    throw error
   }
   return data
 }
@@ -2705,95 +2711,102 @@ async function createBoldsign8821SigningLink({
   const sendDateLabel = formatMmDdYyyy(new Date())
   const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
 
-  const sendResult = isTemplateConfigured
-    ? await boldsignFetch('v1/template/send', {
-        method: 'POST',
-        query: { templateId: selectedTemplateId },
-        body: {
-          Title: 'TaxRefresh R.E.D Packet',
-          Message: '',
-          DisableEmails: true,
-          EnableEmbeddedSigning: true,
-          EnableSigningOrder: false,
-          ...(isMarriedJoint
-            ? {
-                Roles: [
-                  {
-                    RoleIndex: 1,
-                    SignerName: resolvedSignerName,
-                    SignerEmail: resolvedSignerEmail,
-                    SignerType: 'Signer',
-                    Locale: 'EN',
-                    ExistingFormFields: existingClientFormFields,
-                  },
-                  {
-                    RoleIndex: 2,
-                    SignerName: spouseName || 'Spouse',
-                    SignerEmail: spouseEmail,
-                    SignerType: 'Signer',
-                    Locale: 'EN',
-                    ExistingFormFields: existingSpouseFormFields,
-                  },
-                ],
-              }
-            : {
-                Roles: [
-                  {
-                    RoleIndex: 1,
-                    SignerName: resolvedSignerName,
-                    SignerEmail: resolvedSignerEmail,
-                    SignerType: 'Signer',
-                    Locale: 'EN',
-                    ExistingFormFields: existingClientFormFields,
-                  },
-                ],
-              }),
-        },
-      })
-    : await (async () => {
-        const pdfDataUri = await loadBoldsign8821PdfDataUri()
-        return boldsignFetch('v1/document/send', {
+  const existingDocumentId = String(answers?.[`${documentFieldPrefix}_document_id`] || '').trim()
+  const shouldReuseExistingDocument = Boolean(existingDocumentId)
+
+  const sendResult = shouldReuseExistingDocument
+    ? { documentId: existingDocumentId }
+    : isTemplateConfigured
+      ? await boldsignFetch('v1/template/send', {
           method: 'POST',
+          query: { templateId: selectedTemplateId },
           body: {
-            Title: 'Form 8821 - Tax Information Authorization',
+            Title: 'TaxRefresh R.E.D Packet',
             Message: '',
             DisableEmails: true,
-            AutoDetectFields: true,
             EnableEmbeddedSigning: true,
-            UseTextTags: false,
-            Files: [
-              {
-                base64: pdfDataUri,
-                fileName: 'Taxrefresh Form 8821.pdf',
-              },
-            ],
-            Signers: [
-              {
-                Name: resolvedSignerName,
-                EmailAddress: resolvedSignerEmail,
-                SignerType: 'Signer',
-                Locale: 'EN',
-              },
-            ],
+            EnableSigningOrder: false,
+            ...(isMarriedJoint
+              ? {
+                  Roles: [
+                    {
+                      RoleIndex: 1,
+                      SignerName: resolvedSignerName,
+                      SignerEmail: resolvedSignerEmail,
+                      SignerType: 'Signer',
+                      Locale: 'EN',
+                      ExistingFormFields: existingClientFormFields,
+                    },
+                    {
+                      RoleIndex: 2,
+                      SignerName: spouseName || 'Spouse',
+                      SignerEmail: spouseEmail,
+                      SignerType: 'Signer',
+                      Locale: 'EN',
+                      ExistingFormFields: existingSpouseFormFields,
+                    },
+                  ],
+                }
+              : {
+                  Roles: [
+                    {
+                      RoleIndex: 1,
+                      SignerName: resolvedSignerName,
+                      SignerEmail: resolvedSignerEmail,
+                      SignerType: 'Signer',
+                      Locale: 'EN',
+                      ExistingFormFields: existingClientFormFields,
+                    },
+                  ],
+                }),
           },
         })
-      })()
+      : await (async () => {
+          const pdfDataUri = await loadBoldsign8821PdfDataUri()
+          return boldsignFetch('v1/document/send', {
+            method: 'POST',
+            body: {
+              Title: 'Form 8821 - Tax Information Authorization',
+              Message: '',
+              DisableEmails: true,
+              AutoDetectFields: true,
+              EnableEmbeddedSigning: true,
+              UseTextTags: false,
+              Files: [
+                {
+                  base64: pdfDataUri,
+                  fileName: 'Taxrefresh Form 8821.pdf',
+                },
+              ],
+              Signers: [
+                {
+                  Name: resolvedSignerName,
+                  EmailAddress: resolvedSignerEmail,
+                  SignerType: 'Signer',
+                  Locale: 'EN',
+                },
+              ],
+            },
+          })
+        })()
 
   const documentId = String(sendResult?.documentId || '').trim()
   if (!documentId) throw new Error('BoldSign did not return a documentId.')
 
   if (persistDocument) {
     const room = await ensureRoom(normalizedSessionCode)
-    room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
-    room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
-    room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
-    room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
-    room.state.updatedAt = Date.now()
-    io.to(normalizedSessionCode).emit('room_state', room.state)
-    try {
-      await dbUpsertSession({ code: normalizedSessionCode, state: room.state })
-    } catch {
-      // ignore; room state still updates in-memory
+    if (!shouldReuseExistingDocument) {
+      room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
+      room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
+      room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
+      room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
+      room.state.updatedAt = Date.now()
+      io.to(normalizedSessionCode).emit('room_state', room.state)
+      try {
+        await dbUpsertSession({ code: normalizedSessionCode, state: room.state })
+      } catch {
+        // ignore; room state still updates in-memory
+      }
     }
   }
 
@@ -2814,6 +2827,7 @@ async function retry(fn, { attempts = 8, delayMs = 1200 } = {}) {
       return await fn()
     } catch (error) {
       lastError = error
+      if (error?.noRetry || error?.status === 429) break
       if (attempt >= attempts) break
       await new Promise((resolve) => setTimeout(resolve, delayMs))
     }
@@ -4717,7 +4731,14 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('BoldSign 8821 recipient view failed:', error)
-    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create BoldSign signing view.' })
+    const status = typeof error?.status === 'number' ? error.status : 500
+    if (status === 429) {
+      const retryAfterSeconds = typeof error?.retryAfterSeconds === 'number' && Number.isFinite(error.retryAfterSeconds) ? error.retryAfterSeconds : 60
+      return res
+        .status(429)
+        .json({ error: `BoldSign is rate limiting right now. Please wait ${retryAfterSeconds} seconds and try again.` })
+    }
+    return res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to create BoldSign signing view.' })
   }
 })
 
