@@ -572,6 +572,40 @@ function appendDocumentDeliveryLogEntry(answers = {}, entry = null) {
   answers.document_delivery_log = [entry, ...(Array.isArray(current) ? current : [])]
 }
 
+function hasDocumentLifecycleEntry(answers = {}, { name = '', documentCode = '' } = {}) {
+  const normalizedName = String(name || '').trim()
+  const normalizedDocumentCode = String(documentCode || '').trim()
+  if (!normalizedName) return false
+
+  const deliveryLog = Array.isArray(answers?.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers?.document_delivery_log, [])
+  if (
+    Array.isArray(deliveryLog) &&
+    deliveryLog.some((entry) => {
+      const entryName = String(entry?.name || '').trim()
+      if (entryName !== normalizedName) return false
+      const entryCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryCode && entryCode !== normalizedDocumentCode) return false
+      const status = String(entry?.status || '').trim()
+      return status === 'Sent' || status === 'Signed'
+    })
+  ) {
+    return true
+  }
+
+  const receipts = Array.isArray(answers?.document_receipts) ? answers.document_receipts : parseStoredObject(answers?.document_receipts, [])
+  return (
+    Array.isArray(receipts) &&
+    receipts.some((entry) => {
+      const entryName = String(entry?.name || '').trim()
+      if (entryName !== normalizedName) return false
+      const entryCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryCode && entryCode !== normalizedDocumentCode) return false
+      const status = String(entry?.status || '').trim()
+      return status === 'Sent' || status === 'Signed'
+    })
+  )
+}
+
 function createDocumentInstanceCode(prefix = 'doc') {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 }
@@ -660,6 +694,9 @@ function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previ
   const documentCode = existingDocumentCode || createDocumentInstanceCode('red')
   answers.current_8821_document_code = documentCode
   answers.active_8821_document_code = documentCode
+  if (hasDocumentLifecycleEntry(answers, { name: receiptName, documentCode })) {
+    return false
+  }
   const recipientEmail = String(
     isSpouseTarget
       ? getSpouseSignerEmailFromAnswers(answers) || answers.spouse_email || ''
@@ -2551,19 +2588,9 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   if (normalizedType.includes('verification')) return { handled: true, reason: 'verification', roomCode, eventType }
 
   if (normalizedType.includes('sent') || normalizedType.includes('created')) {
-    const receiptEntry = {
-      id: `boldsign_${documentId}_${normalizedType}_${target}`,
-      name: receiptName,
-      documentCode: resolvedDocumentCode,
-      status: 'Sent',
-      method: 'Experience',
-      sentAt,
-      recipientEmail: signerEmail,
-      sentBy: 'BoldSign',
-    }
-    answers.document_delivery_log = [receiptEntry, ...parseStoredObject(answers.document_delivery_log, [])]
-    answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
-      {
+    if (!hasDocumentLifecycleEntry(answers, { name: receiptName, documentCode: resolvedDocumentCode })) {
+      const receiptEntry = {
+        id: `boldsign_${documentId}_${normalizedType}_${target}`,
         name: receiptName,
         documentCode: resolvedDocumentCode,
         status: 'Sent',
@@ -2571,8 +2598,20 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
         sentAt,
         recipientEmail: signerEmail,
         sentBy: 'BoldSign',
-      },
-    ])
+      }
+      answers.document_delivery_log = [receiptEntry, ...parseStoredObject(answers.document_delivery_log, [])]
+      answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
+        {
+          name: receiptName,
+          documentCode: resolvedDocumentCode,
+          status: 'Sent',
+          method: 'Experience',
+          sentAt,
+          recipientEmail: signerEmail,
+          sentBy: 'BoldSign',
+        },
+      ])
+    }
     if (target === 'spouse') {
       answers.form8821_spouse_status = answers.form8821_spouse_status || 'launching'
     } else {
