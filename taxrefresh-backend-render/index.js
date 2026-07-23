@@ -1422,10 +1422,6 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
 
-  const signatureMap = parseStoredTargetMap(answers.esign_signatures_by_target)
-  const hasPrimarySignature = Boolean(signatureMap['agreement-client-signature'] || signatureMap['billing-signature'] || signatureMap['communications-signature'])
-  if (!hasPrimarySignature) return false
-
   const pdfBuffer = await buildSigned8821PdfBuffer(answers)
   const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
   const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
@@ -2071,11 +2067,13 @@ function getBoldsignConfig() {
   const apiBase = String(process.env.BOLDSIGN_BASE_URI || 'https://api.boldsign.com').trim().replace(/\/$/, '')
   const apiKey = String(process.env.BOLDSIGN_API_KEY || '').trim()
   const pdfPath = process.env.BOLDSIGN_8821_PDF_PATH?.trim() || new URL('./assets/f8821.pdf', import.meta.url)
+  const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
 
   return {
     apiBase,
     apiKey,
     pdfPath,
+    templateId,
     ready: Boolean(apiKey),
   }
 }
@@ -2188,6 +2186,168 @@ async function getBoldsignEmbeddedSignLink({ documentId, signerEmail, redirectUr
   return String(embedded?.signLink || '').trim()
 }
 
+function formatMmDdYyyy(value) {
+  const date = value instanceof Date ? value : new Date(value || Date.now())
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleDateString('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+}
+
+function extractLast4(value = '') {
+  const digits = String(value || '').replace(/\D/g, '')
+  if (!digits) return ''
+  return digits.length <= 4 ? digits : digits.slice(-4)
+}
+
+function maskedCardLabel(value = '') {
+  const last4 = extractLast4(value)
+  return last4 ? `**** **** **** ${last4}` : ''
+}
+
+function maskedAccountLabel(value = '') {
+  const last4 = extractLast4(value)
+  return last4 ? `****${last4}` : ''
+}
+
+function maskedRoutingLabel(value = '') {
+  const last4 = extractLast4(value)
+  return last4 ? `*****${last4}` : ''
+}
+
+function getSpouseSignerEmailFromAnswers(answers = {}) {
+  const direct = String(getPrimaryAnswer(answers, ['spouse_email', 'spouseEmail', 'spouse_email_address', 'spouseEmailAddress']) || '').trim()
+  if (isValidEmailAddress(direct)) return direct
+  const logEntries = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
+  const targetLog = Array.isArray(logEntries)
+    ? logEntries.find((entry) => String(entry?.documentType || '').trim() === '8821 Spouse')
+    : null
+  const fallback = String(targetLog?.recipientEmail || '').trim()
+  return isValidEmailAddress(fallback) ? fallback : ''
+}
+
+function getSpouseSignerNameFromAnswers(answers = {}) {
+  const direct = String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || '').trim()
+  if (direct) return direct
+  const first = String(getPrimaryAnswer(answers, ['spouse_first_name', 'spouseFirstName']) || '').trim()
+  const last = String(getPrimaryAnswer(answers, ['spouse_last_name', 'spouseLastName']) || '').trim()
+  return [first, last].filter(Boolean).join(' ') || 'Spouse'
+}
+
+function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
+  const context = getRedPacketRenderContext(answers)
+  const fullName = [String(context.firstName || '').trim(), String(context.lastName || '').trim()].filter(Boolean).join(' ')
+  const sentLabel = String(sentDateLabel || '').trim() || formatMmDdYyyy(new Date())
+
+  const spouseFirstName = String(context.spouseFirstName || '').trim()
+  const spouseLastName = String(context.spouseLastName || '').trim()
+  const spouseFullName = [spouseFirstName, spouseLastName].filter(Boolean).join(' ')
+
+  const mailingFull = [String(context.mailingAddress || '').trim(), String(context.mailingCity || '').trim(), String(context.mailingState || '').trim(), String(context.mailingZip || '').trim()]
+    .filter(Boolean)
+    .join(', ')
+
+  const physicalStreet = String(context.physicalAddress || '').trim()
+  const physicalCity = String(context.city || '').trim()
+  const physicalState = String(context.stateCode || '').trim()
+  const physicalZip = String(context.zipCode || '').trim()
+
+  const paymentKind = String(context.primaryPaymentMethodKind || '').trim().toLowerCase()
+  const isCard = paymentKind === 'card'
+  const isBank = paymentKind === 'bank'
+
+  const showSchedule = Boolean(context.showPaymentScheduleFields)
+
+  const effectiveInvoiceAmount = Number(context.effectiveInvoiceAmount || 0)
+  const discountActive = effectiveInvoiceAmount === 375
+
+  const fields = {
+    // Client identity
+    Client_First_Name: String(context.firstName || '').trim(),
+    Client_Last_Name: String(context.lastName || '').trim(),
+    Client_Middle_Name: String(getPrimaryAnswer(answers, ['middle_name', 'middleName', 'client_middle_name']) || '').trim(),
+    Client_Full_Name: fullName,
+    Client_Full_Name2: fullName,
+    Client_Full_Name5: fullName,
+    Client_Email: String(context.email || '').trim(),
+    Client_Phone_Number: String(context.phone || '').trim(),
+    Client_Phone_Number2: String(context.phone || '').trim(),
+    Work_Phone: String(context.businessWorkPhone || '').trim(),
+    Client_SSN: String(context.ssn || '').trim(),
+    Client_SSN2: String(context.ssn || '').trim(),
+    Client_DOB: String(context.dob || '').trim(),
+
+    // Spouse
+    Spouse_First_Name: spouseFirstName,
+    Spouse_Last_Name: spouseLastName,
+    Spouse_SSN: String(context.spouseSsn || '').trim(),
+    Spouse_DOB: String(context.spouseDob || '').trim(),
+    Spouse_Phone_Number: String(context.spousePhone || '').trim(),
+
+    // Addresses (physical + mailing)
+    Client_Address: physicalStreet,
+    Client_City: physicalCity,
+    Client_State: physicalState,
+    Client_ZIP: physicalZip,
+    Client_Address2: physicalStreet,
+    Client_City2: physicalCity,
+    Client_State2: physicalState,
+    Client_ZIP2: physicalZip,
+    Client_Mailing_Address: mailingFull,
+
+    // Business
+    Business_Name: String(context.businessName || '').trim(),
+    Business_EIN: String(context.businessEin || '').trim(),
+
+    // Tax/plan
+    Tax_Type: String(context.taxTypeLabel || '').trim(),
+    Tax_Agency: String(context.taxAgencyLabel || '').trim(),
+    Years_Owed: String(context.unfiledYearsLabel || '').trim(),
+    Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
+    Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
+
+    // Payment (masked)
+    Card_Type: isCard ? String(context.paymentCardTypeLabel || '').trim() : '',
+    Cardholder_Name: isCard ? String(context.paymentCardholderNameLabel || '').trim() : '',
+    Card_Number: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
+    Card_On_File: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
+    Card_On_File2: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
+    Card_Expiration_Date: isCard ? String(context.paymentCardExpirationLabel || '').trim() : '',
+
+    Bank_Name: isBank ? String(context.paymentBankNameLabel || '').trim() : '',
+    Bank_Account_Name: isBank ? String(context.paymentAccountHolderNameLabel || '').trim() : '',
+    Bank_Account_Number: isBank ? maskedAccountLabel(context.paymentAccountNumberLabel || '') : '',
+    Bank_Routing_Number: isBank ? maskedRoutingLabel(context.paymentRoutingNumberLabel || '') : '',
+
+    // Payment schedule (up to 3)
+    Payment_Schedule_Date: showSchedule ? String(context.billingScheduleDate1Label || '').trim() : '',
+    Payment_Scheduled_Amount: showSchedule ? String(context.billingScheduleAmount1Label || '').trim() : '',
+    Payment_Schedule_Date2: showSchedule ? String(context.billingScheduleDate2Label || '').trim() : '',
+    Payment_Scheduled_Amount2: showSchedule ? String(context.billingScheduleAmount2Label || '').trim() : '',
+    Payment_Schedule_Date3: showSchedule ? String(context.billingScheduleDate3Label || '').trim() : '',
+    Payment_Scheduled_Amount3: showSchedule ? String(context.billingScheduleAmount3Label || '').trim() : '',
+
+    // Discount text block
+    Discount_1: discountActive ? 'DISCARD' : '',
+    Discount_2: discountActive ? 'DISCARD' : '',
+    Discount_3: discountActive ? 'DISCARD' : '',
+    Discount_4: discountActive ? '$375' : '',
+    Discount_5: discountActive ? '$375' : '',
+    Discount_6: discountActive ? '$375' : '',
+  }
+
+  // Dates: Date_Signed1..9 should be the "send date" (MM/DD/YYYY)
+  for (let i = 1; i <= 9; i += 1) {
+    fields[`Date_Signed${i}`] = sentLabel
+  }
+
+  // Convert to BoldSign ExistingFormFields array
+  return Object.entries(fields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') }))
+}
+
 async function createBoldsign8821SigningLink({
   sessionCode,
   signerName,
@@ -2219,32 +2379,91 @@ async function createBoldsign8821SigningLink({
     resolvedReturnUrl = `${base}/session/preparing-documents?session=${encodeURIComponent(normalizedSessionCode)}&boldsign=complete`
   }
 
-  const pdfDataUri = await loadBoldsign8821PdfDataUri()
-  const sendResult = await boldsignFetch('v1/document/send', {
-    method: 'POST',
-    body: {
-      Title: 'Form 8821 - Tax Information Authorization',
-      Message: '',
-      DisableEmails: true,
-      AutoDetectFields: true,
-      EnableEmbeddedSigning: true,
-      UseTextTags: false,
-      Files: [
-        {
-          base64: pdfDataUri,
-          fileName: 'Taxrefresh Form 8821.pdf',
+  const boldsignConfig = getBoldsignConfig()
+  const isTemplateConfigured = Boolean(String(boldsignConfig.templateId || '').trim())
+  const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const spouseEmail = isMarriedJoint ? getSpouseSignerEmailFromAnswers(answers) : ''
+  const spouseName = isMarriedJoint ? getSpouseSignerNameFromAnswers(answers) : ''
+  if (isTemplateConfigured && isMarriedJoint && !isValidEmailAddress(spouseEmail)) {
+    throw new Error('Spouse email is required for married filing jointly signing.')
+  }
+
+  const sendDateLabel = formatMmDdYyyy(new Date())
+  const existingFormFields = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
+
+  const sendResult = isTemplateConfigured
+    ? await boldsignFetch('v1/template/send', {
+        method: 'POST',
+        query: { templateId: boldsignConfig.templateId },
+        body: {
+          Title: 'TaxRefresh R.E.D Packet',
+          Message: '',
+          DisableEmails: true,
+          EnableSigningOrder: false,
+          ...(isMarriedJoint
+            ? {
+                Roles: [
+                  {
+                    RoleIndex: 1,
+                    SignerName: resolvedSignerName,
+                    SignerEmail: resolvedSignerEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                    ExistingFormFields: existingFormFields,
+                  },
+                  {
+                    RoleIndex: 2,
+                    SignerName: spouseName || 'Spouse',
+                    SignerEmail: spouseEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                  },
+                ],
+              }
+            : {
+                Roles: [
+                  {
+                    RoleIndex: 1,
+                    SignerName: resolvedSignerName,
+                    SignerEmail: resolvedSignerEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                    ExistingFormFields: existingFormFields,
+                  },
+                ],
+                // Remove spouse role when not MFJ (roleIndex 2 in the template).
+                RoleRemovalIndices: [2],
+              }),
         },
-      ],
-      Signers: [
-        {
-          Name: resolvedSignerName,
-          EmailAddress: resolvedSignerEmail,
-          SignerType: 'Signer',
-          Locale: 'EN',
-        },
-      ],
-    },
-  })
+      })
+    : await (async () => {
+        const pdfDataUri = await loadBoldsign8821PdfDataUri()
+        return boldsignFetch('v1/document/send', {
+          method: 'POST',
+          body: {
+            Title: 'Form 8821 - Tax Information Authorization',
+            Message: '',
+            DisableEmails: true,
+            AutoDetectFields: true,
+            EnableEmbeddedSigning: true,
+            UseTextTags: false,
+            Files: [
+              {
+                base64: pdfDataUri,
+                fileName: 'Taxrefresh Form 8821.pdf',
+              },
+            ],
+            Signers: [
+              {
+                Name: resolvedSignerName,
+                EmailAddress: resolvedSignerEmail,
+                SignerType: 'Signer',
+                Locale: 'EN',
+              },
+            ],
+          },
+        })
+      })()
 
   const documentId = String(sendResult?.documentId || '').trim()
   if (!documentId) throw new Error('BoldSign did not return a documentId.')
@@ -2252,7 +2471,7 @@ async function createBoldsign8821SigningLink({
   if (persistDocument) {
     const room = await ensureRoom(normalizedSessionCode)
     room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
-    room.state.answers[`${documentFieldPrefix}_file_name`] = 'TaxRefresh Form 8821.pdf'
+    room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
     room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
     room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
     room.state.updatedAt = Date.now()
