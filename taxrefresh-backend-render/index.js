@@ -2394,8 +2394,8 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Card_Type: isCard ? String(context.paymentCardTypeLabel || '').trim() : '',
     Cardholder_Name: isCard ? String(context.paymentCardholderNameLabel || '').trim() : '',
     Card_Number: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
-    Card_On_File: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
-    Card_On_File2: isCard ? maskedCardLabel(context.paymentCardNumberLabel || '') : '',
+    Card_On_File: isCard ? 'Yes' : '',
+    Card_On_File2: isCard ? 'Yes' : '',
     Card_Expiration_Date: isCard ? String(context.paymentCardExpirationLabel || '').trim() : '',
 
     Bank_Name: isBank ? String(context.paymentBankNameLabel || '').trim() : '',
