@@ -2430,6 +2430,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
   for (let i = 1; i <= 9; i += 1) {
     fields[`Date_Signed${i}`] = sentLabel
   }
+  fields.Spouse_Date_Signed = sentLabel
 
   // Convert to BoldSign ExistingFormFields array
   return Object.entries(fields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') }))
@@ -2490,16 +2491,39 @@ async function createBoldsign8821SigningLink({
           DisableEmails: true,
           EnableEmbeddedSigning: true,
           EnableSigningOrder: false,
-          Roles: [
-            {
-              RoleIndex: 1,
-              SignerName: resolvedSignerName,
-              SignerEmail: resolvedSignerEmail,
-              SignerType: 'Signer',
-              Locale: 'EN',
-              ExistingFormFields: existingFormFields,
-            },
-          ],
+          ...(isMarriedJoint
+            ? {
+                Roles: [
+                  {
+                    RoleIndex: 1,
+                    SignerName: resolvedSignerName,
+                    SignerEmail: resolvedSignerEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                    ExistingFormFields: existingFormFields,
+                  },
+                  {
+                    RoleIndex: 2,
+                    SignerName: spouseName || 'Spouse',
+                    SignerEmail: spouseEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                  },
+                ],
+              }
+            : {
+                Roles: [
+                  {
+                    RoleIndex: 1,
+                    SignerName: resolvedSignerName,
+                    SignerEmail: resolvedSignerEmail,
+                    SignerType: 'Signer',
+                    Locale: 'EN',
+                    ExistingFormFields: existingFormFields,
+                  },
+                ],
+                RoleRemovalIndices: [2],
+              }),
         },
       })
     : await (async () => {
