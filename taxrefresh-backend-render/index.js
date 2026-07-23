@@ -4510,6 +4510,8 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!isValidEmailAddress(resolvedRecipientEmail)) {
       return res.status(400).json({ error: 'No valid client email is attached to this record yet.' })
     }
+    answers.email = resolvedRecipientEmail
+    answers.email_address = resolvedRecipientEmail
     let links = buildExternalDocumentLinks(roomCode, room, baseUrl)
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
     const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
