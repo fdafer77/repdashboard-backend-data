@@ -2758,6 +2758,9 @@ async function createBoldsign8821SigningLink({
   spouseSignerEmail = '',
   spouseSignerName = '',
   forceNewDocument = false,
+  createReceiptOnCreate = false,
+  receiptRecipientEmail = '',
+  target = 'client',
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) throw new Error('sessionCode is required')
@@ -2884,10 +2887,56 @@ async function createBoldsign8821SigningLink({
   if (persistDocument) {
     const room = await ensureRoom(normalizedSessionCode)
     if (!shouldReuseExistingDocument) {
+      const normalizedTarget = String(target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+      const nextReceiptEmail = String(receiptRecipientEmail || resolvedSignerEmail || '').trim()
+      const nextSentAt = new Date().toISOString()
+      const nextDocumentCode =
+        createReceiptOnCreate || !String(room.state.answers.current_8821_document_code || room.state.answers.active_8821_document_code || '').trim()
+          ? createDocumentInstanceCode('red')
+          : String(room.state.answers.active_8821_document_code || room.state.answers.current_8821_document_code || '').trim()
       room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
       room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
-      room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
+      room.state.answers[`${documentFieldPrefix}_sent_at`] = nextSentAt
       room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
+      if (createReceiptOnCreate) {
+        room.state.answers.current_8821_document_code = nextDocumentCode
+        room.state.answers.active_8821_document_code = nextDocumentCode
+        if (normalizedTarget === 'spouse') {
+          room.state.answers.form8821_spouse_status = 'launching'
+        } else {
+          room.state.answers.form8821_status = 'launching'
+        }
+        room.state.answers.onboarding_status = 'documents_ready_for_signature'
+        const receiptName = normalizedTarget === 'spouse' ? '8821 Spouse' : '8821 Document'
+        room.state.answers.document_receipts = upsertDocumentReceipts(room.state.answers.document_receipts, [
+          {
+            name: receiptName,
+            documentCode: nextDocumentCode,
+            status: 'Sent',
+            method: 'Experience',
+            sentAt: nextSentAt,
+            recipientEmail: nextReceiptEmail,
+            sentBy: 'Experience',
+          },
+        ])
+        room.state.answers.document_delivery_log = [
+          {
+            id: `doc_delivery_${Date.now().toString(36)}_${normalizedTarget}`,
+            name: receiptName,
+            documentCode: nextDocumentCode,
+            status: 'Sent',
+            method: 'Experience',
+            sentAt: nextSentAt,
+            recipientEmail: nextReceiptEmail,
+            sentBy: 'Experience',
+          },
+          ...parseStoredObject(room.state.answers.document_delivery_log, []),
+        ]
+        const hiddenReceiptNames = parseStoredObject(room.state.answers.hidden_document_receipt_names, []).filter(
+          (name) => typeof name === 'string' && name.trim(),
+        )
+        room.state.answers.hidden_document_receipt_names = hiddenReceiptNames.filter((name) => String(name || '').trim() !== receiptName)
+      }
       room.state.updatedAt = Date.now()
       io.to(normalizedSessionCode).emit('room_state', room.state)
       try {
@@ -4865,6 +4914,9 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
       returnUrl: String(req.body?.returnUrl || '').trim(),
       onBehalfOf: String(req.body?.onBehalfOf || '').trim(),
       persistDocument: true,
+      createReceiptOnCreate: true,
+      receiptRecipientEmail: String(req.body?.email || '').trim(),
+      target,
     })
     return res.json(result)
   } catch (error) {
