@@ -2155,12 +2155,16 @@ function getBoldsignConfig() {
   const apiKey = String(process.env.BOLDSIGN_API_KEY || '').trim()
   const pdfPath = process.env.BOLDSIGN_8821_PDF_PATH?.trim() || new URL('./assets/f8821.pdf', import.meta.url)
   const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
+  const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || '').trim()
+  const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || '').trim()
 
   return {
     apiBase,
     apiKey,
     pdfPath,
     templateId,
+    templateIdMfj,
+    templateIdSingle,
     ready: Boolean(apiKey),
   }
 }
@@ -2468,8 +2472,11 @@ async function createBoldsign8821SigningLink({
   }
 
   const boldsignConfig = getBoldsignConfig()
-  const isTemplateConfigured = Boolean(String(boldsignConfig.templateId || '').trim())
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const selectedTemplateId = isMarriedJoint
+    ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
+    : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+  const isTemplateConfigured = Boolean(selectedTemplateId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
   const spouseName = isMarriedJoint ? String(spouseSignerName || getSpouseSignerNameFromAnswers(answers) || '').trim() : ''
   if (isTemplateConfigured && isMarriedJoint && !isValidEmailAddress(spouseEmail)) {
@@ -2482,7 +2489,7 @@ async function createBoldsign8821SigningLink({
   const sendResult = isTemplateConfigured
     ? await boldsignFetch('v1/template/send', {
         method: 'POST',
-        query: { templateId: boldsignConfig.templateId },
+        query: { templateId: selectedTemplateId },
         body: {
           Title: 'TaxRefresh R.E.D Packet',
           Message: '',
@@ -4550,7 +4557,11 @@ app.get('/api/session/:code/document-link', async (req, res) => {
       (backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=${target}` : '')
 
     const boldsignConfig = getBoldsignConfig()
-    const templateConfigured = Boolean(String(boldsignConfig.templateId || '').trim())
+    const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+    const selectedTemplateId = isMarriedJoint
+      ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
+      : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+    const templateConfigured = Boolean(selectedTemplateId)
 
     // When we use a BoldSign template (client + spouse roles), we keep a single
     // BoldSign document id (`boldsign_8821_document_id`) and just generate
