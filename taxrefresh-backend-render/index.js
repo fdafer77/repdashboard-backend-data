@@ -2138,6 +2138,46 @@ async function sendSigned8821CopyEmail({ roomCode, room }) {
   return true
 }
 
+async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '', target = 'client' }) {
+  const room = await ensureRoom(roomCode)
+  if (completedDocumentCode) {
+    room.state.answers.active_8821_document_code = completedDocumentCode
+  }
+
+  const normalizedTarget = String(target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+  if (normalizedTarget === 'spouse') {
+    room.state.answers.form8821_spouse_status = 'completed'
+  } else {
+    room.state.answers.form8821_status = 'completed'
+    if (!isMarriedJointFilingAnswers(room.state.answers)) {
+      room.state.answers.form8821_spouse_status = room.state.answers.form8821_spouse_status || 'not_required'
+    }
+  }
+
+  if (isForm8821FullySigned(room.state.answers)) {
+    room.state.answers.onboarding_status = 'documents_signed'
+    room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
+    room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
+    markSigned8821DeliveryEntries(room.state.answers, room.state.answers.boldsign_8821_signed_at, completedDocumentCode)
+    await ensureSigned8821StoredOnRecord(roomCode, room)
+    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+      console.error('Signed 8821 client email failed:', error)
+    })
+  }
+
+  room.state.updatedAt = Date.now()
+  io.to(roomCode).emit('room_state', room.state)
+  try {
+    await dbUpsertSession({ code: roomCode, state: room.state })
+  } catch {
+    // ignore; session still works in-memory
+  }
+  void syncSessionToGhl({ roomCode, room, reason: 'form_8821_completed', force: true }).catch((error) => {
+    console.error('GHL form 8821 completion sync failed:', error)
+  })
+  return room
+}
+
 function buildResolutionEmailHtml({ clientName, portalLink }) {
   const safeName = String(clientName || 'Client').trim() || 'Client'
   const safeLink = String(portalLink || '').trim()
@@ -4493,7 +4533,16 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
   }
 })
 
-app.get('/api/session/:code/document-complete', (req, res) => {
+app.get('/api/session/:code/document-complete', async (req, res) => {
+  const roomCode = String(req.params.code || '').toUpperCase().trim()
+  const target = String(req.query?.target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+  if (roomCode) {
+    try {
+      await markBoldsign8821Completed({ roomCode, target })
+    } catch (error) {
+      console.error('Standalone BoldSign completion failed:', error)
+    }
+  }
   res.set('Cache-Control', 'no-store')
   res.type('html').send(`<!doctype html>
 <html lang="en">
@@ -4800,36 +4849,9 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
   try {
     const roomCode = String(req.body?.sessionCode || req.body?.code || '').toUpperCase().trim()
     const completedDocumentCode = String(req.body?.documentCode || req.body?.document_code || '').trim()
+    const target = String(req.body?.target || req.body?.signer || 'client').trim().toLowerCase()
     if (!roomCode) return res.status(400).json({ error: 'sessionCode is required' })
-    const room = await ensureRoom(roomCode)
-    if (completedDocumentCode) {
-      room.state.answers.active_8821_document_code = completedDocumentCode
-    }
-    room.state.answers.form8821_status = 'completed'
-    if (isMarriedJointFilingAnswers(room.state.answers)) {
-      room.state.answers.form8821_spouse_status = 'completed'
-    } else {
-      room.state.answers.form8821_spouse_status = room.state.answers.form8821_spouse_status || 'not_required'
-    }
-    room.state.answers.onboarding_status = 'documents_signed'
-    room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
-    room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
-    markSigned8821DeliveryEntries(room.state.answers, room.state.answers.boldsign_8821_signed_at, completedDocumentCode)
-    await ensureSigned8821StoredOnRecord(roomCode, room)
-    room.state.updatedAt = Date.now()
-
-    io.to(roomCode).emit('room_state', room.state)
-    try {
-      await dbUpsertSession({ code: roomCode, state: room.state })
-    } catch {
-      // ignore; session still works in-memory
-    }
-    void syncSessionToGhl({ roomCode, room, reason: 'form_8821_completed', force: true }).catch((error) => {
-      console.error('GHL form 8821 completion sync failed:', error)
-    })
-    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
-      console.error('Signed 8821 client email failed:', error)
-    })
+    await markBoldsign8821Completed({ roomCode, completedDocumentCode, target })
     return res.json({ ok: true })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to mark Form 8821 complete.' })
