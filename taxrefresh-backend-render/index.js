@@ -568,12 +568,22 @@ function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previ
   if (normalizedNextRoute !== '/session/sign-form-8821' && normalizedNextRoute !== '/session/sign-form-8821-spouse') return false
 
   const answers = room?.state?.answers || {}
-  const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  const isSpouseTarget = normalizedNextRoute.endsWith('-spouse')
+  const receiptName = isSpouseTarget ? '8821 Spouse' : '8821 Document'
+  const existingDocumentCode = getActive8821DocumentCode(answers)
+  const documentCode = existingDocumentCode || createDocumentInstanceCode('red')
+  answers.current_8821_document_code = documentCode
+  answers.active_8821_document_code = documentCode
+  const recipientEmail = String(
+    isSpouseTarget
+      ? getSpouseSignerEmailFromAnswers(answers) || answers.spouse_email || ''
+      : getPrimaryAnswer(answers, ['email', 'email_address']) || '',
+  ).trim()
   const sentAt = new Date().toISOString()
   appendDocumentDeliveryLogEntry(answers, {
-    id: `doc_experience_${Date.now().toString(36)}_${normalizedNextRoute.endsWith('-spouse') ? 'spouse' : 'client'}`,
-    name: normalizedNextRoute.endsWith('-spouse') ? '8821 Spouse' : '8821 Document',
-    documentCode: getActive8821DocumentCode(answers),
+    id: `doc_experience_${Date.now().toString(36)}_${isSpouseTarget ? 'spouse' : 'client'}`,
+    name: receiptName,
+    documentCode,
     status: 'Sent',
     method: 'Experience',
     sentAt,
@@ -582,8 +592,25 @@ function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previ
     route: normalizedNextRoute,
     sessionCode: roomCode,
   })
+  answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
+    {
+      name: receiptName,
+      documentCode,
+      status: 'Sent',
+      method: 'Experience',
+      sentAt,
+      recipientEmail,
+      sentBy: 'Experience',
+    },
+  ])
+  const hiddenReceiptNames = parseStoredObject(answers.hidden_document_receipt_names, []).filter((name) => typeof name === 'string' && name.trim())
+  answers.hidden_document_receipt_names = hiddenReceiptNames.filter((name) => String(name || '').trim() !== receiptName)
   answers.last_document_experience_sent_at = sentAt
-  return true
+  return {
+    receiptName,
+    documentCode,
+    target: isSpouseTarget ? 'spouse' : 'client',
+  }
 }
 
 async function loadSigned8821DocumentPayload(roomCode, room) {
@@ -5959,6 +5986,7 @@ io.on('connection', (socket) => {
     const roomCode = String(code || '').toUpperCase().trim()
     if (!roomCode) return
     const room = await ensureRoom(roomCode)
+    let experienceReceiptUpdate = null
 
     // Basic last-write-wins patching
     if (patch?.type === 'setStep' && Number.isInteger(patch.step)) {
@@ -5984,7 +6012,7 @@ io.on('connection', (socket) => {
     if (patch?.type === 'setRoute' && typeof patch.route === 'string') {
       const previousRoute = String(room.state.route || '').trim()
       room.state.route = patch.route.slice(0, 500)
-      maybeTrackExperienceDocumentRoute(roomCode, room, room.state.route, previousRoute)
+      experienceReceiptUpdate = maybeTrackExperienceDocumentRoute(roomCode, room, room.state.route, previousRoute)
       room.state.updatedAt = Date.now()
     }
 
@@ -5999,6 +6027,14 @@ io.on('connection', (socket) => {
       await dbUpsertSession({ code: roomCode, state: room.state })
     } catch {
       // ignore; session will still work in-memory
+    }
+    if (experienceReceiptUpdate) {
+      emitDashboardRecordsUpdated({
+        reason: 'experience_route_sent',
+        sessionCode: roomCode,
+        target: experienceReceiptUpdate.target,
+        documentCode: experienceReceiptUpdate.documentCode,
+      })
     }
     if (shouldSyncPatchToGhl(patch)) {
       void syncSessionToGhl({ roomCode, room, reason: patch.type === 'setRoute' ? 'route_changed' : `answer_${patch.questionId}` }).catch((error) => {
