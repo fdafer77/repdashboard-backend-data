@@ -312,6 +312,15 @@ function formatUsdLabel(value) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
 }
 
+function toPositiveNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+  if (typeof value === 'string') {
+    const parsed = Number(digitsOnly(value))
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+  }
+  return 0
+}
+
 function formatCardTypeLabel(value = '') {
   const normalized = String(value || '').trim().toLowerCase()
   if (!normalized) return ''
