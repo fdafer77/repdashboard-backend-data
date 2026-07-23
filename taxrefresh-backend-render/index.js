@@ -2145,6 +2145,7 @@ async function sendSigned8821CopyEmail({ roomCode, room }) {
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
   if (String(answers.signed_8821_client_emailed_at || '').trim()) return false
+  if (String(answers.signed_8821_client_email_sending_at || '').trim()) return false
 
   const contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
   const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
@@ -2153,25 +2154,47 @@ async function sendSigned8821CopyEmail({ roomCode, room }) {
   const backendBase = getBackendBaseUrl()
   if (!backendBase) return false
 
-  const downloadLink = `${backendBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
-  const portalLink = buildClientPortalLoginLink(roomCode, room)
-  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
-  await sendGhlEmailMessage({
-    contactId,
-    emailTo: recipientEmail,
-    subject: 'Your Signed TaxRefresh Document Copy',
-    message: `Your Signed TaxRefresh Document Copy is ready: ${downloadLink}`,
-    html: buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }),
-  })
-
-  answers.signed_8821_client_emailed_at = new Date().toISOString()
-  answers.signed_8821_client_emailed_to = recipientEmail
+  answers.signed_8821_client_email_sending_at = new Date().toISOString()
   room.state.updatedAt = Date.now()
   io.to(roomCode).emit('room_state', room.state)
   try {
     await dbUpsertSession({ code: roomCode, state: room.state })
   } catch {
     // ignore; room state still updates in-memory
+  }
+
+  const downloadLink = `${backendBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
+  const portalLink = buildClientPortalLoginLink(roomCode, room)
+  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
+  try {
+    await sendGhlEmailMessage({
+      contactId,
+      emailTo: recipientEmail,
+      subject: 'Your Signed TaxRefresh Document Copy',
+      message: `Your Signed TaxRefresh Document Copy is ready: ${downloadLink}`,
+      html: buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }),
+    })
+
+    answers.signed_8821_client_emailed_at = new Date().toISOString()
+    answers.signed_8821_client_emailed_to = recipientEmail
+    answers.signed_8821_client_email_sending_at = ''
+    room.state.updatedAt = Date.now()
+    io.to(roomCode).emit('room_state', room.state)
+    try {
+      await dbUpsertSession({ code: roomCode, state: room.state })
+    } catch {
+      // ignore; room state still updates in-memory
+    }
+  } catch (error) {
+    answers.signed_8821_client_email_sending_at = ''
+    room.state.updatedAt = Date.now()
+    io.to(roomCode).emit('room_state', room.state)
+    try {
+      await dbUpsertSession({ code: roomCode, state: room.state })
+    } catch {
+      // ignore; room state still updates in-memory
+    }
+    throw error
   }
   return true
 }
@@ -4442,6 +4465,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.signed_8821_saved_at = ''
       answers.signed_8821_first_page_saved_at = ''
       answers.signed_8821_client_emailed_at = ''
+      answers.signed_8821_client_email_sending_at = ''
       answers.signed_8821_render_version = ''
       answers.signed_8821_first_page_render_version = ''
       answers.form8821_status = 'launching'
