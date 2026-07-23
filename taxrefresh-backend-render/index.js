@@ -4466,7 +4466,14 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         : []),
     ])
 
-    const refreshedItem = await getConsultationRecordByCode(roomCode)
+    const refreshedItem = buildConsultationDetail({
+      sessionCode: roomCode,
+      contactId: room.contactId,
+      opportunityId: room.opportunityId,
+      state: room.state,
+      createdAt: room.state?.updatedAt || Date.now(),
+      updatedAt: room.state?.updatedAt || Date.now(),
+    })
     return res.json({
       ok: true,
       item: refreshedItem,
