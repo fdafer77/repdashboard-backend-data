@@ -307,6 +307,37 @@ function formatDobValue(value = '') {
   return normalized
 }
 
+function formatUsdLabel(value) {
+  if (!Number.isFinite(value) || value <= 0) return ''
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
+}
+
+function formatCardTypeLabel(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return ''
+  if (normalized === 'visa') return 'Visa'
+  if (normalized === 'mastercard' || normalized === 'master card') return 'Mastercard'
+  if (normalized === 'amex' || normalized === 'american express') return 'AMEX'
+  if (normalized === 'discover') return 'Discover'
+  if (normalized === 'bank') return 'Bank'
+  return String(value || '').trim()
+}
+
+function formatEndingInLabel(value = '') {
+  const digits = digitsOnly(value)
+  if (!digits) return ''
+  return `Ending in ${digits.slice(-4)}`
+}
+
+function normalizeTaxAgencyLabel(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return ''
+  if (normalized === 'irs') return 'IRS'
+  if (normalized === 'state') return 'State'
+  if (normalized === 'both' || normalized === 'irs & state' || normalized === 'irs and state' || normalized === 'irs + state') return 'IRS & State'
+  return String(value || '').trim()
+}
+
 function formatYearsLabel(value) {
   if (Array.isArray(value)) return value.map((entry) => String(entry).trim()).filter(Boolean).join(', ')
   return String(value || '')
