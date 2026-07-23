@@ -1422,7 +1422,28 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
 
-  const pdfBuffer = await buildSigned8821PdfBuffer(answers)
+  let pdfBuffer = null
+  const documentId = String(answers.boldsign_8821_document_id || '').trim()
+  if (documentId) {
+    try {
+      const download = await boldsignDownloadDocument(documentId, {
+        onBehalfOf: String(answers.boldsign_8821_sender_email || '').trim() || undefined,
+      })
+      pdfBuffer = download.fileBuffer
+      try {
+        const pdfDoc = await PDFDocument.load(download.fileBuffer)
+        stripPdfWidgetPlaceholders(pdfDoc)
+        pdfBuffer = Buffer.from(await pdfDoc.save())
+      } catch {
+        // ignore cleaning errors; fall back to the raw BoldSign payload
+      }
+    } catch {
+      pdfBuffer = null
+    }
+  }
+  if (!pdfBuffer?.length) {
+    pdfBuffer = await buildSigned8821PdfBuffer(answers)
+  }
   const firstPagePdfBuffer = await buildSigned8821FirstPagePdfBuffer(answers)
   const dataUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`
   const firstPageDataUrl = `data:application/pdf;base64,${firstPagePdfBuffer.toString('base64')}`
@@ -2365,6 +2386,8 @@ async function createBoldsign8821SigningLink({
   onBehalfOf = '',
   persistDocument = true,
   documentFieldPrefix = 'boldsign_8821',
+  spouseSignerEmail = '',
+  spouseSignerName = '',
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) throw new Error('sessionCode is required')
@@ -2391,8 +2414,8 @@ async function createBoldsign8821SigningLink({
   const boldsignConfig = getBoldsignConfig()
   const isTemplateConfigured = Boolean(String(boldsignConfig.templateId || '').trim())
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
-  const spouseEmail = isMarriedJoint ? getSpouseSignerEmailFromAnswers(answers) : ''
-  const spouseName = isMarriedJoint ? getSpouseSignerNameFromAnswers(answers) : ''
+  const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
+  const spouseName = isMarriedJoint ? String(spouseSignerName || getSpouseSignerNameFromAnswers(answers) || '').trim() : ''
   if (isTemplateConfigured && isMarriedJoint && !isValidEmailAddress(spouseEmail)) {
     throw new Error('Spouse email is required for married filing jointly signing.')
   }
