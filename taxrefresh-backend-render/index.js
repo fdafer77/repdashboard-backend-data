@@ -2351,7 +2351,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
   const effectiveInvoiceAmount = Number(context.effectiveInvoiceAmount || 0)
   const discountActive = effectiveInvoiceAmount === 375
 
-  const fields = {
+  const clientFields = {
     // Client identity
     Client_First_Name: String(context.firstName || '').trim(),
     Client_Last_Name: String(context.lastName || '').trim(),
@@ -2366,13 +2366,6 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Client_SSN: String(context.ssn || '').trim(),
     Client_SSN2: String(context.ssn || '').trim(),
     Client_DOB: String(context.dob || '').trim(),
-
-    // Spouse
-    Spouse_First_Name: spouseFirstName,
-    Spouse_Last_Name: spouseLastName,
-    Spouse_SSN: String(context.spouseSsn || '').trim(),
-    Spouse_DOB: String(context.spouseDob || '').trim(),
-    Spouse_Phone_Number: String(context.spousePhone || '').trim(),
 
     // Addresses (physical + mailing)
     Client_Address: physicalStreet,
@@ -2426,14 +2419,24 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Discount_6: discountActive ? '$375' : '',
   }
 
+  const spouseFields = {
+    Spouse_First_Name: spouseFirstName,
+    Spouse_Last_Name: spouseLastName,
+    Spouse_SSN: String(context.spouseSsn || '').trim(),
+    Spouse_DOB: String(context.spouseDob || '').trim(),
+    Spouse_Phone_Number: String(context.spousePhone || '').trim(),
+    Spouse_Date_Signed: sentLabel,
+  }
+
   // Dates: Date_Signed1..9 should be the "send date" (MM/DD/YYYY)
   for (let i = 1; i <= 9; i += 1) {
-    fields[`Date_Signed${i}`] = sentLabel
+    clientFields[`Date_Signed${i}`] = sentLabel
   }
-  fields.Spouse_Date_Signed = sentLabel
 
-  // Convert to BoldSign ExistingFormFields array
-  return Object.entries(fields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') }))
+  return {
+    clientFields: Object.entries(clientFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
+    spouseFields: Object.entries(spouseFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
+  }
 }
 
 async function createBoldsign8821SigningLink({
@@ -2479,7 +2482,7 @@ async function createBoldsign8821SigningLink({
   }
 
   const sendDateLabel = formatMmDdYyyy(new Date())
-  const existingFormFields = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
+  const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
 
   const sendResult = isTemplateConfigured
     ? await boldsignFetch('v1/template/send', {
@@ -2500,7 +2503,7 @@ async function createBoldsign8821SigningLink({
                     SignerEmail: resolvedSignerEmail,
                     SignerType: 'Signer',
                     Locale: 'EN',
-                    ExistingFormFields: existingFormFields,
+                    ExistingFormFields: existingClientFormFields,
                   },
                   {
                     RoleIndex: 2,
@@ -2508,6 +2511,7 @@ async function createBoldsign8821SigningLink({
                     SignerEmail: spouseEmail,
                     SignerType: 'Signer',
                     Locale: 'EN',
+                    ExistingFormFields: existingSpouseFormFields,
                   },
                 ],
               }
@@ -2519,7 +2523,7 @@ async function createBoldsign8821SigningLink({
                     SignerEmail: resolvedSignerEmail,
                     SignerType: 'Signer',
                     Locale: 'EN',
-                    ExistingFormFields: existingFormFields,
+                    ExistingFormFields: existingClientFormFields,
                   },
                 ],
               }),
