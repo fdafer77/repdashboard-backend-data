@@ -1741,15 +1741,24 @@ function buildExternalDocumentLinks(roomCode, room, baseUrl = '') {
   const contactId = String(room?.contactId || room?.state?.answers?.ghl_contact_id || '').trim()
   const opportunityId = String(room?.opportunityId || room?.state?.answers?.ghl_opportunity_id || '').trim()
   const portalLinks = makePortalLinks(contactId, roomCode, baseUrl, opportunityId)
+  const backendBase = String(getBackendBaseUrl() || '').trim().replace(/\/+$/, '')
+  const encodedCode = encodeURIComponent(roomCode)
   return {
     experienceBase,
     clientPortalLink: buildClientPortalLoginLink(roomCode, room) || portalLinks.clientLink || (experienceBase ? `${experienceBase}/rep/session/${encodeURIComponent(roomCode)}` : ''),
-    form8821ClientLink: experienceBase
-      ? `${experienceBase}/document/red-signing?session=${encodeURIComponent(roomCode)}&document=1&packet=red&standalone=1`
-      : '',
-    form8821SpouseLink: experienceBase
-      ? `${experienceBase}/document/red-signing-spouse?session=${encodeURIComponent(roomCode)}&document=1&packet=red&standalone=1`
-      : '',
+    // For signature requests we want the "Review and Sign" button to take the
+    // client directly into the BoldSign signing session, not the legacy PDF
+    // overlay experience.
+    form8821ClientLink: backendBase
+      ? `${backendBase}/api/session/${encodedCode}/document-link`
+      : experienceBase
+        ? `${experienceBase}/document/red-signing?session=${encodedCode}&document=1&packet=red&standalone=1`
+        : '',
+    form8821SpouseLink: backendBase
+      ? `${backendBase}/api/session/${encodedCode}/document-link?target=spouse`
+      : experienceBase
+        ? `${experienceBase}/document/red-signing-spouse?session=${encodedCode}&document=1&packet=red&standalone=1`
+        : '',
   }
 }
 
@@ -2399,6 +2408,7 @@ async function createBoldsign8821SigningLink({
           Title: 'TaxRefresh R.E.D Packet',
           Message: '',
           DisableEmails: true,
+          EnableEmbeddedSigning: true,
           EnableSigningOrder: false,
           ...(isMarriedJoint
             ? {
@@ -4111,7 +4121,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!isValidEmailAddress(resolvedRecipientEmail)) {
       return res.status(400).json({ error: 'No valid client email is attached to this record yet.' })
     }
-    const links = buildExternalDocumentLinks(roomCode, room, baseUrl)
+    let links = buildExternalDocumentLinks(roomCode, room, baseUrl)
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
     const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
     let contactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
@@ -4154,8 +4164,57 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.signed_8821_render_version = ''
       answers.signed_8821_first_page_render_version = ''
       answers.form8821_status = 'launching'
-      if (!links.form8821ClientLink) {
-        return res.status(400).json({ error: 'A custom signing link is not available for this document yet.' })
+
+      // Ensure we create the BoldSign document immediately when the rep clicks
+      // "Send Document" so the client only has to sign (everything else is prefilled).
+      const backendBase = String(getBackendBaseUrl() || '').trim().replace(/\/+$/, '')
+      const clientReturnUrl = backendBase
+        ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=client`
+        : ''
+      const spouseReturnUrl = backendBase
+        ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=spouse`
+        : ''
+
+      const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+      if (isMarriedJoint) {
+        if (!isValidEmailAddress(spouseRecipientEmail)) {
+          return res.status(400).json({ error: 'Spouse email is required for married filing jointly.' })
+        }
+        // Store spouse email so template sending can attach spouse as RoleIndex 2.
+        answers.spouse_email = spouseRecipientEmail
+        answers.form8821_spouse_status = 'launching'
+      } else {
+        answers.form8821_spouse_status = 'not_required'
+      }
+
+      const created = await createBoldsign8821SigningLink({
+        sessionCode: roomCode,
+        signerName: clientName,
+        signerEmail: resolvedRecipientEmail,
+        returnUrl: clientReturnUrl,
+        onBehalfOf: String(req.adminUser?.email || '').trim(),
+        persistDocument: true,
+        documentFieldPrefix: 'boldsign_8821',
+      })
+
+      const clientSigningUrl = String(created?.signingUrl || '').trim()
+      if (!clientSigningUrl) {
+        return res.status(500).json({ error: 'Unable to create a secure signing link for this document.' })
+      }
+
+      let spouseSigningUrl = ''
+      if (isMarriedJoint) {
+        spouseSigningUrl = await getBoldsignEmbeddedSignLink({
+          documentId: String(created?.documentId || '').trim(),
+          signerEmail: spouseRecipientEmail,
+          redirectUrl: spouseReturnUrl || clientReturnUrl,
+        })
+      }
+
+      links = {
+        ...links,
+        form8821ClientLink: clientSigningUrl,
+        form8821SpouseLink: spouseSigningUrl,
       }
       await sendGhlEmailMessage({
         contactId,
@@ -4186,6 +4245,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       })
 
       if (isMarriedJointFilingAnswers(answers) && spouseRecipientEmail) {
+        if (!links.form8821SpouseLink) {
+          return res.status(500).json({ error: 'Unable to create a secure spouse signing link for this document.' })
+        }
         await sendGhlEmailMessage({
           contactId,
           emailTo: spouseRecipientEmail,
@@ -4267,6 +4329,8 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
             { type: 'setAnswer', questionId: 'current_8821_document_code', value: answers.current_8821_document_code },
             { type: 'setAnswer', questionId: 'active_8821_document_code', value: answers.active_8821_document_code },
             { type: 'setAnswer', questionId: 'form8821_status', value: answers.form8821_status },
+            { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+            { type: 'setAnswer', questionId: 'spouse_email', value: answers.spouse_email || '' },
             { type: 'setAnswer', questionId: 'boldsign_8821_signed_at', value: answers.boldsign_8821_signed_at },
             { type: 'setAnswer', questionId: 'signed_8821_saved_at', value: answers.signed_8821_saved_at },
             { type: 'setAnswer', questionId: 'signed_8821_first_page_saved_at', value: answers.signed_8821_first_page_saved_at },
@@ -4406,7 +4470,14 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     const returnUrl =
       String(req.query?.returnUrl || '').trim() ||
       (backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=${target}` : '')
-    const documentFieldPrefix = target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
+
+    const boldsignConfig = getBoldsignConfig()
+    const templateConfigured = Boolean(String(boldsignConfig.templateId || '').trim())
+
+    // When we use a BoldSign template (client + spouse roles), we keep a single
+    // BoldSign document id (`boldsign_8821_document_id`) and just generate
+    // separate embedded signing links for each signer email.
+    const documentFieldPrefix = templateConfigured ? 'boldsign_8821' : target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
     const existingDocumentId = String(answers[`${documentFieldPrefix}_document_id`] || '').trim()
     let signingUrl = ''
 
@@ -4423,15 +4494,38 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     }
 
     if (!signingUrl) {
-      const created = await createBoldsign8821SigningLink({
-        sessionCode: roomCode,
-        signerName,
-        signerEmail,
-        returnUrl,
-        persistDocument: true,
-        documentFieldPrefix,
-      })
-      signingUrl = String(created.signingUrl || '').trim()
+      if (templateConfigured && target === 'spouse') {
+        // Ensure spouse email is stored for MFJ template sending.
+        if (!String(answers.spouse_email || '').trim()) answers.spouse_email = signerEmail
+        const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim()
+        const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+        if (!isValidEmailAddress(clientEmail)) {
+          return res.status(400).json({ error: 'No valid client email is attached to this record yet.' })
+        }
+        const created = await createBoldsign8821SigningLink({
+          sessionCode: roomCode,
+          signerName: clientName,
+          signerEmail: clientEmail,
+          returnUrl,
+          persistDocument: true,
+          documentFieldPrefix: 'boldsign_8821',
+        })
+        signingUrl = await getBoldsignEmbeddedSignLink({
+          documentId: String(created?.documentId || '').trim(),
+          signerEmail,
+          redirectUrl: returnUrl,
+        })
+      } else {
+        const created = await createBoldsign8821SigningLink({
+          sessionCode: roomCode,
+          signerName,
+          signerEmail,
+          returnUrl,
+          persistDocument: true,
+          documentFieldPrefix,
+        })
+        signingUrl = String(created.signingUrl || '').trim()
+      }
     }
 
     if (!signingUrl) return res.status(500).json({ error: 'Unable to create a standalone document link.' })
@@ -4623,6 +4717,11 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
       room.state.answers.active_8821_document_code = completedDocumentCode
     }
     room.state.answers.form8821_status = 'completed'
+    if (isMarriedJointFilingAnswers(room.state.answers)) {
+      room.state.answers.form8821_spouse_status = 'completed'
+    } else {
+      room.state.answers.form8821_spouse_status = room.state.answers.form8821_spouse_status || 'not_required'
+    }
     room.state.answers.onboarding_status = 'documents_signed'
     room.state.answers.completed_at = room.state.answers.completed_at || new Date().toISOString()
     room.state.answers.boldsign_8821_signed_at = new Date().toISOString()
