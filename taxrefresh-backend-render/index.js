@@ -4104,6 +4104,35 @@ app.post('/api/plaid/exchange_public_token', async (req, res) => {
  * Durable form state is persisted in Postgres (ti_sessions.state) when DATABASE_URL is set.
  */
 const rooms = new Map()
+const ROOM_MEMORY_IDLE_MS = 2 * 60 * 1000
+
+function canReleaseRoomFromMemory(room) {
+  if (!room) return false
+  if (room.participants?.size) return false
+  if (room.screenshareActive || room.pendingScreenshareFrom || room.repSocketId) return false
+  if (room.repControlEnabled || room.repControlFrom) return false
+  const lastPresenceAt = Number(room.lastClientPresenceAt || 0)
+  if (lastPresenceAt && Date.now() - lastPresenceAt < ROOM_MEMORY_IDLE_MS) return false
+  return true
+}
+
+function releaseRoomFromMemory(code = '', expectedRoom = null) {
+  const variants = getCodeVariants(code)
+  variants.forEach((variant) => {
+    const current = rooms.get(variant)
+    if (!current) return
+    if (expectedRoom && current !== expectedRoom) return
+    rooms.delete(variant)
+  })
+}
+
+setInterval(() => {
+  for (const [code, room] of rooms.entries()) {
+    if (canReleaseRoomFromMemory(room)) {
+      releaseRoomFromMemory(code, room)
+    }
+  }
+}, 60 * 1000).unref()
 
 async function ensureRoom(code) {
   for (const candidate of getCodeVariants(code)) {
@@ -5865,6 +5894,7 @@ io.on('connection', (socket) => {
       if (room.repSocketId === socket.id) room.repSocketId = null
       if (!hasLiveClientParticipant(room)) room.lastClientPresenceAt = 0
       broadcastParticipants(roomCode)
+      if (canReleaseRoomFromMemory(room)) releaseRoomFromMemory(roomCode, room)
     }
   })
 
@@ -6244,6 +6274,7 @@ io.on('connection', (socket) => {
         if (room.repSocketId === socket.id) room.repSocketId = null
         if (!hasLiveClientParticipant(room)) room.lastClientPresenceAt = 0
         broadcastParticipants(code)
+        if (canReleaseRoomFromMemory(room)) releaseRoomFromMemory(code, room)
       }
     }
   })
