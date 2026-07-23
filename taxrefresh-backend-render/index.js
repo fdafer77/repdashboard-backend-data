@@ -2327,7 +2327,6 @@ function getSpouseSignerNameFromAnswers(answers = {}) {
 function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
   const context = getRedPacketRenderContext(answers)
   const fullName = [String(context.firstName || '').trim(), String(context.lastName || '').trim()].filter(Boolean).join(' ')
-  const sentLabel = String(sentDateLabel || '').trim() || formatMmDdYyyy(new Date())
 
   const spouseFirstName = String(context.spouseFirstName || '').trim()
   const spouseLastName = String(context.spouseLastName || '').trim()
@@ -2425,12 +2424,6 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_SSN: String(context.spouseSsn || '').trim(),
     Spouse_DOB: String(context.spouseDob || '').trim(),
     Spouse_Phone_Number: String(context.spousePhone || '').trim(),
-    Spouse_Date_Signed: sentLabel,
-  }
-
-  // Dates: Date_Signed1..9 should be the "send date" (MM/DD/YYYY)
-  for (let i = 1; i <= 9; i += 1) {
-    clientFields[`Date_Signed${i}`] = sentLabel
   }
 
   return {
