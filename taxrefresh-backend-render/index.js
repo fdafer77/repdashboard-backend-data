@@ -469,6 +469,14 @@ function getActive8821DocumentCode(answers = {}) {
   return String(answers?.active_8821_document_code || answers?.current_8821_document_code || '').trim()
 }
 
+function is8821TargetAlreadySigned(answers = {}, target = 'client') {
+  const normalizedTarget = String(target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+  if (normalizedTarget === 'spouse') {
+    return String(answers?.form8821_spouse_status || '').trim().toLowerCase() === 'completed'
+  }
+  return String(answers?.form8821_status || '').trim().toLowerCase() === 'completed'
+}
+
 function markSigned8821DeliveryEntries(answers = {}, signedAt = '', documentCode = '') {
   const normalizedSignedAt = String(signedAt || '').trim() || new Date().toISOString()
   const normalizedDocumentCode = String(documentCode || getActive8821DocumentCode(answers)).trim()
@@ -2783,7 +2791,7 @@ async function createBoldsign8821SigningLink({
   const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignExistingFormFieldsFromAnswers(answers, { sentDateLabel: sendDateLabel })
 
   const existingDocumentId = String(answers?.[`${documentFieldPrefix}_document_id`] || '').trim()
-  const shouldReuseExistingDocument = Boolean(existingDocumentId)
+  const shouldReuseExistingDocument = Boolean(existingDocumentId) && !isForm8821FullySigned(answers)
 
   const sendResult = shouldReuseExistingDocument
     ? { documentId: existingDocumentId }
@@ -4803,6 +4811,13 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
   try {
     const sessionCode = String(req.body?.sessionCode || '').trim()
     if (!sessionCode) return res.status(400).json({ error: 'sessionCode is required' })
+    const target = String(req.body?.target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
+    const roomState = await getSessionStateForCode(sessionCode)
+    const answers = roomState?.answers || {}
+    const existingDocumentId = String(answers.boldsign_8821_document_id || '').trim()
+    if (existingDocumentId && is8821TargetAlreadySigned(answers, target)) {
+      return res.json({ alreadySigned: true, documentId: existingDocumentId, target })
+    }
     const result = await createBoldsign8821SigningLink({
       sessionCode,
       signerName: String(req.body?.name || '').trim(),
@@ -4913,9 +4928,10 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     // separate embedded signing links for each signer email.
     const documentFieldPrefix = templateConfigured ? 'boldsign_8821' : target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
     const existingDocumentId = String(answers[`${documentFieldPrefix}_document_id`] || '').trim()
+    const allowExistingDocumentReuse = Boolean(existingDocumentId) && !isForm8821FullySigned(answers)
     let signingUrl = ''
 
-    if (existingDocumentId && returnUrl) {
+    if (allowExistingDocumentReuse && returnUrl) {
       try {
         signingUrl = await getBoldsignEmbeddedSignLink({
           documentId: existingDocumentId,
