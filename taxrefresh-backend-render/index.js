@@ -368,6 +368,58 @@ function digitsOnly(input = '') {
   return String(input || '').replace(/\D/g, '')
 }
 
+function extractGhlCustomFieldValue(entity = {}, matcher = () => false) {
+  const groups = [
+    entity?.customFields,
+    entity?.custom_fields,
+    entity?.customField,
+    entity?.custom_field,
+  ]
+
+  for (const group of groups) {
+    for (const field of Array.isArray(group) ? group : []) {
+      const keysToMatch = [
+        field?.slug,
+        field?.key,
+        field?.name,
+        field?.label,
+        field?.fieldKey,
+        field?.fieldName,
+        field?.fieldLabel,
+        field?.id,
+      ]
+      if (!keysToMatch.some((value) => matcher(String(value || '')))) continue
+      const value = field?.fieldValue ?? field?.field_value ?? field?.value ?? field?.fieldData ?? field?.data ?? ''
+      if (String(value || '').trim()) return String(value).trim()
+    }
+  }
+
+  return ''
+}
+
+function extractGhlLiabilityValue(opportunity = {}, contact = {}) {
+  const isLiabilityField = (value = '') => {
+    const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+    if (!normalized) return false
+    return [
+      'irs_balance',
+      'irs_balance_amount',
+      'federal_balance',
+      'tax_liability',
+      'total_liability',
+      'amount_owed',
+      'tax_debt',
+      'liability',
+    ].some((token) => normalized.includes(token))
+  }
+
+  return (
+    extractGhlCustomFieldValue(opportunity, isLiabilityField) ||
+    extractGhlCustomFieldValue(contact, isLiabilityField) ||
+    String(opportunity?.monetaryValue ?? '').trim()
+  )
+}
+
 function parseStoredTargetMap(value) {
   const parsed = parseStoredObject(value, {})
   return Object.fromEntries(
@@ -3662,6 +3714,7 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
   const pipelineName = pipelineNameById.get(pipelineId) || ''
   const stageName = stageNameById.get(stageId) || ''
   const updatedAt = Date.parse(String(opportunity?.updatedAt || opportunity?.lastStatusChangeAt || '')) || Date.now()
+  const ghlLiabilityValue = extractGhlLiabilityValue(opportunity, contact)
 
   return {
     ...existingState,
@@ -3677,6 +3730,7 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
       ghl_opportunity_name: String(opportunity?.name || ''),
       ghl_opportunity_status: String(opportunity?.status || ''),
       ghl_opportunity_value: String(opportunity?.monetaryValue ?? ''),
+      ghl_liability_value: ghlLiabilityValue,
       ghl_assigned_to: String(opportunity?.assignedTo || ''),
       ghl_last_status_change_at: String(opportunity?.lastStatusChangeAt || ''),
       ghl_last_stage_change_at: String(opportunity?.lastStageChangeAt || ''),
@@ -3804,15 +3858,16 @@ function buildConsultationSummary(record) {
   const state = record?.state || {}
   const answers = state?.answers || {}
   normalizePersistedSigned8821State(answers)
-  const irsBalance = toNumberValue(
+  const rawIrsBalance = toNumberValue(
     getPrimaryAnswer(answers, ['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount']),
   )
   const stateBalance = toNumberValue(
     getPrimaryAnswer(answers, ['stateBalance', 'state_balance', 'stateTaxBalance', 'state_tax_balance']),
   )
   const directLiability = toNumberValue(
-    getPrimaryAnswer(answers, ['taxLiability', 'tax_liability', 'totalLiability', 'total_liability', 'ghl_opportunity_value']),
+    getPrimaryAnswer(answers, ['taxLiability', 'tax_liability', 'totalLiability', 'total_liability', 'ghl_liability_value', 'ghl_opportunity_value']),
   )
+  const irsBalance = rawIrsBalance > 0 ? rawIrsBalance : directLiability
   const stateUpdatedAt = Number(state?.updatedAt || 0)
   const recordUpdatedAt = record?.updatedAt ? new Date(record.updatedAt).getTime() : 0
   const updatedAtRaw = Math.max(stateUpdatedAt, recordUpdatedAt)
