@@ -2280,6 +2280,31 @@ function buildSmsThreadEntryFromGhlMessage(message = {}, overrides = {}) {
   })
 }
 
+async function findRecentGhlConversationIdByContact(contactId = '') {
+  const normalizedContactId = String(contactId || '').trim()
+  if (!normalizedContactId || !hasDirectGhlConfig()) return ''
+  try {
+    const data = await ghlFetch('conversations/search', {
+      version: 'v3',
+      query: {
+        locationId: GHL_LOCATION_ID,
+        contactId: normalizedContactId,
+        sort: 'desc',
+        sortBy: 'last_message_date',
+        limit: 10,
+      },
+    })
+    const conversations = Array.isArray(data?.conversations) ? data.conversations : []
+    const preferredConversation =
+      conversations.find((entry) => ['TYPE_PHONE', 'TYPE_GROUP_SMS'].includes(String(entry?.type || '').trim())) ||
+      conversations[0]
+    return String(preferredConversation?.id || '').trim()
+  } catch (error) {
+    console.error('Failed to search GHL conversations by contact:', error)
+    return ''
+  }
+}
+
 async function fetchRecentGhlSmsMessages(conversationId = '', limit = 20) {
   const normalizedConversationId = String(conversationId || '').trim()
   if (!normalizedConversationId || !hasDirectGhlConfig()) return []
@@ -2302,10 +2327,8 @@ async function fetchRecentGhlSmsMessages(conversationId = '', limit = 20) {
 
 async function sendGhlSmsMessage({ contactId, phoneNumber, message }) {
   const normalizedContactId = String(contactId || '').trim()
-  const normalizedPhone = normalizePhoneForSms(phoneNumber)
   const normalizedMessage = String(message || '').trim()
   if (!normalizedContactId) throw new Error('A CRM contact id is required before sending SMS.')
-  if (!normalizedPhone) throw new Error('A valid phone number is required before sending SMS.')
   if (!normalizedMessage) throw new Error('SMS message cannot be empty.')
   return ghlFetch('conversations/messages', {
     method: 'POST',
@@ -2313,7 +2336,6 @@ async function sendGhlSmsMessage({ contactId, phoneNumber, message }) {
     body: {
       type: 'SMS',
       contactId: normalizedContactId,
-      toNumber: normalizedPhone,
       message: normalizedMessage,
       status: 'delivered',
     },
@@ -4095,12 +4117,25 @@ async function attachSmsThreadToConsultationDetail(detail) {
   if (!detail) return null
   const answers = detail?.answers || {}
   const storedThread = parseStoredSmsThread(answers.consultation_sms_thread)
-  const conversationId = getStoredSmsConversationId(answers, storedThread)
-  const fetchedThread = await fetchRecentGhlSmsMessages(conversationId, 25)
+  const contactId = String(detail?.contactId || answers?.ghl_contact_id || '').trim()
+  const storedConversationId = getStoredSmsConversationId(answers, storedThread)
+  const resolvedConversationId = storedConversationId || (await findRecentGhlConversationIdByContact(contactId))
+  let fetchedThread = await fetchRecentGhlSmsMessages(resolvedConversationId, 25)
+  let finalConversationId = resolvedConversationId
+  if (!fetchedThread.length && contactId) {
+    const fallbackConversationId = await findRecentGhlConversationIdByContact(contactId)
+    if (fallbackConversationId && fallbackConversationId !== resolvedConversationId) {
+      const fallbackThread = await fetchRecentGhlSmsMessages(fallbackConversationId, 25)
+      if (fallbackThread.length) {
+        fetchedThread = fallbackThread
+        finalConversationId = fallbackConversationId
+      }
+    }
+  }
   const smsThread = mergeSmsThreadEntries(storedThread, fetchedThread)
   return {
     ...detail,
-    smsConversationId: conversationId,
+    smsConversationId: finalConversationId,
     smsPhone: normalizePhoneForSms(detail?.phone || answers?.phone || answers?.phone_number || ''),
     smsThread,
   }
