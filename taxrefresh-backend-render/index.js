@@ -3957,7 +3957,16 @@ function buildConsultationDetail(record) {
   const answerEntries = Object.entries(answers)
     .filter(([key, value]) => !key.startsWith('_ui_') && value !== '' && value !== null && value !== undefined)
     .map(([key, value]) => ({ key, value }))
-    .sort((a, b) => a.key.localeCompare(b.key))
+  const irsBalanceEntryIndex = answerEntries.findIndex((entry) => entry.key === 'irsBalance')
+  const currentIrsBalanceEntryValue = irsBalanceEntryIndex >= 0 ? toNumberValue(answerEntries[irsBalanceEntryIndex]?.value) : 0
+  if (summary.irsBalance > 0 && currentIrsBalanceEntryValue <= 0) {
+    if (irsBalanceEntryIndex >= 0) {
+      answerEntries[irsBalanceEntryIndex] = { key: 'irsBalance', value: String(summary.irsBalance) }
+    } else {
+      answerEntries.push({ key: 'irsBalance', value: String(summary.irsBalance) })
+    }
+  }
+  answerEntries.sort((a, b) => a.key.localeCompare(b.key))
   return {
     ...summary,
     answers,
