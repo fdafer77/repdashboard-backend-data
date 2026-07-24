@@ -334,9 +334,34 @@ function getPrimaryAnswer(answers, keys = []) {
 
 function toNumberValue(input) {
   if (typeof input === 'number' && Number.isFinite(input)) return input
-  const digits = String(input ?? '').replace(/[^\d.-]/g, '')
+  const raw = String(input ?? '').trim()
+  if (!raw) return 0
+  const normalized = raw.toLowerCase()
+  const numericMatches = raw.match(/\d[\d,]*/g) || []
+  const values = numericMatches
+    .map((entry) => Number.parseFloat(String(entry).replace(/,/g, '')))
+    .filter((value) => Number.isFinite(value))
+
+  const estimateBracketAmount = (amount) => {
+    const safeAmount = Number(amount)
+    if (!Number.isFinite(safeAmount) || safeAmount <= 0) return 0
+    if (safeAmount < 100) return Math.ceil(safeAmount)
+    const magnitude = 10 ** Math.max(String(Math.trunc(safeAmount)).length - 2, 0)
+    return Math.ceil(safeAmount / magnitude) * magnitude
+  }
+
+  if (values.length) {
+    if (/(under|less than|below|up to|upto)/.test(normalized)) {
+      return estimateBracketAmount(values[0])
+    }
+    if (values.length > 1 && /(between|\bto\b|-|–|—)/.test(normalized)) {
+      return estimateBracketAmount(Math.max(...values))
+    }
+  }
+
+  const digits = raw.replace(/[^\d.-]/g, '')
   const parsed = Number.parseFloat(digits)
-  return Number.isFinite(parsed) ? parsed : 0
+  return Number.isFinite(parsed) ? parsed : values[0] || 0
 }
 
 function digitsOnly(input = '') {
@@ -1218,20 +1243,10 @@ function getRedPacketRenderContext(answers = {}) {
   const taxTypeValue = String(getPrimaryAnswer(answers, ['taxType']) || '').trim().toLowerCase()
   const taxTypeLabel = taxTypeValue === 'personal' ? 'Personal' : taxTypeValue === 'business' ? 'Business' : taxTypeValue === 'both' ? 'Both' : ''
   const taxAgencyLabel = normalizeTaxAgencyLabel(String(getPrimaryAnswer(answers, ['taxAgency', 'tax_agency']) || getPrimaryAnswer(answers, ['owe']) || '').trim())
-  const irs = Number(typeof answers['irsBalance'] === 'string' ? digitsOnly(answers['irsBalance']) : answers['irsBalance'] || 0)
-  const state = Number(typeof answers['stateBalance'] === 'string' ? digitsOnly(answers['stateBalance']) : answers['stateBalance'] || 0)
-  const aliasTotal = Number(
-    typeof answers['taxLiability'] === 'string'
-      ? digitsOnly(answers['taxLiability'])
-      : typeof answers['tax_liability'] === 'string'
-        ? digitsOnly(answers['tax_liability'])
-        : typeof answers['totalLiability'] === 'string'
-          ? digitsOnly(answers['totalLiability'])
-          : typeof answers['total_liability'] === 'string'
-            ? digitsOnly(answers['total_liability'])
-            : typeof answers['ghl_opportunity_value'] === 'string'
-              ? digitsOnly(answers['ghl_opportunity_value'])
-              : answers['taxLiability'] || answers['tax_liability'] || answers['totalLiability'] || answers['total_liability'] || answers['ghl_opportunity_value'] || 0,
+  const irs = toNumberValue(answers['irsBalance'])
+  const state = toNumberValue(answers['stateBalance'])
+  const aliasTotal = toNumberValue(
+    answers['taxLiability'] || answers['tax_liability'] || answers['totalLiability'] || answers['total_liability'] || answers['ghl_opportunity_value'] || 0,
   )
   const totalLiability = irs + state || aliasTotal
   const estimatedLiabilityLabel = formatUsdLabel(totalLiability)
