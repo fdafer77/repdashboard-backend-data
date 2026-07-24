@@ -2204,6 +2204,122 @@ async function sendGhlEmailMessage({ contactId, emailTo, subject, html, message 
   })
 }
 
+function normalizePhoneForSms(value = '') {
+  const digits = digitsOnly(value)
+  if (digits.length === 10) return `+1${digits}`
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
+  if (String(value || '').trim().startsWith('+')) return String(value || '').trim()
+  return String(value || '').trim()
+}
+
+function normalizeSmsThreadEntry(entry = {}) {
+  const body = String(entry?.body ?? entry?.message ?? '').trim()
+  const id =
+    String(entry?.id || entry?.messageId || entry?.message_id || '').trim() ||
+    `${String(entry?.conversationId || entry?.conversation_id || 'local').trim()}:${String(entry?.direction || 'outbound').trim()}:${String(entry?.dateAdded || entry?.date_added || '').trim()}:${body}`
+  return {
+    id,
+    conversationId: String(entry?.conversationId || entry?.conversation_id || '').trim(),
+    contactId: String(entry?.contactId || entry?.contact_id || '').trim(),
+    body,
+    direction: String(entry?.direction || 'outbound').trim().toLowerCase() === 'inbound' ? 'inbound' : 'outbound',
+    status: String(entry?.status || '').trim(),
+    messageType: String(entry?.messageType || entry?.message_type || 'SMS').trim() || 'SMS',
+    dateAdded: String(entry?.dateAdded || entry?.date_added || new Date().toISOString()).trim() || new Date().toISOString(),
+    from: String(entry?.from || '').trim(),
+    to: String(entry?.to || '').trim(),
+    source: String(entry?.source || 'dashboard').trim() || 'dashboard',
+    userId: String(entry?.userId || entry?.user_id || '').trim(),
+    error: String(entry?.error || '').trim(),
+    attachments: Array.isArray(entry?.attachments) ? entry.attachments.filter(Boolean).map((item) => String(item)) : [],
+  }
+}
+
+function parseStoredSmsThread(value) {
+  const parsed = parseStoredObject(value, [])
+  if (!Array.isArray(parsed)) return []
+  return parsed
+    .map((entry) => normalizeSmsThreadEntry(entry))
+    .filter((entry) => entry.body || entry.attachments.length)
+    .sort((left, right) => String(left.dateAdded || '').localeCompare(String(right.dateAdded || '')))
+}
+
+function mergeSmsThreadEntries(existingEntries = [], nextEntries = []) {
+  const merged = new Map()
+  for (const entry of [...existingEntries, ...nextEntries].map((item) => normalizeSmsThreadEntry(item))) {
+    if (!entry.id) continue
+    merged.set(entry.id, entry)
+  }
+  return Array.from(merged.values())
+    .sort((left, right) => String(left.dateAdded || '').localeCompare(String(right.dateAdded || '')))
+    .slice(-100)
+}
+
+function getStoredSmsConversationId(answers = {}, smsThread = []) {
+  const direct = String(answers?.ghl_conversation_id || answers?.ghl_sms_conversation_id || '').trim()
+  if (direct) return direct
+  return String(smsThread.find((entry) => String(entry?.conversationId || '').trim())?.conversationId || '').trim()
+}
+
+function buildSmsThreadEntryFromGhlMessage(message = {}, overrides = {}) {
+  return normalizeSmsThreadEntry({
+    id: String(message?.id || message?.messageId || '').trim(),
+    conversationId: String(message?.conversationId || overrides?.conversationId || '').trim(),
+    contactId: String(message?.contactId || overrides?.contactId || '').trim(),
+    body: String(message?.body || message?.message || '').trim(),
+    direction: String(message?.direction || overrides?.direction || '').trim() || 'outbound',
+    status: String(message?.status || overrides?.status || '').trim(),
+    messageType: String(message?.messageType || overrides?.messageType || 'SMS').trim(),
+    dateAdded: String(message?.dateAdded || overrides?.dateAdded || new Date().toISOString()).trim(),
+    from: String(message?.from || overrides?.from || '').trim(),
+    to: String(message?.to || overrides?.to || '').trim(),
+    source: String(overrides?.source || 'ghl').trim(),
+    userId: String(message?.userId || overrides?.userId || '').trim(),
+    error: String(message?.error || overrides?.error || '').trim(),
+    attachments: Array.isArray(message?.attachments) ? message.attachments : overrides?.attachments || [],
+  })
+}
+
+async function fetchRecentGhlSmsMessages(conversationId = '', limit = 20) {
+  const normalizedConversationId = String(conversationId || '').trim()
+  if (!normalizedConversationId || !hasDirectGhlConfig()) return []
+  try {
+    const data = await ghlFetch(`conversations/${encodeURIComponent(normalizedConversationId)}/messages`, {
+      version: 'v3',
+      query: { limit, type: 'TYPE_SMS,TYPE_CUSTOM_PROVIDER_SMS' },
+    })
+    const messages = Array.isArray(data?.messages?.messages)
+      ? data.messages.messages
+      : Array.isArray(data?.messages)
+        ? data.messages
+        : []
+    return messages.map((entry) => buildSmsThreadEntryFromGhlMessage(entry, { source: 'ghl' }))
+  } catch (error) {
+    console.error('Failed to fetch GHL SMS thread:', error)
+    return []
+  }
+}
+
+async function sendGhlSmsMessage({ contactId, phoneNumber, message }) {
+  const normalizedContactId = String(contactId || '').trim()
+  const normalizedPhone = normalizePhoneForSms(phoneNumber)
+  const normalizedMessage = String(message || '').trim()
+  if (!normalizedContactId) throw new Error('A CRM contact id is required before sending SMS.')
+  if (!normalizedPhone) throw new Error('A valid phone number is required before sending SMS.')
+  if (!normalizedMessage) throw new Error('SMS message cannot be empty.')
+  return ghlFetch('conversations/messages', {
+    method: 'POST',
+    version: 'v3',
+    body: {
+      type: 'SMS',
+      contactId: normalizedContactId,
+      toNumber: normalizedPhone,
+      message: normalizedMessage,
+      status: 'delivered',
+    },
+  })
+}
+
 function upsertDocumentReceipts(existingReceipts, nextReceipts) {
   const current = Array.isArray(existingReceipts) ? existingReceipts : parseStoredObject(existingReceipts, [])
   const currentList = Array.isArray(current) ? current : []
@@ -3975,6 +4091,45 @@ function buildConsultationDetail(record) {
   }
 }
 
+async function attachSmsThreadToConsultationDetail(detail) {
+  if (!detail) return null
+  const answers = detail?.answers || {}
+  const storedThread = parseStoredSmsThread(answers.consultation_sms_thread)
+  const conversationId = getStoredSmsConversationId(answers, storedThread)
+  const fetchedThread = await fetchRecentGhlSmsMessages(conversationId, 25)
+  const smsThread = mergeSmsThreadEntries(storedThread, fetchedThread)
+  return {
+    ...detail,
+    smsConversationId: conversationId,
+    smsPhone: normalizePhoneForSms(detail?.phone || answers?.phone || answers?.phone_number || ''),
+    smsThread,
+  }
+}
+
+async function persistSmsThreadForRoom({ roomCode, room, entries = [], conversationId = '', contactId = '' }) {
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode || !room) return []
+  const existingThread = parseStoredSmsThread(room.state?.answers?.consultation_sms_thread)
+  const mergedThread = mergeSmsThreadEntries(existingThread, entries)
+  room.state.answers.consultation_sms_thread = mergedThread
+  if (conversationId) {
+    room.state.answers.ghl_conversation_id = String(conversationId).trim()
+    room.state.answers.ghl_sms_conversation_id = String(conversationId).trim()
+  }
+  if (contactId) {
+    room.contactId = String(contactId).trim() || room.contactId || null
+    room.state.answers.ghl_contact_id = String(contactId).trim()
+  }
+  room.state.updatedAt = Date.now()
+  io.to(normalizedRoomCode).emit('room_patch', {
+    patch: { type: 'setAnswer', questionId: 'consultation_sms_thread', value: mergedThread },
+    updatedAt: room.state.updatedAt,
+  })
+  io.to(normalizedRoomCode).emit('room_state', room.state)
+  await dbUpsertSession({ code: normalizedRoomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+  return mergedThread
+}
+
 function consultationMatchesSearch(summary, search = '') {
   if (!search) return true
   const haystack = [
@@ -4472,25 +4627,25 @@ async function getConsultationRecordByCode(code) {
   if (!normalized) return null
   const row = await dbGetSession(normalized)
   if (row) {
-    return buildConsultationDetail({
+    return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
       opportunityId: row.ghl_opportunity_id,
       state: row.state,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-    })
+    }))
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
   if (!room) return null
-  return buildConsultationDetail({
+  return attachSmsThreadToConsultationDetail(buildConsultationDetail({
     sessionCode: normalized,
     contactId: room.contactId,
     opportunityId: room.opportunityId,
     state: room.state,
     createdAt: room.state?.updatedAt || Date.now(),
     updatedAt: room.state?.updatedAt || Date.now(),
-  })
+  }))
 }
 
 app.post('/api/admin/consultations/auth', (req, res) => {
@@ -4551,6 +4706,53 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
     return res.json({ item })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation detail' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/sms', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const message = String(req.body?.message || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    if (!message) return res.status(400).json({ error: 'SMS message is required' })
+
+    const room = await ensureRoom(roomCode)
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+
+    const contactId = String(room.contactId || currentItem.contactId || currentItem.answers?.ghl_contact_id || '').trim()
+    const phoneNumber = normalizePhoneForSms(currentItem.phone || currentItem.answers?.phone || currentItem.answers?.phone_number || '')
+    if (!contactId) return res.status(400).json({ error: 'This consultation is missing a GoHighLevel contact id.' })
+    if (!phoneNumber) return res.status(400).json({ error: 'This consultation is missing a valid phone number for SMS.' })
+
+    const response = await sendGhlSmsMessage({ contactId, phoneNumber, message })
+    const conversationId = String(response?.conversationId || currentItem.smsConversationId || '').trim()
+    const outboundEntry = normalizeSmsThreadEntry({
+      id: String(response?.messageId || '').trim(),
+      conversationId,
+      contactId,
+      body: message,
+      direction: 'outbound',
+      status: 'delivered',
+      messageType: 'SMS',
+      dateAdded: new Date().toISOString(),
+      from: '',
+      to: phoneNumber,
+      source: 'dashboard',
+      userId: String(req.adminUser?.email || '').trim(),
+    })
+
+    await persistSmsThreadForRoom({ roomCode, room, entries: [outboundEntry], conversationId, contactId })
+    emitDashboardRecordsUpdated({ reason: 'ghl_sms_outbound', sessionCode: roomCode, contactId, opportunityId: room.opportunityId || '' })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, conversationId, messageId: String(response?.messageId || '') })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to send SMS message.' })
   }
 })
 
@@ -5620,6 +5822,43 @@ app.post('/webhooks/ghl', (req, res) => {
     const contactId = String(req.body?.contactId || req.body?.contact_id || req.body?.contact?.id || '').trim()
     const opportunityId = String(req.body?.opportunityId || req.body?.opportunity_id || req.body?.opportunity?.id || req.body?.id || '').trim()
     if (!contactId) return res.status(400).json({ error: 'contactId missing in webhook payload' })
+
+    const webhookType = String(req.body?.type || '').trim()
+    const messageType = String(req.body?.messageType || req.body?.message_type || '').trim().toUpperCase()
+    if (webhookType === 'InboundMessage' && (messageType === 'SMS' || messageType === 'TYPE_SMS')) {
+      const synced = await syncSingleGhlProspectToDashboard({
+        contactId,
+        opportunityId,
+        webhookPayload: req.body || {},
+      })
+      const code = synced.code
+      const room = synced.room
+      const conversationId = String(req.body?.conversationId || req.body?.conversation_id || '').trim()
+      const inboundEntry = normalizeSmsThreadEntry({
+        id: String(req.body?.messageId || req.body?.message_id || '').trim(),
+        conversationId,
+        contactId,
+        body: String(req.body?.body || req.body?.message || '').trim(),
+        direction: 'inbound',
+        status: String(req.body?.status || '').trim(),
+        messageType: 'SMS',
+        dateAdded: String(req.body?.dateAdded || req.body?.date_added || new Date().toISOString()).trim(),
+        from: String(req.body?.from || '').trim(),
+        to: Array.isArray(req.body?.to) ? String(req.body.to[0] || '').trim() : String(req.body?.to || '').trim(),
+        source: 'ghl_webhook',
+        userId: String(req.body?.userId || req.body?.user_id || '').trim(),
+        attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
+      })
+      await persistSmsThreadForRoom({ roomCode: code, room, entries: [inboundEntry], conversationId, contactId })
+      emitDashboardRecordsUpdated({
+        reason: 'ghl_sms_inbound',
+        sessionCode: code,
+        contactId,
+        opportunityId: room.opportunityId || '',
+        opportunityName: String(room.state?.answers?.ghl_opportunity_name || ''),
+      })
+      return res.json({ ok: true, contactId, opportunityId: room.opportunityId || '', code, conversationId })
+    }
 
     const base = String(req.body?.baseUrl || req.body?.base_url || process.env.PUBLIC_BASE_URL || '').trim()
     const synced = await syncSingleGhlProspectToDashboard({
