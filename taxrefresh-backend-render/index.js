@@ -2280,9 +2280,9 @@ function buildSmsThreadEntryFromGhlMessage(message = {}, overrides = {}) {
   })
 }
 
-async function findRecentGhlConversationIdByContact(contactId = '') {
+async function findRecentGhlConversationIdsByContact(contactId = '') {
   const normalizedContactId = String(contactId || '').trim()
-  if (!normalizedContactId || !hasDirectGhlConfig()) return ''
+  if (!normalizedContactId || !hasDirectGhlConfig()) return []
   try {
     const data = await ghlFetch('conversations/search', {
       version: 'v3',
@@ -2295,13 +2295,23 @@ async function findRecentGhlConversationIdByContact(contactId = '') {
       },
     })
     const conversations = Array.isArray(data?.conversations) ? data.conversations : []
-    const preferredConversation =
-      conversations.find((entry) => ['TYPE_PHONE', 'TYPE_GROUP_SMS'].includes(String(entry?.type || '').trim())) ||
-      conversations[0]
-    return String(preferredConversation?.id || '').trim()
+    const ordered = conversations
+      .slice()
+      .sort((left, right) => {
+        const leftScore =
+          (['TYPE_PHONE', 'TYPE_GROUP_SMS'].includes(String(left?.type || '').trim()) ? 5 : 0) +
+          (String(left?.lastMessageType || '').toUpperCase().includes('SMS') ? 3 : 0)
+        const rightScore =
+          (['TYPE_PHONE', 'TYPE_GROUP_SMS'].includes(String(right?.type || '').trim()) ? 5 : 0) +
+          (String(right?.lastMessageType || '').toUpperCase().includes('SMS') ? 3 : 0)
+        return rightScore - leftScore
+      })
+    return ordered
+      .map((entry) => String(entry?.id || '').trim())
+      .filter(Boolean)
   } catch (error) {
     console.error('Failed to search GHL conversations by contact:', error)
-    return ''
+    return []
   }
 }
 
@@ -2311,14 +2321,22 @@ async function fetchRecentGhlSmsMessages(conversationId = '', limit = 20) {
   try {
     const data = await ghlFetch(`conversations/${encodeURIComponent(normalizedConversationId)}/messages`, {
       version: 'v3',
-      query: { limit, type: 'TYPE_SMS,TYPE_CUSTOM_PROVIDER_SMS' },
+      query: { limit },
     })
     const messages = Array.isArray(data?.messages?.messages)
       ? data.messages.messages
       : Array.isArray(data?.messages)
         ? data.messages
         : []
-    return messages.map((entry) => buildSmsThreadEntryFromGhlMessage(entry, { source: 'ghl' }))
+    return messages
+      .filter((entry) => {
+        const messageType = String(entry?.messageType || '').toUpperCase()
+        if (!messageType) return Boolean(String(entry?.body || entry?.message || '').trim())
+        if (messageType.includes('EMAIL') || messageType.includes('INTERNAL')) return false
+        if (messageType.includes('SMS')) return true
+        return Boolean(String(entry?.body || entry?.message || '').trim()) && !messageType.includes('CALL')
+      })
+      .map((entry) => buildSmsThreadEntryFromGhlMessage(entry, { source: 'ghl' }))
   } catch (error) {
     console.error('Failed to fetch GHL SMS thread:', error)
     return []
@@ -4119,17 +4137,16 @@ async function attachSmsThreadToConsultationDetail(detail) {
   const storedThread = parseStoredSmsThread(answers.consultation_sms_thread)
   const contactId = String(detail?.contactId || answers?.ghl_contact_id || '').trim()
   const storedConversationId = getStoredSmsConversationId(answers, storedThread)
-  const resolvedConversationId = storedConversationId || (await findRecentGhlConversationIdByContact(contactId))
-  let fetchedThread = await fetchRecentGhlSmsMessages(resolvedConversationId, 25)
-  let finalConversationId = resolvedConversationId
-  if (!fetchedThread.length && contactId) {
-    const fallbackConversationId = await findRecentGhlConversationIdByContact(contactId)
-    if (fallbackConversationId && fallbackConversationId !== resolvedConversationId) {
-      const fallbackThread = await fetchRecentGhlSmsMessages(fallbackConversationId, 25)
-      if (fallbackThread.length) {
-        fetchedThread = fallbackThread
-        finalConversationId = fallbackConversationId
-      }
+  const discoveredConversationIds = await findRecentGhlConversationIdsByContact(contactId)
+  const conversationCandidates = Array.from(new Set([storedConversationId, ...discoveredConversationIds].filter(Boolean)))
+  let fetchedThread = []
+  let finalConversationId = conversationCandidates[0] || ''
+  for (const conversationId of conversationCandidates) {
+    const candidateThread = await fetchRecentGhlSmsMessages(conversationId, 25)
+    if (candidateThread.length) {
+      fetchedThread = candidateThread
+      finalConversationId = conversationId
+      break
     }
   }
   const smsThread = mergeSmsThreadEntries(storedThread, fetchedThread)
