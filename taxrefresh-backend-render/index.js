@@ -38,6 +38,16 @@ const ADMIN_DASHBOARD_PASSCODE = String(process.env.ADMIN_DASHBOARD_PASSCODE || 
 const SESSION_STORE_PATH = path.resolve(process.env.SESSION_STORE_PATH || path.join(process.cwd(), '.data', 'sessions.json'))
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_PUBLISHABLE_KEY = String(process.env.STRIPE_PUBLISHABLE_KEY || '').trim()
+const SOFT_CREDIT_CHECK_PROVIDER = 'Experian'
+const SOFT_CREDIT_CHECK_CONSENT_VERSION = String(process.env.SOFT_CREDIT_CHECK_CONSENT_VERSION || '2026-07-30-v1').trim()
+const EXPERIAN_SOFT_PULL_URL = String(process.env.EXPERIAN_SOFT_PULL_URL || '').trim()
+const EXPERIAN_SOFT_PULL_BEARER_TOKEN = String(process.env.EXPERIAN_SOFT_PULL_BEARER_TOKEN || '').trim()
+const EXPERIAN_SOFT_PULL_USERNAME = String(process.env.EXPERIAN_SOFT_PULL_USERNAME || '').trim()
+const EXPERIAN_SOFT_PULL_PASSWORD = String(process.env.EXPERIAN_SOFT_PULL_PASSWORD || '').trim()
+const EXPERIAN_SOFT_PULL_API_KEY = String(process.env.EXPERIAN_SOFT_PULL_API_KEY || '').trim()
+const EXPERIAN_SOFT_PULL_API_KEY_HEADER = String(process.env.EXPERIAN_SOFT_PULL_API_KEY_HEADER || 'x-api-key').trim()
+const EXPERIAN_SOFT_PULL_USE_MOCK = String(process.env.EXPERIAN_SOFT_PULL_USE_MOCK || '').trim() === '1'
+const EXPERIAN_SOFT_PULL_TIMEOUT_MS = Math.max(3000, Number(process.env.EXPERIAN_SOFT_PULL_TIMEOUT_MS || 15000) || 15000)
 
 const DEFAULT_GHL_CONTACT_FIELDS = [
   { slug: 'portal_session_code', name: 'Portal Session Code' },
@@ -2699,6 +2709,14 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
       console.error('Signed 8821 client email failed:', error)
     })
+    void runSoftCreditCheckForRoom({
+      roomCode,
+      room,
+      consentGranted: true,
+      source: 'document_signed_auto',
+    }).catch((error) => {
+      console.error('Soft credit check auto-run failed:', error)
+    })
   }
 
   room.state.updatedAt = Date.now()
@@ -4077,6 +4095,803 @@ function buildConsultationSummary(record) {
   }
 }
 
+function parseSoftCreditHistory(value) {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function isSoftCreditConsentGranted(answers = {}) {
+  const normalized = String(answers.soft_credit_check_consent_status || '').trim().toLowerCase()
+  return ['1', 'true', 'yes', 'granted', 'authorized', 'authorized_soft_pull'].includes(normalized)
+}
+
+function parseStoredDob(value = '') {
+  const digits = digitsOnly(value)
+  if (digits.length !== 8) return ''
+  const month = Number(digits.slice(0, 2))
+  const day = Number(digits.slice(2, 4))
+  const year = Number(digits.slice(4, 8))
+  if (!month || month > 12 || !day || day > 31 || year < 1900) return ''
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+function resolveApplicantName(answers = {}) {
+  const explicitFullName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || '').trim()
+  const explicitFirstName = String(getPrimaryAnswer(answers, ['first_name', 'firstName']) || '').trim()
+  const explicitLastName = String(getPrimaryAnswer(answers, ['last_name', 'lastName']) || '').trim()
+  const parsedParts = explicitFullName.split(/\s+/).filter(Boolean)
+  const firstName = explicitFirstName || parsedParts[0] || ''
+  const lastName = explicitLastName || (parsedParts.length > 1 ? parsedParts.slice(1).join(' ') : '')
+  const fullName = explicitFullName || [firstName, lastName].filter(Boolean).join(' ')
+  return {
+    fullName,
+    firstName,
+    lastName,
+  }
+}
+
+function collectSoftCreditApplicant(answers = {}) {
+  const { fullName, firstName, lastName } = resolveApplicantName(answers)
+  const street = String(getPrimaryAnswer(answers, ['address1', 'street', 'address']) || '').trim()
+  const city = String(getPrimaryAnswer(answers, ['city']) || '').trim()
+  const state = String(getPrimaryAnswer(answers, ['state']) || '').trim()
+  const zip = digitsOnly(String(getPrimaryAnswer(answers, ['zip', 'postalCode', 'postal_code']) || '')).slice(0, 5)
+  const ssn = digitsOnly(String(getPrimaryAnswer(answers, ['ssn']) || '')).slice(0, 9)
+  const dob = parseStoredDob(String(getPrimaryAnswer(answers, ['dob', 'date_of_birth', 'birthdate']) || ''))
+  const missingFields = []
+  if (!fullName || !firstName || !lastName) missingFields.push('full name')
+  if (!ssn || ssn.length !== 9) missingFields.push('SSN')
+  if (!dob) missingFields.push('date of birth')
+  if (!street) missingFields.push('street address')
+  if (!city) missingFields.push('city')
+  if (!state) missingFields.push('state')
+  if (!zip || zip.length < 5) missingFields.push('ZIP code')
+  return {
+    missingFields,
+    applicant: {
+      fullName,
+      firstName,
+      lastName,
+      ssn,
+      dob,
+      address1: street,
+      address2: String(getPrimaryAnswer(answers, ['address2', 'apt', 'unit']) || '').trim(),
+      city,
+      state,
+      zip,
+      email: String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim(),
+      phone: String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || '').trim(),
+    },
+  }
+}
+
+function findNestedValueByKeys(input, matcher) {
+  const queue = [input]
+  while (queue.length) {
+    const current = queue.shift()
+    if (!current || typeof current !== 'object') continue
+    if (Array.isArray(current)) {
+      current.forEach((item) => queue.push(item))
+      continue
+    }
+    for (const [key, value] of Object.entries(current)) {
+      if (matcher(key, value)) return value
+      if (value && typeof value === 'object') queue.push(value)
+    }
+  }
+  return undefined
+}
+
+function findNestedArrayByKeys(input, matcher) {
+  const queue = [input]
+  while (queue.length) {
+    const current = queue.shift()
+    if (!current || typeof current !== 'object') continue
+    if (Array.isArray(current)) {
+      if (matcher('', current)) return current
+      current.forEach((item) => queue.push(item))
+      continue
+    }
+    for (const [key, value] of Object.entries(current)) {
+      if (Array.isArray(value) && matcher(key, value)) return value
+      if (value && typeof value === 'object') queue.push(value)
+    }
+  }
+  return []
+}
+
+function normalizeCurrencyValue(value) {
+  const parsed = Number(value)
+  if (Number.isFinite(parsed)) return Math.round(parsed)
+  if (typeof value === 'string') {
+    const digits = value.replace(/[^\d.-]/g, '')
+    const next = Number(digits)
+    return Number.isFinite(next) ? Math.round(next) : ''
+  }
+  return ''
+}
+
+function normalizeCountValue(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : ''
+}
+
+function normalizePercentValue(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.round(parsed * 10) / 10 : ''
+}
+
+function stringifyStructuredValue(value, fallback = '[]') {
+  try {
+    return JSON.stringify(value ?? JSON.parse(fallback))
+  } catch {
+    return fallback
+  }
+}
+
+function normalizeTextList(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || '').trim()).filter(Boolean)
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  return []
+}
+
+function normalizeTradeline(item = {}) {
+  const paymentHistory = normalizeTextList(item?.paymentHistory || item?.payment_history || item?.history || item?.paymentStatuses)
+  return {
+    creditor: String(item?.creditor || item?.subscriberName || item?.lender || item?.name || '').trim(),
+    accountType: String(item?.accountType || item?.type || item?.portfolioType || '').trim(),
+    accountStatus: String(item?.accountStatus || item?.status || item?.paymentStatus || '').trim(),
+    balance: normalizeCurrencyValue(item?.balance || item?.currentBalance || item?.amountOwed),
+    creditLimit: normalizeCurrencyValue(item?.creditLimit || item?.limit || item?.highCredit),
+    monthlyPayment: normalizeCurrencyValue(item?.monthlyPayment || item?.scheduledPayment || item?.minimumPayment),
+    pastDue: normalizeCurrencyValue(item?.pastDue || item?.pastDueAmount || item?.amountPastDue),
+    openedAt: String(item?.openedAt || item?.dateOpened || item?.openedDate || '').trim(),
+    lastReportedAt: String(item?.lastReportedAt || item?.reportedDate || item?.dateReported || '').trim(),
+    remarks: String(item?.remarks || item?.comment || item?.description || '').trim(),
+    paymentHistory,
+  }
+}
+
+function normalizeInquiry(item = {}, fallbackType = 'Inquiry') {
+  return {
+    type: String(item?.type || item?.inquiryType || fallbackType).trim(),
+    subscriberName: String(item?.subscriberName || item?.creditor || item?.name || '').trim(),
+    bureau: String(item?.bureau || item?.bureauName || '').trim(),
+    inquiredAt: String(item?.inquiredAt || item?.date || item?.inquiryDate || '').trim(),
+  }
+}
+
+function normalizeAlert(item = {}) {
+  return {
+    title: String(item?.title || item?.type || item?.name || 'Alert').trim(),
+    description: String(item?.description || item?.message || item?.detail || '').trim(),
+    severity: String(item?.severity || item?.status || '').trim(),
+  }
+}
+
+function normalizePublicRecord(item = {}) {
+  return {
+    type: String(item?.type || item?.recordType || item?.name || '').trim(),
+    status: String(item?.status || item?.filingStatus || '').trim(),
+    amount: normalizeCurrencyValue(item?.amount || item?.balance || item?.liability),
+    filedAt: String(item?.filedAt || item?.dateFiled || item?.openedAt || '').trim(),
+    reference: String(item?.reference || item?.court || item?.identifier || '').trim(),
+  }
+}
+
+function normalizeSoftCreditResult(payload = {}) {
+  const bureau = String(
+    payload?.bureau ||
+      payload?.creditBureau ||
+      payload?.bureauName ||
+      findNestedValueByKeys(payload, (key, value) => /bureau/i.test(key) && typeof value === 'string') ||
+      SOFT_CREDIT_CHECK_PROVIDER,
+  ).trim() || SOFT_CREDIT_CHECK_PROVIDER
+  const referenceId = String(
+    payload?.referenceId ||
+      payload?.transactionId ||
+      payload?.requestId ||
+      payload?.reportId ||
+      findNestedValueByKeys(payload, (key, value) => /reference|transaction|request|report.*id/i.test(key) && typeof value !== 'object'),
+  ).trim()
+  const scoreValueRaw =
+    payload?.score ??
+    payload?.creditScore ??
+    payload?.vantageScore ??
+    payload?.ficoScore ??
+    findNestedValueByKeys(payload, (key, value) => /score/i.test(key) && typeof value === 'number')
+  const scoreValue = Number(scoreValueRaw)
+  const score = Number.isFinite(scoreValue) ? Math.round(scoreValue) : ''
+  const rangeMin = Number(
+    payload?.scoreRangeMin ??
+      payload?.scoreMin ??
+      findNestedValueByKeys(payload, (key, value) => /(score.*min|min.*score)/i.test(key) && typeof value === 'number'),
+  )
+  const rangeMax = Number(
+    payload?.scoreRangeMax ??
+      payload?.scoreMax ??
+      findNestedValueByKeys(payload, (key, value) => /(score.*max|max.*score)/i.test(key) && typeof value === 'number'),
+  )
+  const scoreRange =
+    Number.isFinite(rangeMin) && Number.isFinite(rangeMax) ? `${Math.round(rangeMin)}-${Math.round(rangeMax)}` : score ? `${Math.floor(score / 10) * 10}-${Math.floor(score / 10) * 10 + 9}` : ''
+  const model = String(
+    payload?.scoreModel ||
+      payload?.model ||
+      payload?.scoreName ||
+      findNestedValueByKeys(payload, (key, value) => /model|score.*name/i.test(key) && typeof value === 'string') ||
+      '',
+  ).trim()
+  const reasons = Array.isArray(payload?.reasonCodes)
+    ? payload.reasonCodes.filter(Boolean).map((value) => String(value))
+    : []
+  const tradelines = (
+    payload?.tradelines ||
+    payload?.tradeLines ||
+    payload?.accounts ||
+    payload?.creditAccounts ||
+    findNestedArrayByKeys(payload, (key) => /(tradeline|trade.?line|credit.?account|account)s?$/i.test(key))
+  )
+    .filter(Boolean)
+    .map((item) => normalizeTradeline(item))
+    .filter((item) => item.creditor || item.accountType || item.balance !== '')
+  const inquiries = [
+    ...(
+      payload?.inquiries ||
+      findNestedArrayByKeys(payload, (key) => /^inquiries?$|hardInquiries|softInquiries/i.test(key))
+    )
+      .filter(Boolean)
+      .map((item) => normalizeInquiry(item)),
+    ...(Array.isArray(payload?.hardInquiries) ? payload.hardInquiries.map((item) => normalizeInquiry(item, 'Hard Inquiry')) : []),
+    ...(Array.isArray(payload?.softInquiries) ? payload.softInquiries.map((item) => normalizeInquiry(item, 'Soft Inquiry')) : []),
+  ].filter((item) => item.subscriberName || item.inquiredAt || item.type)
+  const alerts = (
+    payload?.alerts ||
+    payload?.messages ||
+    findNestedArrayByKeys(payload, (key) => /alerts?|messages?|notifications?/i.test(key))
+  )
+    .filter(Boolean)
+    .map((item) => normalizeAlert(item))
+    .filter((item) => item.title || item.description)
+  const publicRecords = (
+    payload?.publicRecords ||
+    payload?.legalItems ||
+    findNestedArrayByKeys(payload, (key) => /public.?records?|legal.?items?/i.test(key))
+  )
+    .filter(Boolean)
+    .map((item) => normalizePublicRecord(item))
+    .filter((item) => item.type || item.reference)
+  const totalDebt =
+    normalizeCurrencyValue(
+      payload?.totalDebt ||
+        payload?.totalBalances ||
+        payload?.summary?.totalDebt ||
+        findNestedValueByKeys(payload, (key, value) => /(total.*debt|total.*balance)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.reduce((sum, item) => sum + (Number(item.balance) || 0), 0)
+  const totalCreditLimit =
+    normalizeCurrencyValue(
+      payload?.totalCreditLimit ||
+        payload?.creditLimitTotal ||
+        payload?.summary?.totalCreditLimit ||
+        findNestedValueByKeys(payload, (key, value) => /(total.*credit.*limit|credit.*limit.*total)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.reduce((sum, item) => sum + (Number(item.creditLimit) || 0), 0)
+  const pastDueAmount =
+    normalizeCurrencyValue(
+      payload?.pastDueAmount ||
+        payload?.totalPastDue ||
+        payload?.summary?.pastDueAmount ||
+        findNestedValueByKeys(payload, (key, value) => /(past.*due|amount.*past.*due)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.reduce((sum, item) => sum + (Number(item.pastDue) || 0), 0)
+  const monthlyPayment =
+    normalizeCurrencyValue(
+      payload?.monthlyPayment ||
+        payload?.totalMonthlyPayment ||
+        findNestedValueByKeys(payload, (key, value) => /(monthly.*payment|scheduled.*payment)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.reduce((sum, item) => sum + (Number(item.monthlyPayment) || 0), 0)
+  const availableCredit =
+    normalizeCurrencyValue(
+      payload?.availableCredit ||
+        payload?.summary?.availableCredit ||
+        findNestedValueByKeys(payload, (key, value) => /(available.*credit)/i.test(key) && typeof value !== 'object'),
+    ) || (Number(totalCreditLimit) || 0) - (Number(totalDebt) || 0)
+  const revolvingUtilization =
+    normalizePercentValue(
+      payload?.revolvingUtilization ||
+        payload?.creditUtilization ||
+        payload?.utilizationRate ||
+        findNestedValueByKeys(payload, (key, value) => /(utilization|credit.*usage)/i.test(key) && typeof value !== 'object'),
+    ) ||
+    ((Number(totalCreditLimit) || 0) > 0 ? Math.round(((Number(totalDebt) || 0) / Number(totalCreditLimit)) * 1000) / 10 : '')
+  const openAccounts =
+    normalizeCountValue(
+      payload?.openAccounts ||
+        payload?.summary?.openAccounts ||
+        findNestedValueByKeys(payload, (key, value) => /(open.*accounts?)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.filter((item) => !/closed|paid/i.test(item.accountStatus || '')).length
+  const closedAccounts =
+    normalizeCountValue(
+      payload?.closedAccounts ||
+        payload?.summary?.closedAccounts ||
+        findNestedValueByKeys(payload, (key, value) => /(closed.*accounts?)/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.filter((item) => /closed|paid/i.test(item.accountStatus || '')).length
+  const delinquentAccounts =
+    normalizeCountValue(
+      payload?.delinquentAccounts ||
+        payload?.lateAccounts ||
+        findNestedValueByKeys(payload, (key, value) => /(delinquent|late).*accounts?/i.test(key) && typeof value !== 'object'),
+    ) || tradelines.filter((item) => (Number(item.pastDue) || 0) > 0).length
+  const derogatoryAccounts =
+    normalizeCountValue(
+      payload?.derogatoryAccounts ||
+        payload?.negativeAccounts ||
+        findNestedValueByKeys(payload, (key, value) => /(derogatory|negative).*accounts?/i.test(key) && typeof value !== 'object'),
+    )
+  const collectionsCount =
+    normalizeCountValue(
+      payload?.collectionsCount ||
+        findNestedValueByKeys(payload, (key, value) => /(collections?.*count|count.*collections?)/i.test(key) && typeof value !== 'object'),
+    )
+  const publicRecordsCount = normalizeCountValue(payload?.publicRecordsCount || publicRecords.length)
+  const inquiryCount =
+    normalizeCountValue(
+      payload?.inquiryCount ||
+        payload?.inquiriesCount ||
+        findNestedValueByKeys(payload, (key, value) => /(inquiries?.*count|count.*inquiries?)/i.test(key) && typeof value !== 'object'),
+    ) || inquiries.length
+  const oldestAccountAgeMonths = normalizeCountValue(
+    payload?.oldestAccountAgeMonths ||
+      payload?.summary?.oldestAccountAgeMonths ||
+      findNestedValueByKeys(payload, (key, value) => /(oldest.*account.*age)/i.test(key) && typeof value !== 'object'),
+  )
+  const averageAccountAgeMonths = normalizeCountValue(
+    payload?.averageAccountAgeMonths ||
+      payload?.summary?.averageAccountAgeMonths ||
+      findNestedValueByKeys(payload, (key, value) => /(average.*account.*age|avg.*account.*age)/i.test(key) && typeof value !== 'object'),
+  )
+  return {
+    status: score ? 'completed' : 'failed',
+    provider: SOFT_CREDIT_CHECK_PROVIDER,
+    bureau,
+    score,
+    scoreRange,
+    model,
+    referenceId,
+    reasons,
+    totalDebt,
+    totalCreditLimit,
+    availableCredit: availableCredit < 0 ? '' : availableCredit,
+    revolvingUtilization,
+    monthlyPayment,
+    pastDueAmount,
+    openAccounts,
+    closedAccounts,
+    delinquentAccounts,
+    derogatoryAccounts,
+    collectionsCount,
+    publicRecordsCount,
+    inquiryCount,
+    oldestAccountAgeMonths,
+    averageAccountAgeMonths,
+    tradelines,
+    inquiries,
+    alerts,
+    publicRecords,
+    rawStatus: String(payload?.status || payload?.result || '').trim(),
+  }
+}
+
+function buildSoftCreditSnapshot(answers = {}) {
+  return {
+    provider: String(answers.soft_credit_check_provider || SOFT_CREDIT_CHECK_PROVIDER).trim() || SOFT_CREDIT_CHECK_PROVIDER,
+    status: String(answers.soft_credit_check_status || 'not_started').trim() || 'not_started',
+    score: String(answers.soft_credit_check_score || '').trim(),
+    scoreRange: String(answers.soft_credit_check_score_range || '').trim(),
+    model: String(answers.soft_credit_check_model || '').trim(),
+    bureau: String(answers.soft_credit_check_bureau || '').trim(),
+    referenceId: String(answers.soft_credit_check_reference_id || '').trim(),
+    consentStatus: String(answers.soft_credit_check_consent_status || '').trim(),
+    consentAt: String(answers.soft_credit_check_consent_at || '').trim(),
+    consentTextVersion: String(answers.soft_credit_check_consent_text_version || '').trim(),
+    requestedAt: String(answers.soft_credit_check_last_requested_at || '').trim(),
+    completedAt: String(answers.soft_credit_check_completed_at || '').trim(),
+    error: String(answers.soft_credit_check_error || '').trim(),
+    errorCode: String(answers.soft_credit_check_error_code || '').trim(),
+    lastSource: String(answers.soft_credit_check_last_source || '').trim(),
+    totalDebt: String(answers.soft_credit_check_total_debt || '').trim(),
+    totalCreditLimit: String(answers.soft_credit_check_total_credit_limit || '').trim(),
+    availableCredit: String(answers.soft_credit_check_available_credit || '').trim(),
+    revolvingUtilization: String(answers.soft_credit_check_revolving_utilization || '').trim(),
+    monthlyPayment: String(answers.soft_credit_check_monthly_payment || '').trim(),
+    pastDueAmount: String(answers.soft_credit_check_past_due_amount || '').trim(),
+    openAccounts: String(answers.soft_credit_check_open_accounts || '').trim(),
+    closedAccounts: String(answers.soft_credit_check_closed_accounts || '').trim(),
+    delinquentAccounts: String(answers.soft_credit_check_delinquent_accounts || '').trim(),
+    derogatoryAccounts: String(answers.soft_credit_check_derogatory_accounts || '').trim(),
+    collectionsCount: String(answers.soft_credit_check_collections_count || '').trim(),
+    publicRecordsCount: String(answers.soft_credit_check_public_records_count || '').trim(),
+    inquiryCount: String(answers.soft_credit_check_inquiry_count || '').trim(),
+    oldestAccountAgeMonths: String(answers.soft_credit_check_oldest_account_age_months || '').trim(),
+    averageAccountAgeMonths: String(answers.soft_credit_check_average_account_age_months || '').trim(),
+    scoreFactors: String(answers.soft_credit_check_score_factors || '').trim(),
+    tradelines: String(answers.soft_credit_check_tradelines || '').trim(),
+    inquiries: String(answers.soft_credit_check_inquiries || '').trim(),
+    alerts: String(answers.soft_credit_check_alerts || '').trim(),
+    publicRecords: String(answers.soft_credit_check_public_records || '').trim(),
+    history: parseSoftCreditHistory(answers.soft_credit_check_history),
+  }
+}
+
+function appendSoftCreditHistoryEntry(answers = {}, entry = {}) {
+  const existing = parseSoftCreditHistory(answers.soft_credit_check_history)
+  answers.soft_credit_check_history = [
+    {
+      id: `soft_credit_${Date.now().toString(36)}`,
+      createdAt: new Date().toISOString(),
+      ...entry,
+    },
+    ...existing,
+  ].slice(0, 12)
+}
+
+function buildSoftCreditPatches(answers = {}) {
+  const keys = [
+    'soft_credit_check_provider',
+    'soft_credit_check_status',
+    'soft_credit_check_score',
+    'soft_credit_check_score_range',
+    'soft_credit_check_model',
+    'soft_credit_check_bureau',
+    'soft_credit_check_reference_id',
+    'soft_credit_check_total_debt',
+    'soft_credit_check_total_credit_limit',
+    'soft_credit_check_available_credit',
+    'soft_credit_check_revolving_utilization',
+    'soft_credit_check_monthly_payment',
+    'soft_credit_check_past_due_amount',
+    'soft_credit_check_open_accounts',
+    'soft_credit_check_closed_accounts',
+    'soft_credit_check_delinquent_accounts',
+    'soft_credit_check_derogatory_accounts',
+    'soft_credit_check_collections_count',
+    'soft_credit_check_public_records_count',
+    'soft_credit_check_inquiry_count',
+    'soft_credit_check_oldest_account_age_months',
+    'soft_credit_check_average_account_age_months',
+    'soft_credit_check_score_factors',
+    'soft_credit_check_tradelines',
+    'soft_credit_check_inquiries',
+    'soft_credit_check_alerts',
+    'soft_credit_check_public_records',
+    'soft_credit_check_consent_status',
+    'soft_credit_check_consent_at',
+    'soft_credit_check_consent_text_version',
+    'soft_credit_check_consent_source',
+    'soft_credit_check_consent_ip',
+    'soft_credit_check_last_requested_at',
+    'soft_credit_check_completed_at',
+    'soft_credit_check_error',
+    'soft_credit_check_error_code',
+    'soft_credit_check_last_source',
+    'soft_credit_check_history',
+  ]
+  return keys.map((questionId) => ({
+    type: 'setAnswer',
+    questionId,
+    value: answers[questionId] ?? '',
+  }))
+}
+
+function getRequestIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim()
+  return forwarded || String(req.ip || '').trim()
+}
+
+function applySoftCreditConsent(answers = {}, { source = '', textVersion = '', ipAddress = '', userAgent = '' } = {}) {
+  const grantedAt = new Date().toISOString()
+  answers.soft_credit_check_consent_status = 'granted'
+  answers.soft_credit_check_consent_at = String(answers.soft_credit_check_consent_at || '').trim() || grantedAt
+  answers.soft_credit_check_consent_text_version = String(textVersion || SOFT_CREDIT_CHECK_CONSENT_VERSION).trim() || SOFT_CREDIT_CHECK_CONSENT_VERSION
+  answers.soft_credit_check_consent_source = String(source || 'document_signed').trim() || 'document_signed'
+  if (ipAddress) answers.soft_credit_check_consent_ip = ipAddress
+  if (userAgent) answers.soft_credit_check_consent_user_agent = userAgent
+}
+
+function buildExperianSoftPullHeaders() {
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json',
+  }
+  if (EXPERIAN_SOFT_PULL_BEARER_TOKEN) {
+    headers.authorization = `Bearer ${EXPERIAN_SOFT_PULL_BEARER_TOKEN}`
+  } else if (EXPERIAN_SOFT_PULL_USERNAME && EXPERIAN_SOFT_PULL_PASSWORD) {
+    headers.authorization = `Basic ${Buffer.from(`${EXPERIAN_SOFT_PULL_USERNAME}:${EXPERIAN_SOFT_PULL_PASSWORD}`).toString('base64')}`
+  }
+  if (EXPERIAN_SOFT_PULL_API_KEY && EXPERIAN_SOFT_PULL_API_KEY_HEADER) {
+    headers[EXPERIAN_SOFT_PULL_API_KEY_HEADER] = EXPERIAN_SOFT_PULL_API_KEY
+  }
+  return headers
+}
+
+function buildMockSoftCreditResult({ sessionCode = '', applicant = {} } = {}) {
+  const seed = crypto.createHash('sha256').update(`${sessionCode}:${applicant?.ssn || ''}`).digest()
+  const score = 620 + (seed[0] % 121)
+  const totalDebt = 13240 + seed[1] * 18
+  const totalCreditLimit = 24500 + seed[2] * 30
+  const pastDueAmount = 320 + (seed[3] % 4) * 140
+  return {
+    status: 'completed',
+    provider: SOFT_CREDIT_CHECK_PROVIDER,
+    bureau: SOFT_CREDIT_CHECK_PROVIDER,
+    score,
+    scoreRange: `${Math.floor(score / 10) * 10}-${Math.floor(score / 10) * 10 + 9}`,
+    model: 'Experian VantageScore 3.0',
+    referenceId: `mock_${Date.now().toString(36)}`,
+    reasons: ['High revolving utilization', 'Recent delinquency on revolving account', 'Limited age of open installment accounts'],
+    totalDebt,
+    totalCreditLimit,
+    availableCredit: totalCreditLimit - totalDebt,
+    revolvingUtilization: Math.round((totalDebt / totalCreditLimit) * 1000) / 10,
+    monthlyPayment: 612,
+    pastDueAmount,
+    openAccounts: 7,
+    closedAccounts: 11,
+    delinquentAccounts: 1,
+    derogatoryAccounts: 1,
+    collectionsCount: 1,
+    publicRecordsCount: 0,
+    inquiryCount: 4,
+    oldestAccountAgeMonths: 118,
+    averageAccountAgeMonths: 49,
+    tradelines: [
+      {
+        creditor: 'Capital One',
+        accountType: 'Revolving',
+        accountStatus: '30 days past due',
+        balance: 2840,
+        creditLimit: 4000,
+        monthlyPayment: 95,
+        pastDue: pastDueAmount,
+        openedAt: '2019-02-11',
+        lastReportedAt: new Date().toISOString(),
+        remarks: 'Primary revolving line',
+        paymentHistory: ['Current', 'Current', '30 Late', '30 Late'],
+      },
+      {
+        creditor: 'Chase Auto',
+        accountType: 'Installment',
+        accountStatus: 'Current',
+        balance: 8640,
+        creditLimit: '',
+        monthlyPayment: 417,
+        pastDue: '',
+        openedAt: '2021-09-01',
+        lastReportedAt: new Date().toISOString(),
+        remarks: 'Auto loan',
+        paymentHistory: ['Current', 'Current', 'Current', 'Current'],
+      },
+      {
+        creditor: 'Amex Blue',
+        accountType: 'Revolving',
+        accountStatus: 'Current',
+        balance: 1760,
+        creditLimit: 6500,
+        monthlyPayment: 100,
+        pastDue: '',
+        openedAt: '2020-06-14',
+        lastReportedAt: new Date().toISOString(),
+        remarks: 'Open credit card',
+        paymentHistory: ['Current', 'Current', 'Current', 'Current'],
+      },
+    ],
+    inquiries: [
+      { type: 'Hard Inquiry', subscriberName: 'Toyota Financial', bureau: SOFT_CREDIT_CHECK_PROVIDER, inquiredAt: '2025-11-02' },
+      { type: 'Hard Inquiry', subscriberName: 'Citi Cards', bureau: SOFT_CREDIT_CHECK_PROVIDER, inquiredAt: '2025-08-14' },
+      { type: 'Soft Inquiry', subscriberName: 'TaxRefresh', bureau: SOFT_CREDIT_CHECK_PROVIDER, inquiredAt: new Date().toISOString() },
+    ],
+    alerts: [
+      { title: 'Past due balance', description: 'One revolving account is currently past due.', severity: 'warning' },
+      { title: 'High utilization', description: 'Overall revolving utilization is above the preferred range.', severity: 'info' },
+    ],
+    publicRecords: [],
+    rawStatus: 'mock_success',
+  }
+}
+
+async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}, consent = {} } = {}) {
+  if (EXPERIAN_SOFT_PULL_USE_MOCK) {
+    return buildMockSoftCreditResult({ sessionCode, applicant })
+  }
+  if (!EXPERIAN_SOFT_PULL_URL) {
+    return {
+      status: 'configuration_required',
+      provider: SOFT_CREDIT_CHECK_PROVIDER,
+      bureau: SOFT_CREDIT_CHECK_PROVIDER,
+      score: '',
+      scoreRange: '',
+      model: '',
+      referenceId: '',
+      reasons: [],
+      rawStatus: 'missing_configuration',
+      error: 'Experian soft-pull credentials are not configured yet.',
+    }
+  }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), EXPERIAN_SOFT_PULL_TIMEOUT_MS)
+  try {
+    const response = await fetch(EXPERIAN_SOFT_PULL_URL, {
+      method: 'POST',
+      headers: buildExperianSoftPullHeaders(),
+      body: JSON.stringify({
+        bureau: SOFT_CREDIT_CHECK_PROVIDER,
+        inquiryType: 'soft',
+        sessionCode,
+        applicant,
+        consent,
+      }),
+      signal: controller.signal,
+    })
+    const rawText = await response.text()
+    let payload = {}
+    try {
+      payload = rawText ? JSON.parse(rawText) : {}
+    } catch {
+      payload = { rawText }
+    }
+    if (!response.ok) {
+      const error = new Error(
+        String(payload?.error || payload?.message || `Experian soft pull failed with status ${response.status}`),
+      )
+      error.status = response.status
+      error.payload = payload
+      throw error
+    }
+    return normalizeSoftCreditResult(payload)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function runSoftCreditCheckForRoom({
+  roomCode = '',
+  room,
+  consentGranted = false,
+  source = 'manual',
+  force = false,
+  requestedBy = '',
+  ipAddress = '',
+  userAgent = '',
+} = {}) {
+  const answers = room?.state?.answers || {}
+  if (!roomCode || !room) throw new Error('A valid room is required to run a soft credit check.')
+
+  if (consentGranted) {
+    applySoftCreditConsent(answers, {
+      source,
+      ipAddress,
+      userAgent,
+    })
+  }
+
+  if (!isForm8821FullySigned(answers)) {
+    answers.soft_credit_check_status = 'not_ready'
+    answers.soft_credit_check_error = 'The document must be fully signed before a soft credit check can run.'
+    answers.soft_credit_check_error_code = 'document_not_signed'
+    await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+    return buildSoftCreditSnapshot(answers)
+  }
+
+  if (!isSoftCreditConsentGranted(answers)) {
+    answers.soft_credit_check_status = 'consent_required'
+    answers.soft_credit_check_error = 'Soft credit check consent is required before the score can be retrieved.'
+    answers.soft_credit_check_error_code = 'consent_required'
+    await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+    return buildSoftCreditSnapshot(answers)
+  }
+
+  const currentStatus = String(answers.soft_credit_check_status || '').trim().toLowerCase()
+  if (!force && (currentStatus === 'processing' || currentStatus === 'completed')) {
+    return buildSoftCreditSnapshot(answers)
+  }
+
+  const { applicant, missingFields } = collectSoftCreditApplicant(answers)
+  if (missingFields.length) {
+    answers.soft_credit_check_status = 'failed'
+    answers.soft_credit_check_error = `Missing required applicant information: ${missingFields.join(', ')}.`
+    answers.soft_credit_check_error_code = 'missing_required_fields'
+    answers.soft_credit_check_last_source = source
+    appendSoftCreditHistoryEntry(answers, {
+      status: 'failed',
+      source,
+      error: answers.soft_credit_check_error,
+      requestedBy,
+    })
+    await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+    return buildSoftCreditSnapshot(answers)
+  }
+
+  answers.soft_credit_check_provider = SOFT_CREDIT_CHECK_PROVIDER
+  answers.soft_credit_check_status = 'processing'
+  answers.soft_credit_check_last_requested_at = new Date().toISOString()
+  answers.soft_credit_check_error = ''
+  answers.soft_credit_check_error_code = ''
+  answers.soft_credit_check_last_source = source
+  await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+
+  try {
+    const result = await requestExperianSoftCreditCheck({
+      sessionCode: roomCode,
+      applicant,
+      consent: {
+        grantedAt: answers.soft_credit_check_consent_at,
+        textVersion: answers.soft_credit_check_consent_text_version,
+        source: answers.soft_credit_check_consent_source,
+        ipAddress: answers.soft_credit_check_consent_ip,
+      },
+    })
+    answers.soft_credit_check_provider = result.provider || SOFT_CREDIT_CHECK_PROVIDER
+    answers.soft_credit_check_bureau = result.bureau || SOFT_CREDIT_CHECK_PROVIDER
+    answers.soft_credit_check_status = result.status || 'completed'
+    answers.soft_credit_check_score = result.score === '' ? '' : String(result.score)
+    answers.soft_credit_check_score_range = result.scoreRange || ''
+    answers.soft_credit_check_model = result.model || ''
+    answers.soft_credit_check_reference_id = result.referenceId || ''
+    answers.soft_credit_check_total_debt = result.totalDebt === '' ? '' : String(result.totalDebt)
+    answers.soft_credit_check_total_credit_limit = result.totalCreditLimit === '' ? '' : String(result.totalCreditLimit)
+    answers.soft_credit_check_available_credit = result.availableCredit === '' ? '' : String(result.availableCredit)
+    answers.soft_credit_check_revolving_utilization = result.revolvingUtilization === '' ? '' : String(result.revolvingUtilization)
+    answers.soft_credit_check_monthly_payment = result.monthlyPayment === '' ? '' : String(result.monthlyPayment)
+    answers.soft_credit_check_past_due_amount = result.pastDueAmount === '' ? '' : String(result.pastDueAmount)
+    answers.soft_credit_check_open_accounts = result.openAccounts === '' ? '' : String(result.openAccounts)
+    answers.soft_credit_check_closed_accounts = result.closedAccounts === '' ? '' : String(result.closedAccounts)
+    answers.soft_credit_check_delinquent_accounts = result.delinquentAccounts === '' ? '' : String(result.delinquentAccounts)
+    answers.soft_credit_check_derogatory_accounts = result.derogatoryAccounts === '' ? '' : String(result.derogatoryAccounts)
+    answers.soft_credit_check_collections_count = result.collectionsCount === '' ? '' : String(result.collectionsCount)
+    answers.soft_credit_check_public_records_count = result.publicRecordsCount === '' ? '' : String(result.publicRecordsCount)
+    answers.soft_credit_check_inquiry_count = result.inquiryCount === '' ? '' : String(result.inquiryCount)
+    answers.soft_credit_check_oldest_account_age_months = result.oldestAccountAgeMonths === '' ? '' : String(result.oldestAccountAgeMonths)
+    answers.soft_credit_check_average_account_age_months = result.averageAccountAgeMonths === '' ? '' : String(result.averageAccountAgeMonths)
+    answers.soft_credit_check_score_factors = stringifyStructuredValue(result.reasons || [], '[]')
+    answers.soft_credit_check_tradelines = stringifyStructuredValue(result.tradelines || [], '[]')
+    answers.soft_credit_check_inquiries = stringifyStructuredValue(result.inquiries || [], '[]')
+    answers.soft_credit_check_alerts = stringifyStructuredValue(result.alerts || [], '[]')
+    answers.soft_credit_check_public_records = stringifyStructuredValue(result.publicRecords || [], '[]')
+    answers.soft_credit_check_completed_at = new Date().toISOString()
+    answers.soft_credit_check_error = result.error || ''
+    answers.soft_credit_check_error_code = result.status === 'configuration_required' ? 'configuration_required' : ''
+    appendSoftCreditHistoryEntry(answers, {
+      status: answers.soft_credit_check_status,
+      source,
+      requestedBy,
+      score: answers.soft_credit_check_score,
+      referenceId: answers.soft_credit_check_reference_id,
+      error: answers.soft_credit_check_error,
+    })
+    await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+    return buildSoftCreditSnapshot(answers)
+  } catch (error) {
+    answers.soft_credit_check_status = 'failed'
+    answers.soft_credit_check_completed_at = new Date().toISOString()
+    answers.soft_credit_check_error = error instanceof Error ? error.message : 'Soft credit check failed.'
+    answers.soft_credit_check_error_code = String(error?.status || 'soft_pull_failed')
+    appendSoftCreditHistoryEntry(answers, {
+      status: 'failed',
+      source,
+      requestedBy,
+      error: answers.soft_credit_check_error,
+    })
+    await persistRoomState(roomCode, room, buildSoftCreditPatches(answers))
+    return buildSoftCreditSnapshot(answers)
+  }
+}
+
 function isEnrolledAgentHandoffSent(value) {
   const normalized = String(value || '').trim().toLowerCase()
   return ['1', 'true', 'yes', 'ready', 'completed', 'sent'].includes(normalized)
@@ -4758,6 +5573,34 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
     return res.json({ item })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation detail' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/soft-credit-check', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+    const room = await ensureRoom(roomCode)
+    const creditCheck = await runSoftCreditCheckForRoom({
+      roomCode,
+      room,
+      consentGranted: true,
+      source: 'admin_dashboard',
+      force: Boolean(req.body?.force),
+      requestedBy: String(req.adminUser?.email || req.adminUser?.uid || 'dashboard').trim(),
+      ipAddress: getRequestIp(req),
+      userAgent: String(req.headers['user-agent'] || '').trim(),
+    })
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, creditCheck, item })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to run soft credit check.' })
   }
 })
 
@@ -5520,6 +6363,26 @@ app.post('/api/session', (_req, res) => {
     else await ensureRoom(code)
     res.json({ code })
   })().catch(() => res.status(500).json({ error: 'Failed to create session' }))
+})
+
+app.post('/api/session/:code/soft-credit-check', async (req, res) => {
+  try {
+    const roomCode = String(req.params.code || '').toUpperCase().trim()
+    if (!roomCode) return res.status(400).json({ error: 'code is required' })
+    const room = await ensureRoom(roomCode)
+    const creditCheck = await runSoftCreditCheckForRoom({
+      roomCode,
+      room,
+      consentGranted: Boolean(req.body?.consentGranted),
+      source: String(req.body?.source || 'document_signed').trim() || 'document_signed',
+      force: Boolean(req.body?.force),
+      ipAddress: getRequestIp(req),
+      userAgent: String(req.headers['user-agent'] || '').trim(),
+    })
+    return res.json({ ok: true, creditCheck })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to run soft credit check.' })
+  }
 })
 
 app.post('/api/session/:code/presence', async (req, res) => {
