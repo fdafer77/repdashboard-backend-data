@@ -4933,6 +4933,31 @@ function extractExperianErrorDetails(payload = {}, rawText = '') {
   return parts.join(' | ').slice(0, 1200)
 }
 
+function maskExperianDebugValue(key = '', value = '') {
+  const normalizedKey = String(key || '').toLowerCase()
+  const raw = String(value || '')
+  if (!raw) return raw
+  if (normalizedKey.includes('authorization') || normalizedKey.includes('token') || normalizedKey.includes('secret') || normalizedKey.includes('password') || normalizedKey.includes('api_key') || normalizedKey.includes('api-key')) {
+    return '[redacted]'
+  }
+  if (normalizedKey.includes('ssn')) {
+    const digits = raw.replace(/\D/g, '')
+    return digits ? `***-**-${digits.slice(-4)}` : '[redacted]'
+  }
+  return raw
+}
+
+function buildExperianDebugPayload(input) {
+  if (Array.isArray(input)) return input.map((item) => buildExperianDebugPayload(item))
+  if (!input || typeof input !== 'object') return input
+  return Object.fromEntries(
+    Object.entries(input).map(([key, value]) => {
+      if (value && typeof value === 'object') return [key, buildExperianDebugPayload(value)]
+      return [key, maskExperianDebugValue(key, value)]
+    }),
+  )
+}
+
 async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}, consent = {} } = {}) {
   if (EXPERIAN_SOFT_PULL_USE_MOCK) {
     return buildMockSoftCreditResult({ sessionCode, applicant })
@@ -4984,9 +5009,16 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
   const timeoutId = setTimeout(() => controller.abort(), EXPERIAN_SOFT_PULL_TIMEOUT_MS)
   try {
     const requestBody = buildExperianCreditProfileRequest({ sessionCode, applicant, consent })
+    const requestHeaders = await buildExperianSoftPullHeaders()
+    console.log('Experian soft pull request debug:', {
+      sessionCode,
+      url: EXPERIAN_SOFT_PULL_URL,
+      headers: buildExperianDebugPayload(requestHeaders),
+      body: buildExperianDebugPayload(requestBody),
+    })
     const response = await fetch(EXPERIAN_SOFT_PULL_URL, {
       method: 'POST',
-      headers: await buildExperianSoftPullHeaders(),
+      headers: requestHeaders,
       body: JSON.stringify(requestBody),
       signal: controller.signal,
     })
@@ -4999,6 +5031,13 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
     }
     if (!response.ok) {
       const errorDetails = extractExperianErrorDetails(payload, rawText)
+      console.error('Experian soft pull response debug:', {
+        sessionCode,
+        status: response.status,
+        statusText: response.statusText,
+        payload: buildExperianDebugPayload(payload),
+        rawText,
+      })
       const error = new Error(errorDetails ? `Experian soft pull failed (${response.status}): ${errorDetails}` : `Experian soft pull failed with status ${response.status}`)
       error.status = response.status
       error.payload = payload
