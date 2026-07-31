@@ -4633,6 +4633,12 @@ function splitCsvValues(value = '') {
 function formatExperianDob(value = '') {
   const digits = digitsOnly(value)
   if (digits.length !== 8) return ''
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim())) {
+    const year = digits.slice(0, 4)
+    const month = digits.slice(4, 6)
+    const day = digits.slice(6, 8)
+    return `${month}${day}${year}`
+  }
   const month = digits.slice(0, 2)
   const day = digits.slice(2, 4)
   const year = digits.slice(4, 8)
