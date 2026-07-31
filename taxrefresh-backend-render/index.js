@@ -4630,6 +4630,15 @@ function splitCsvValues(value = '') {
     .filter(Boolean)
 }
 
+function formatExperianDob(value = '') {
+  const digits = digitsOnly(value)
+  if (digits.length !== 8) return ''
+  const month = digits.slice(0, 2)
+  const day = digits.slice(2, 4)
+  const year = digits.slice(4, 8)
+  return `${month}${day}${year}`
+}
+
 function getExperianRequestConfigMissingFields() {
   const missing = []
   if (!EXPERIAN_REQUESTOR_SUBSCRIBER_CODE) missing.push('EXPERIAN_REQUESTOR_SUBSCRIBER_CODE')
@@ -4675,7 +4684,7 @@ function buildExperianCreditProfileRequest({ sessionCode = '', applicant = {} } 
       firstName: applicant.firstName,
     },
     dob: {
-      dob: applicant.dob,
+      dob: formatExperianDob(applicant.dob),
     },
     ssn: {
       ssn: applicant.ssn,
@@ -4689,14 +4698,6 @@ function buildExperianCreditProfileRequest({ sessionCode = '', applicant = {} } 
     },
   }
   if (applicant.address2) primaryApplicant.currentAddress.line2 = applicant.address2
-  if (applicant.phone) {
-    primaryApplicant.phone = [
-      {
-        number: applicant.phone,
-        type: 'home',
-      },
-    ]
-  }
   if (applicant.email) {
     primaryApplicant.emailId = {
       emailId: applicant.email,
@@ -4716,13 +4717,6 @@ function buildExperianCreditProfileRequest({ sessionCode = '', applicant = {} } 
       abbreviatedAmount: EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT,
     },
     ...(Object.keys(addOns).length ? { addOns } : {}),
-    ...(sessionCode
-      ? {
-          vendorData: {
-            vendorNumber: sessionCode,
-          },
-        }
-      : {}),
   }
 }
 
