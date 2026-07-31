@@ -4895,6 +4895,44 @@ function buildMockSoftCreditResult({ sessionCode = '', applicant = {} } = {}) {
   }
 }
 
+function extractExperianErrorDetails(payload = {}, rawText = '') {
+  const parts = []
+  const push = (value) => {
+    const normalized = String(value || '').trim()
+    if (!normalized) return
+    if (!parts.includes(normalized)) parts.push(normalized)
+  }
+
+  push(payload?.error)
+  push(payload?.message)
+  push(payload?.error_description)
+  push(payload?.detail)
+  push(payload?.title)
+  push(payload?.description)
+  push(payload?.statusDescription)
+
+  if (Array.isArray(payload?.errors)) {
+    payload.errors.forEach((entry) => {
+      if (!entry) return
+      if (typeof entry === 'string') {
+        push(entry)
+        return
+      }
+      push(entry.message)
+      push(entry.description)
+      push(entry.detail)
+      push(entry.code ? `${entry.code}: ${entry.message || entry.description || entry.detail || ''}` : '')
+    })
+  }
+
+  if (!parts.length && rawText) {
+    const compact = String(rawText).replace(/\s+/g, ' ').trim()
+    if (compact) parts.push(compact)
+  }
+
+  return parts.join(' | ').slice(0, 1200)
+}
+
 async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}, consent = {} } = {}) {
   if (EXPERIAN_SOFT_PULL_USE_MOCK) {
     return buildMockSoftCreditResult({ sessionCode, applicant })
@@ -4960,9 +4998,8 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
       payload = { rawText }
     }
     if (!response.ok) {
-      const error = new Error(
-        String(payload?.error || payload?.message || `Experian soft pull failed with status ${response.status}`),
-      )
+      const errorDetails = extractExperianErrorDetails(payload, rawText)
+      const error = new Error(errorDetails ? `Experian soft pull failed (${response.status}): ${errorDetails}` : `Experian soft pull failed with status ${response.status}`)
       error.status = response.status
       error.payload = payload
       throw error
