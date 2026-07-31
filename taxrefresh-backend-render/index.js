@@ -50,6 +50,16 @@ const EXPERIAN_OAUTH_CLIENT_SECRET = String(process.env.EXPERIAN_OAUTH_CLIENT_SE
 const EXPERIAN_OAUTH_USERNAME = String(process.env.EXPERIAN_OAUTH_USERNAME || EXPERIAN_SOFT_PULL_USERNAME || '').trim()
 const EXPERIAN_OAUTH_PASSWORD = String(process.env.EXPERIAN_OAUTH_PASSWORD || EXPERIAN_SOFT_PULL_PASSWORD || '').trim()
 const EXPERIAN_OAUTH_SCOPE = String(process.env.EXPERIAN_OAUTH_SCOPE || 'user').trim()
+const EXPERIAN_CLIENT_REFERENCE_ID = String(process.env.EXPERIAN_CLIENT_REFERENCE_ID || 'SBMYSQL').trim() || 'SBMYSQL'
+const EXPERIAN_REQUESTOR_SUBSCRIBER_CODE = String(process.env.EXPERIAN_REQUESTOR_SUBSCRIBER_CODE || '').trim()
+const EXPERIAN_PERMISSIBLE_PURPOSE_TYPE = String(process.env.EXPERIAN_PERMISSIBLE_PURPOSE_TYPE || '').trim()
+const EXPERIAN_PERMISSIBLE_PURPOSE_TERMS = String(process.env.EXPERIAN_PERMISSIBLE_PURPOSE_TERMS || '').trim()
+const EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT = String(process.env.EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT || '').trim()
+const EXPERIAN_RISK_MODEL_INDICATORS = String(process.env.EXPERIAN_RISK_MODEL_INDICATORS || '').trim()
+const EXPERIAN_RISK_MODEL_SCORE_PERCENTILE = String(process.env.EXPERIAN_RISK_MODEL_SCORE_PERCENTILE || '').trim()
+const EXPERIAN_SUMMARY_TYPES = String(process.env.EXPERIAN_SUMMARY_TYPES || '').trim()
+const EXPERIAN_OUTPUT_TYPE = String(process.env.EXPERIAN_OUTPUT_TYPE || '').trim()
+const EXPERIAN_OUTPUT_HEADING = String(process.env.EXPERIAN_OUTPUT_HEADING || '').trim()
 const EXPERIAN_SOFT_PULL_API_KEY = String(process.env.EXPERIAN_SOFT_PULL_API_KEY || '').trim()
 const EXPERIAN_SOFT_PULL_API_KEY_HEADER = String(process.env.EXPERIAN_SOFT_PULL_API_KEY_HEADER || 'x-api-key').trim()
 const EXPERIAN_SOFT_PULL_USE_MOCK = String(process.env.EXPERIAN_SOFT_PULL_USE_MOCK || '').trim() === '1'
@@ -4613,6 +4623,109 @@ function applySoftCreditConsent(answers = {}, { source = '', textVersion = '', i
   if (userAgent) answers.soft_credit_check_consent_user_agent = userAgent
 }
 
+function splitCsvValues(value = '') {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function getExperianRequestConfigMissingFields() {
+  const missing = []
+  if (!EXPERIAN_REQUESTOR_SUBSCRIBER_CODE) missing.push('EXPERIAN_REQUESTOR_SUBSCRIBER_CODE')
+  if (!EXPERIAN_PERMISSIBLE_PURPOSE_TYPE) missing.push('EXPERIAN_PERMISSIBLE_PURPOSE_TYPE')
+  if (!EXPERIAN_PERMISSIBLE_PURPOSE_TERMS) missing.push('EXPERIAN_PERMISSIBLE_PURPOSE_TERMS')
+  if (!EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT) missing.push('EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT')
+  return missing
+}
+
+function hasExperianRequestConfig() {
+  return getExperianRequestConfigMissingFields().length === 0
+}
+
+function buildExperianCreditProfileRequest({ sessionCode = '', applicant = {} } = {}) {
+  const riskModelIndicators = splitCsvValues(EXPERIAN_RISK_MODEL_INDICATORS)
+  const summaryTypes = splitCsvValues(EXPERIAN_SUMMARY_TYPES)
+  const addOns = {}
+  if (riskModelIndicators.length) {
+    addOns.riskModels = {
+      modelIndicator: riskModelIndicators,
+    }
+    if (EXPERIAN_RISK_MODEL_SCORE_PERCENTILE) {
+      addOns.riskModels.scorePercentile = EXPERIAN_RISK_MODEL_SCORE_PERCENTILE
+    }
+  }
+  if (summaryTypes.length) {
+    addOns.summaries = {
+      summaryType: summaryTypes,
+    }
+  }
+  if (EXPERIAN_OUTPUT_TYPE) {
+    addOns.outputType = EXPERIAN_OUTPUT_TYPE
+    if (EXPERIAN_OUTPUT_HEADING) {
+      addOns.outputTypeData = {
+        heading: EXPERIAN_OUTPUT_HEADING,
+      }
+    }
+  }
+
+  const primaryApplicant = {
+    name: {
+      lastName: applicant.lastName,
+      firstName: applicant.firstName,
+    },
+    dob: {
+      dob: applicant.dob,
+    },
+    ssn: {
+      ssn: applicant.ssn,
+    },
+    currentAddress: {
+      line1: applicant.address1,
+      city: applicant.city,
+      state: applicant.state,
+      zipCode: applicant.zip,
+      country: 'USA',
+    },
+  }
+  if (applicant.address2) primaryApplicant.currentAddress.line2 = applicant.address2
+  if (applicant.phone) {
+    primaryApplicant.phone = [
+      {
+        number: applicant.phone,
+        type: 'home',
+      },
+    ]
+  }
+  if (applicant.email) {
+    primaryApplicant.emailId = {
+      emailId: applicant.email,
+    }
+  }
+
+  return {
+    consumerPii: {
+      primaryApplicant,
+    },
+    requestor: {
+      subscriberCode: EXPERIAN_REQUESTOR_SUBSCRIBER_CODE,
+    },
+    permissiblePurpose: {
+      type: EXPERIAN_PERMISSIBLE_PURPOSE_TYPE,
+      terms: EXPERIAN_PERMISSIBLE_PURPOSE_TERMS,
+      abbreviatedAmount: EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT,
+    },
+    ...(Object.keys(addOns).length ? { addOns } : {}),
+    ...(sessionCode
+      ? {
+          vendorData: {
+            vendorNumber: sessionCode,
+          },
+        }
+      : {}),
+  }
+}
+
 function hasExperianOAuthConfig() {
   return Boolean(
     EXPERIAN_OAUTH_TOKEN_URL &&
@@ -4681,6 +4794,7 @@ async function buildExperianSoftPullHeaders() {
   const headers = {
     'content-type': 'application/json',
     accept: 'application/json',
+    clientReferenceId: EXPERIAN_CLIENT_REFERENCE_ID,
   }
   if (EXPERIAN_SOFT_PULL_BEARER_TOKEN) {
     headers.authorization = `Bearer ${EXPERIAN_SOFT_PULL_BEARER_TOKEN}`
@@ -4813,20 +4927,29 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
       error: 'Experian OAuth or direct soft-pull credentials are not configured yet.',
     }
   }
+  if (!hasExperianRequestConfig()) {
+    return {
+      status: 'configuration_required',
+      provider: SOFT_CREDIT_CHECK_PROVIDER,
+      bureau: SOFT_CREDIT_CHECK_PROVIDER,
+      score: '',
+      scoreRange: '',
+      model: '',
+      referenceId: '',
+      reasons: [],
+      rawStatus: 'missing_request_configuration',
+      error: `Experian request settings are incomplete: ${getExperianRequestConfigMissingFields().join(', ')}`,
+    }
+  }
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), EXPERIAN_SOFT_PULL_TIMEOUT_MS)
   try {
+    const requestBody = buildExperianCreditProfileRequest({ sessionCode, applicant, consent })
     const response = await fetch(EXPERIAN_SOFT_PULL_URL, {
       method: 'POST',
       headers: await buildExperianSoftPullHeaders(),
-      body: JSON.stringify({
-        bureau: SOFT_CREDIT_CHECK_PROVIDER,
-        inquiryType: 'soft',
-        sessionCode,
-        applicant,
-        consent,
-      }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     })
     const rawText = await response.text()

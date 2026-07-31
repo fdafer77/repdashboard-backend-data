@@ -31,6 +31,8 @@ services:
         value: https://sandbox-us-api.experian.com/oauth2/v1/token
       - key: EXPERIAN_OAUTH_SCOPE
         value: user
+      - key: EXPERIAN_CLIENT_REFERENCE_ID
+        value: SBMYSQL
       - key: EXPERIAN_OAUTH_CLIENT_ID
         sync: false
       - key: EXPERIAN_OAUTH_CLIENT_SECRET
@@ -38,6 +40,24 @@ services:
       - key: EXPERIAN_OAUTH_USERNAME
         value: farouk.dafer@taxrefresh.info
       - key: EXPERIAN_OAUTH_PASSWORD
+        sync: false
+      - key: EXPERIAN_REQUESTOR_SUBSCRIBER_CODE
+        sync: false
+      - key: EXPERIAN_PERMISSIBLE_PURPOSE_TYPE
+        sync: false
+      - key: EXPERIAN_PERMISSIBLE_PURPOSE_TERMS
+        sync: false
+      - key: EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT
+        sync: false
+      - key: EXPERIAN_RISK_MODEL_INDICATORS
+        sync: false
+      - key: EXPERIAN_RISK_MODEL_SCORE_PERCENTILE
+        sync: false
+      - key: EXPERIAN_SUMMARY_TYPES
+        sync: false
+      - key: EXPERIAN_OUTPUT_TYPE
+        sync: false
+      - key: EXPERIAN_OUTPUT_HEADING
         sync: false
       - key: EXPERIAN_SOFT_PULL_API_KEY
         sync: false
