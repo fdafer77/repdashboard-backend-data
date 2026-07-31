@@ -5013,8 +5013,8 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
     console.log('Experian soft pull request debug:', {
       sessionCode,
       url: EXPERIAN_SOFT_PULL_URL,
-      headers: buildExperianDebugPayload(requestHeaders),
-      body: buildExperianDebugPayload(requestBody),
+      headers: JSON.stringify(buildExperianDebugPayload(requestHeaders), null, 2),
+      body: JSON.stringify(buildExperianDebugPayload(requestBody), null, 2),
     })
     const response = await fetch(EXPERIAN_SOFT_PULL_URL, {
       method: 'POST',
@@ -5035,7 +5035,7 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
         sessionCode,
         status: response.status,
         statusText: response.statusText,
-        payload: buildExperianDebugPayload(payload),
+        payload: JSON.stringify(buildExperianDebugPayload(payload), null, 2),
         rawText,
       })
       const error = new Error(errorDetails ? `Experian soft pull failed (${response.status}): ${errorDetails}` : `Experian soft pull failed with status ${response.status}`)
