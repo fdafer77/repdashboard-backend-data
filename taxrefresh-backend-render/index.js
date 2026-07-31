@@ -44,10 +44,20 @@ const EXPERIAN_SOFT_PULL_URL = String(process.env.EXPERIAN_SOFT_PULL_URL || '').
 const EXPERIAN_SOFT_PULL_BEARER_TOKEN = String(process.env.EXPERIAN_SOFT_PULL_BEARER_TOKEN || '').trim()
 const EXPERIAN_SOFT_PULL_USERNAME = String(process.env.EXPERIAN_SOFT_PULL_USERNAME || '').trim()
 const EXPERIAN_SOFT_PULL_PASSWORD = String(process.env.EXPERIAN_SOFT_PULL_PASSWORD || '').trim()
+const EXPERIAN_OAUTH_TOKEN_URL = String(process.env.EXPERIAN_OAUTH_TOKEN_URL || '').trim()
+const EXPERIAN_OAUTH_CLIENT_ID = String(process.env.EXPERIAN_OAUTH_CLIENT_ID || '').trim()
+const EXPERIAN_OAUTH_CLIENT_SECRET = String(process.env.EXPERIAN_OAUTH_CLIENT_SECRET || '').trim()
+const EXPERIAN_OAUTH_USERNAME = String(process.env.EXPERIAN_OAUTH_USERNAME || EXPERIAN_SOFT_PULL_USERNAME || '').trim()
+const EXPERIAN_OAUTH_PASSWORD = String(process.env.EXPERIAN_OAUTH_PASSWORD || EXPERIAN_SOFT_PULL_PASSWORD || '').trim()
+const EXPERIAN_OAUTH_SCOPE = String(process.env.EXPERIAN_OAUTH_SCOPE || 'user').trim()
 const EXPERIAN_SOFT_PULL_API_KEY = String(process.env.EXPERIAN_SOFT_PULL_API_KEY || '').trim()
 const EXPERIAN_SOFT_PULL_API_KEY_HEADER = String(process.env.EXPERIAN_SOFT_PULL_API_KEY_HEADER || 'x-api-key').trim()
 const EXPERIAN_SOFT_PULL_USE_MOCK = String(process.env.EXPERIAN_SOFT_PULL_USE_MOCK || '').trim() === '1'
 const EXPERIAN_SOFT_PULL_TIMEOUT_MS = Math.max(3000, Number(process.env.EXPERIAN_SOFT_PULL_TIMEOUT_MS || 15000) || 15000)
+let experianOAuthTokenCache = {
+  accessToken: '',
+  expiresAt: 0,
+}
 
 const DEFAULT_GHL_CONTACT_FIELDS = [
   { slug: 'portal_session_code', name: 'Portal Session Code' },
@@ -4603,13 +4613,80 @@ function applySoftCreditConsent(answers = {}, { source = '', textVersion = '', i
   if (userAgent) answers.soft_credit_check_consent_user_agent = userAgent
 }
 
-function buildExperianSoftPullHeaders() {
+function hasExperianOAuthConfig() {
+  return Boolean(
+    EXPERIAN_OAUTH_TOKEN_URL &&
+      EXPERIAN_OAUTH_CLIENT_ID &&
+      EXPERIAN_OAUTH_CLIENT_SECRET &&
+      EXPERIAN_OAUTH_USERNAME &&
+      EXPERIAN_OAUTH_PASSWORD,
+  )
+}
+
+async function fetchExperianOAuthAccessToken() {
+  const now = Date.now()
+  if (experianOAuthTokenCache.accessToken && experianOAuthTokenCache.expiresAt - 30000 > now) {
+    return experianOAuthTokenCache.accessToken
+  }
+  if (!hasExperianOAuthConfig()) return ''
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), EXPERIAN_SOFT_PULL_TIMEOUT_MS)
+  try {
+    const body = new URLSearchParams()
+    body.set('grant_type', 'password')
+    body.set('username', EXPERIAN_OAUTH_USERNAME)
+    body.set('password', EXPERIAN_OAUTH_PASSWORD)
+    if (EXPERIAN_OAUTH_SCOPE) body.set('scope', EXPERIAN_OAUTH_SCOPE)
+
+    const response = await fetch(EXPERIAN_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json',
+        authorization: `Basic ${Buffer.from(`${EXPERIAN_OAUTH_CLIENT_ID}:${EXPERIAN_OAUTH_CLIENT_SECRET}`).toString('base64')}`,
+      },
+      body: body.toString(),
+      signal: controller.signal,
+    })
+    const rawText = await response.text()
+    let payload = {}
+    try {
+      payload = rawText ? JSON.parse(rawText) : {}
+    } catch {
+      payload = { rawText }
+    }
+    if (!response.ok) {
+      const error = new Error(
+        String(payload?.error_description || payload?.error || payload?.message || `Experian OAuth token request failed with status ${response.status}`),
+      )
+      error.status = response.status
+      error.payload = payload
+      throw error
+    }
+    const accessToken = String(payload?.access_token || '').trim()
+    const expiresInSeconds = Math.max(60, Number(payload?.expires_in || 3600) || 3600)
+    if (!accessToken) throw new Error('Experian OAuth token response did not include an access_token.')
+    experianOAuthTokenCache = {
+      accessToken,
+      expiresAt: Date.now() + expiresInSeconds * 1000,
+    }
+    return accessToken
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function buildExperianSoftPullHeaders() {
   const headers = {
     'content-type': 'application/json',
     accept: 'application/json',
   }
   if (EXPERIAN_SOFT_PULL_BEARER_TOKEN) {
     headers.authorization = `Bearer ${EXPERIAN_SOFT_PULL_BEARER_TOKEN}`
+  } else if (hasExperianOAuthConfig()) {
+    const accessToken = await fetchExperianOAuthAccessToken()
+    if (accessToken) headers.authorization = `Bearer ${accessToken}`
   } else if (EXPERIAN_SOFT_PULL_USERNAME && EXPERIAN_SOFT_PULL_PASSWORD) {
     headers.authorization = `Basic ${Buffer.from(`${EXPERIAN_SOFT_PULL_USERNAME}:${EXPERIAN_SOFT_PULL_PASSWORD}`).toString('base64')}`
   }
@@ -4722,13 +4799,27 @@ async function requestExperianSoftCreditCheck({ sessionCode = '', applicant = {}
       error: 'Experian soft-pull credentials are not configured yet.',
     }
   }
+  if (!EXPERIAN_SOFT_PULL_BEARER_TOKEN && !hasExperianOAuthConfig() && !(EXPERIAN_SOFT_PULL_USERNAME && EXPERIAN_SOFT_PULL_PASSWORD)) {
+    return {
+      status: 'configuration_required',
+      provider: SOFT_CREDIT_CHECK_PROVIDER,
+      bureau: SOFT_CREDIT_CHECK_PROVIDER,
+      score: '',
+      scoreRange: '',
+      model: '',
+      referenceId: '',
+      reasons: [],
+      rawStatus: 'missing_credentials',
+      error: 'Experian OAuth or direct soft-pull credentials are not configured yet.',
+    }
+  }
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), EXPERIAN_SOFT_PULL_TIMEOUT_MS)
   try {
     const response = await fetch(EXPERIAN_SOFT_PULL_URL, {
       method: 'POST',
-      headers: buildExperianSoftPullHeaders(),
+      headers: await buildExperianSoftPullHeaders(),
       body: JSON.stringify({
         bureau: SOFT_CREDIT_CHECK_PROVIDER,
         inquiryType: 'soft',
