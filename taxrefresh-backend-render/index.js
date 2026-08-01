@@ -24,6 +24,14 @@ const GHL_SYNC_WEBHOOK_URL = String(process.env.GHL_SYNC_WEBHOOK_URL || '').trim
 const GHL_SYNC_WEBHOOK_SECRET = String(process.env.GHL_SYNC_WEBHOOK_SECRET || '').trim()
 const GHL_SYNC_WEBHOOK_HEADER = String(process.env.GHL_SYNC_WEBHOOK_HEADER || 'x-webhook-secret').trim()
 const BOLDSIGN_WEBHOOK_SECRET = String(process.env.BOLDSIGN_WEBHOOK_SECRET || '').trim()
+const CALENDLY_API_BASE_URL = String(process.env.CALENDLY_API_BASE_URL || 'https://api.calendly.com').trim().replace(/\/$/, '')
+const CALENDLY_PERSONAL_ACCESS_TOKEN = String(process.env.CALENDLY_PERSONAL_ACCESS_TOKEN || '').trim()
+const CALENDLY_WEBHOOK_SIGNING_KEY = String(process.env.CALENDLY_WEBHOOK_SIGNING_KEY || 'taxrefresh_calendly_sync_2026').trim()
+const CALENDLY_WEBHOOK_SCOPE = String(process.env.CALENDLY_WEBHOOK_SCOPE || 'user').trim().toLowerCase() === 'organization' ? 'organization' : 'user'
+const CALENDLY_EVENT_TYPE_URIS = String(process.env.CALENDLY_EVENT_TYPE_URIS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
 const GHL_API_BASE_URL = String(process.env.GHL_API_BASE_URL || 'https://services.leadconnectorhq.com').trim().replace(/\/$/, '')
 const GHL_PRIVATE_INTEGRATION_TOKEN = String(process.env.GHL_PRIVATE_INTEGRATION_TOKEN || '').trim()
 const GHL_LOCATION_ID = String(process.env.GHL_LOCATION_ID || '').trim()
@@ -67,6 +75,10 @@ const EXPERIAN_SOFT_PULL_TIMEOUT_MS = Math.max(3000, Number(process.env.EXPERIAN
 let experianOAuthTokenCache = {
   accessToken: '',
   expiresAt: 0,
+}
+let calendlyIdentityCache = {
+  fetchedAt: 0,
+  resource: null,
 }
 
 const DEFAULT_GHL_CONTACT_FIELDS = [
@@ -287,6 +299,25 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+app.post('/webhooks/calendly', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
+  let payload = {}
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : {}
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON payload' })
+  }
+  if (!verifyCalendlyWebhookSignature(rawBody, req.headers['calendly-webhook-signature'])) {
+    return res.status(401).json({ error: 'Invalid Calendly webhook signature' })
+  }
+  try {
+    await syncCalendlyPayloadToSession(String(payload?.event || '').trim(), payload?.payload || {})
+  } catch (error) {
+    console.error('Calendly webhook processing failed:', error)
+  }
+  return res.status(200).json({ ok: true })
+})
+
 app.post('/webhooks/boldsign', express.raw({ type: 'application/json' }), async (req, res) => {
   const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
   let payload = {}
@@ -352,6 +383,14 @@ function safeOrigin(value) {
   } catch {
     return ''
   }
+}
+
+function normalizeCalendlyUri(value = '') {
+  return String(value || '').trim()
+}
+
+function isCalendlyReady() {
+  return Boolean(CALENDLY_API_BASE_URL && CALENDLY_PERSONAL_ACCESS_TOKEN)
 }
 
 function getPrimaryAnswer(answers, keys = []) {
@@ -3612,6 +3651,172 @@ async function ghlFetch(path, { method = 'GET', version = 'v3', query, body } = 
   return data
 }
 
+async function calendlyFetch(path, { method = 'GET', query, body } = {}) {
+  if (!isCalendlyReady()) {
+    throw new Error('Calendly is not configured. Set CALENDLY_PERSONAL_ACCESS_TOKEN to enable scheduling sync.')
+  }
+  const url = new URL(path, `${CALENDLY_API_BASE_URL}/`)
+  if (query) {
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null || value === '') continue
+      url.searchParams.set(key, String(value))
+    }
+  }
+  const response = await fetch(url, {
+    method,
+    headers: {
+      authorization: `Bearer ${CALENDLY_PERSONAL_ACCESS_TOKEN}`,
+      accept: 'application/json',
+      ...(body ? { 'content-type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const message =
+      data?.title ||
+      data?.message ||
+      data?.error ||
+      data?.details?.[0]?.message ||
+      `Calendly request failed (${response.status})`
+    throw new Error(message)
+  }
+  return data
+}
+
+async function getCalendlyIdentity(forceRefresh = false) {
+  const now = Date.now()
+  if (!forceRefresh && calendlyIdentityCache.resource && now - calendlyIdentityCache.fetchedAt < 10 * 60 * 1000) {
+    return calendlyIdentityCache.resource
+  }
+  const data = await calendlyFetch('/users/me')
+  const resource = data?.resource || {}
+  calendlyIdentityCache = {
+    fetchedAt: now,
+    resource,
+  }
+  return resource
+}
+
+function normalizeCalendlyEventType(item = {}) {
+  return {
+    uri: normalizeCalendlyUri(item?.uri),
+    name: String(item?.name || '').trim(),
+    schedulingUrl: String(item?.scheduling_url || '').trim(),
+    slug: String(item?.slug || '').trim(),
+    duration: Number(item?.duration || 0) || 0,
+    active: item?.active !== false,
+    poolingType: String(item?.pooling_type || '').trim(),
+    kind: String(item?.kind || '').trim(),
+    color: String(item?.color || '').trim(),
+  }
+}
+
+async function listCalendlyEventTypes() {
+  const identity = await getCalendlyIdentity()
+  const userUri = normalizeCalendlyUri(identity?.uri)
+  const data = await calendlyFetch('/event_types', {
+    query: {
+      user: userUri,
+      count: 100,
+    },
+  })
+  const collection = Array.isArray(data?.collection) ? data.collection : []
+  const allowedUris = new Set(CALENDLY_EVENT_TYPE_URIS.map((value) => normalizeCalendlyUri(value)))
+  return collection
+    .map((item) => normalizeCalendlyEventType(item))
+    .filter((item) => item.active)
+    .filter((item) => !allowedUris.size || allowedUris.has(item.uri))
+}
+
+function buildCalendlyWebhookCallbackUrl(req) {
+  return new URL('/webhooks/calendly', resolvePublicBaseUrl(req)).toString()
+}
+
+async function listCalendlyWebhookSubscriptions(req) {
+  const identity = await getCalendlyIdentity()
+  const organizationUri = normalizeCalendlyUri(identity?.current_organization || identity?.organization)
+  const userUri = normalizeCalendlyUri(identity?.uri)
+  const data = await calendlyFetch('/webhook_subscriptions', {
+    query: {
+      organization: organizationUri,
+      scope: CALENDLY_WEBHOOK_SCOPE,
+      ...(CALENDLY_WEBHOOK_SCOPE === 'user' ? { user: userUri } : {}),
+      count: 100,
+    },
+  })
+  const callbackUrl = buildCalendlyWebhookCallbackUrl(req)
+  const collection = Array.isArray(data?.collection) ? data.collection : []
+  return collection.filter((item) => String(item?.callback_url || '').trim() === callbackUrl)
+}
+
+async function ensureCalendlyWebhookSubscription(req) {
+  if (!CALENDLY_WEBHOOK_SIGNING_KEY) {
+    throw new Error('CALENDLY_WEBHOOK_SIGNING_KEY is required to enable secure Calendly webhook sync.')
+  }
+  const existing = await listCalendlyWebhookSubscriptions(req)
+  const reusable = existing.find((item) => String(item?.state || '').trim() === 'active')
+  if (reusable) return reusable
+  const identity = await getCalendlyIdentity()
+  const organizationUri = normalizeCalendlyUri(identity?.current_organization || identity?.organization)
+  const userUri = normalizeCalendlyUri(identity?.uri)
+  const data = await calendlyFetch('/webhook_subscriptions', {
+    method: 'POST',
+    body: {
+      url: buildCalendlyWebhookCallbackUrl(req),
+      events: ['invitee.created', 'invitee.canceled'],
+      organization: organizationUri,
+      scope: CALENDLY_WEBHOOK_SCOPE,
+      ...(CALENDLY_WEBHOOK_SCOPE === 'user' ? { user: userUri } : {}),
+      signing_key: CALENDLY_WEBHOOK_SIGNING_KEY,
+    },
+  })
+  return data?.resource || null
+}
+
+function buildCalendlyBookingUrl(baseUrl, { sessionCode = '', clientName = '', clientEmail = '' } = {}) {
+  const normalized = String(baseUrl || '').trim()
+  if (!normalized) return ''
+  try {
+    const url = new URL(normalized)
+    if (clientName) url.searchParams.set('name', clientName)
+    if (clientEmail) url.searchParams.set('email', clientEmail)
+    url.searchParams.set('utm_source', 'taxrefresh_dashboard')
+    url.searchParams.set('utm_medium', 'admin_dashboard')
+    url.searchParams.set('utm_campaign', 'client_scheduling')
+    if (sessionCode) url.searchParams.set('utm_content', sessionCode)
+    return url.toString()
+  } catch {
+    return normalized
+  }
+}
+
+function parseCalendlyWebhookSignature(headerValue = '') {
+  return String(headerValue || '')
+    .split(',')
+    .map((part) => part.trim())
+    .reduce((acc, part) => {
+      const [key, value] = part.split('=')
+      if (key && value) acc[key] = value
+      return acc
+    }, {})
+}
+
+function verifyCalendlyWebhookSignature(rawBody = '', headerValue = '') {
+  if (!CALENDLY_WEBHOOK_SIGNING_KEY) return false
+  const parts = parseCalendlyWebhookSignature(headerValue)
+  const timestamp = String(parts.t || '').trim()
+  const signature = String(parts.v1 || '').trim()
+  if (!timestamp || !signature) return false
+  if (Math.abs(Date.now() - Number(timestamp) * 1000) > 3 * 60 * 1000) return false
+  const expected = crypto.createHmac('sha256', CALENDLY_WEBHOOK_SIGNING_KEY).update(`${timestamp}.${rawBody}`).digest('hex')
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
+  } catch {
+    return false
+  }
+}
+
 function normalizeFieldSlug(value = '') {
   return String(value || '')
     .toLowerCase()
@@ -3871,7 +4076,7 @@ async function fetchAllGhlOpportunities() {
         additionalDetails: {
           notes: false,
           tasks: false,
-          calendarEvents: false,
+          calendarEvents: true,
           unReadConversations: false,
         },
       },
@@ -3900,6 +4105,7 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
   const existingState = room?.state || initialRoomState()
   const existingAnswers = existingState?.answers || {}
   const contact = explicitContact || opportunity?.contact || {}
+  const calendarEvents = Array.isArray(opportunity?.calendarEvents) ? opportunity.calendarEvents : []
   const contactName = String(contact?.name || opportunity?.contactName || '')
   const contactEmail = String(contact?.email || '')
   const contactPhone = String(contact?.phone || '')
@@ -3928,6 +4134,7 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
       ghl_assigned_to: String(opportunity?.assignedTo || ''),
       ghl_last_status_change_at: String(opportunity?.lastStatusChangeAt || ''),
       ghl_last_stage_change_at: String(opportunity?.lastStageChangeAt || ''),
+      ghl_calendar_events: stringifyStructuredValue(calendarEvents, '[]'),
       name: contactName || String(existingAnswers.name || ''),
       full_name: contactName || String(existingAnswers.full_name || ''),
       email: contactEmail || String(existingAnswers.email || existingAnswers.email_address || ''),
@@ -4073,6 +4280,12 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
+  const appointments = [
+    ...parseStoredGhlCalendarEvents(answers.ghl_calendar_events).map((item) => normalizeGhlCalendarEvent(item)),
+    ...parseStoredCalendlyAppointments(answers.calendly_appointments).map((item) => normalizeCalendlyAppointment(item)),
+  ]
+    .filter((item) => item.startAt)
+    .sort((a, b) => String(a.startAt || '').localeCompare(String(b.startAt || '')))
   return {
     sessionCode: String(record?.sessionCode || ''),
     contactId: String(record?.contactId || ''),
@@ -4105,6 +4318,9 @@ function buildConsultationSummary(record) {
     stateBalance,
     processedPaymentCount,
     hasProcessedPayment,
+    appointmentCount: appointments.length,
+    nextAppointmentAt: appointments[0]?.startAt || '',
+    appointments,
     hasPlan: String(getPrimaryAnswer(answers, ['hasPlan', 'has_plan']) || ''),
     paymentPlanSelected: String(getPrimaryAnswer(answers, ['paymentPlanSelected', 'payment_plan_selected']) || ''),
     planPriceOverride: String(getPrimaryAnswer(answers, ['planPriceOverride', 'plan_price_override']) || ''),
@@ -4113,6 +4329,163 @@ function buildConsultationSummary(record) {
     isTrainingLead: String(getPrimaryAnswer(answers, ['isTrainingLead', 'is_training_lead']) || ''),
     answerCount: Object.keys(answers).filter((key) => !key.startsWith('_ui_')).length,
   }
+}
+
+function parseStoredGhlCalendarEvents(value) {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function normalizeGhlCalendarEvent(item = {}) {
+  return {
+    id: String(item?.id || item?._id || item?.calendarEventId || item?.appointmentId || item?.eventId || '').trim(),
+    title: String(item?.title || item?.name || item?.appointmentTitle || item?.calendarName || item?.calendar?.name || 'Appointment').trim() || 'Appointment',
+    status: String(item?.status || item?.appointmentStatus || item?.calendarEventStatus || '').trim(),
+    startAt: String(
+      item?.startTime || item?.startAt || item?.startDateTime || item?.startDate || item?.dateStart || item?.appointmentStartTime || '',
+    ).trim(),
+    endAt: String(
+      item?.endTime || item?.endAt || item?.endDateTime || item?.endDate || item?.dateEnd || item?.appointmentEndTime || '',
+    ).trim(),
+    calendarName: String(item?.calendarName || item?.calendar?.name || item?.groupName || '').trim(),
+    assignedTo: String(item?.assignedUserName || item?.assignedTo || item?.ownerName || item?.userName || item?.user?.name || '').trim(),
+    source: 'ghl',
+  }
+}
+
+function parseStoredCalendlyAppointments(value) {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function normalizeCalendlyAppointment(item = {}) {
+  return {
+    id: String(item?.id || item?.inviteeUri || item?.eventUri || '').trim(),
+    title: String(item?.title || item?.eventName || item?.calendarName || 'Calendly appointment').trim(),
+    status: String(item?.status || '').trim(),
+    startAt: String(item?.startAt || item?.start_time || '').trim(),
+    endAt: String(item?.endAt || item?.end_time || '').trim(),
+    calendarName: String(item?.calendarName || item?.eventTypeName || 'Calendly').trim(),
+    assignedTo: String(item?.assignedTo || item?.hostName || '').trim(),
+    source: 'calendly',
+  }
+}
+
+function upsertCalendlyAppointment(existingAppointments = [], nextItem = {}) {
+  const normalized = normalizeCalendlyAppointment(nextItem)
+  const nextList = Array.isArray(existingAppointments) ? [...existingAppointments] : []
+  const nextKey = normalized.id || `${normalized.startAt}_${normalized.title}`
+  const index = nextList.findIndex((item) => {
+    const current = normalizeCalendlyAppointment(item)
+    const currentKey = current.id || `${current.startAt}_${current.title}`
+    return currentKey === nextKey
+  })
+  if (index >= 0) {
+    nextList[index] = { ...nextList[index], ...nextItem }
+  } else {
+    nextList.push(nextItem)
+  }
+  return nextList
+}
+
+function extractCalendlySessionCode(payload = {}) {
+  const trackingSession = String(payload?.tracking?.utm_content || '').trim()
+  if (trackingSession) return trackingSession
+  const questionMatch = Array.isArray(payload?.questions_and_answers)
+    ? payload.questions_and_answers.find((entry) => /session/i.test(String(entry?.question || '')))
+    : null
+  return String(questionMatch?.answer || '').trim()
+}
+
+function buildCalendlyAppointmentFromPayload(payload = {}) {
+  const scheduledEvent = payload?.scheduled_event || {}
+  const host = Array.isArray(scheduledEvent?.event_memberships) ? scheduledEvent.event_memberships[0] : null
+  return {
+    id: String(payload?.uri || scheduledEvent?.uri || '').trim(),
+    inviteeUri: String(payload?.uri || '').trim(),
+    eventUri: String(scheduledEvent?.uri || payload?.event || '').trim(),
+    title: String(scheduledEvent?.name || payload?.name || 'Calendly appointment').trim(),
+    eventName: String(scheduledEvent?.name || '').trim(),
+    eventTypeName: String(scheduledEvent?.name || '').trim(),
+    startAt: String(scheduledEvent?.start_time || '').trim(),
+    endAt: String(scheduledEvent?.end_time || '').trim(),
+    status: String(payload?.status || scheduledEvent?.status || '').trim(),
+    assignedTo: String(host?.user_name || '').trim(),
+    hostName: String(host?.user_name || '').trim(),
+    calendarName: 'Calendly',
+    cancelUrl: String(payload?.cancel_url || '').trim(),
+    rescheduleUrl: String(payload?.reschedule_url || '').trim(),
+    email: String(payload?.email || '').trim(),
+    name: String(payload?.name || '').trim(),
+    timezone: String(payload?.timezone || '').trim(),
+    tracking: payload?.tracking || {},
+    location: scheduledEvent?.location || null,
+    source: 'calendly',
+  }
+}
+
+async function findSessionForCalendlyPayload(payload = {}) {
+  const sessionCode = extractCalendlySessionCode(payload)
+  if (sessionCode) {
+    const matched = await dbGetSession(sessionCode)
+    if (matched) return matched
+  }
+  const email = String(payload?.email || '').trim()
+  if (email) {
+    return findLatestSessionByEmail(email)
+  }
+  return null
+}
+
+async function syncCalendlyPayloadToSession(eventName = '', payload = {}) {
+  const matched = await findSessionForCalendlyPayload(payload)
+  if (!matched?.session_code) {
+    return { matched: false, sessionCode: '', action: 'ignored' }
+  }
+  const sessionCode = String(matched.session_code)
+  const room = await ensureRoom(sessionCode)
+  const nextState = room?.state || initialRoomState()
+  const nextAnswers = { ...(nextState.answers || {}) }
+  const existingAppointments = parseStoredCalendlyAppointments(nextAnswers.calendly_appointments)
+  const appointment = buildCalendlyAppointmentFromPayload(payload)
+  if (eventName === 'invitee.canceled') {
+    appointment.status = 'canceled'
+  }
+  nextAnswers.calendly_appointments = stringifyStructuredValue(upsertCalendlyAppointment(existingAppointments, appointment), '[]')
+  nextAnswers.calendly_last_event = String(eventName || '').trim()
+  nextAnswers.calendly_last_synced_at = new Date().toISOString()
+  nextAnswers.calendly_last_invitee_uri = appointment.inviteeUri
+  nextAnswers.calendly_last_event_uri = appointment.eventUri
+  nextAnswers.calendly_last_email = appointment.email
+  nextAnswers.calendly_last_cancel_url = appointment.cancelUrl
+  nextAnswers.calendly_last_reschedule_url = appointment.rescheduleUrl
+  nextAnswers.calendly_sync_status = appointment.status || 'active'
+  nextState.answers = nextAnswers
+  room.state = nextState
+  await dbUpsertSession({
+    code: sessionCode,
+    contactId: room.contactId || matched.ghl_contact_id || null,
+    opportunityId: room.opportunityId || matched.ghl_opportunity_id || null,
+    state: nextState,
+  })
+  emitDashboardRecordsUpdated({ reason: 'calendly_webhook', sessionCode, eventName })
+  return { matched: true, sessionCode, action: eventName }
 }
 
 function parseSoftCreditHistory(value) {
@@ -5849,6 +6222,96 @@ app.post('/api/admin/consultations/sync-ghl', async (req, res) => {
     return res.json({ ok: true, summary })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync GoHighLevel opportunities' })
+  }
+})
+
+app.get('/api/admin/calendly', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    if (!isCalendlyReady()) {
+      return res.json({
+        ready: false,
+        webhookConnected: false,
+        callbackUrl: buildCalendlyWebhookCallbackUrl(req),
+        eventTypes: [],
+      })
+    }
+    const [identity, eventTypes, subscriptions] = await Promise.all([
+      getCalendlyIdentity(),
+      listCalendlyEventTypes(),
+      listCalendlyWebhookSubscriptions(req),
+    ])
+    return res.json({
+      ready: true,
+      callbackUrl: buildCalendlyWebhookCallbackUrl(req),
+      webhookConnected: subscriptions.some((item) => String(item?.state || '').trim() === 'active'),
+      user: {
+        uri: normalizeCalendlyUri(identity?.uri),
+        name: String(identity?.name || '').trim(),
+        email: String(identity?.email || '').trim(),
+        organization: normalizeCalendlyUri(identity?.current_organization || identity?.organization),
+      },
+      eventTypes,
+    })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load Calendly configuration.' })
+  }
+})
+
+app.post('/api/admin/calendly/connect', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const subscription = await ensureCalendlyWebhookSubscription(req)
+    return res.json({ ok: true, subscription })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to connect Calendly webhook sync.' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/calendly/booking-link', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+    const eventTypeUri = normalizeCalendlyUri(req.body?.eventTypeUri)
+    if (!eventTypeUri) return res.status(400).json({ error: 'Calendly event type is required.' })
+    const eventTypes = await listCalendlyEventTypes()
+    const selectedEventType = eventTypes.find((item) => item.uri === eventTypeUri)
+    if (!selectedEventType?.schedulingUrl) {
+      return res.status(400).json({ error: 'Selected Calendly event type is unavailable for booking.' })
+    }
+    const bookingUrl = buildCalendlyBookingUrl(selectedEventType.schedulingUrl, {
+      sessionCode: roomCode,
+      clientName: currentItem.clientName || '',
+      clientEmail: currentItem.email || '',
+    })
+    const room = await ensureRoom(roomCode)
+    const nextState = room?.state || initialRoomState()
+    const nextAnswers = { ...(nextState.answers || {}) }
+    nextAnswers.calendly_selected_event_type_uri = selectedEventType.uri
+    nextAnswers.calendly_selected_event_type_name = selectedEventType.name
+    nextAnswers.calendly_last_booking_url = bookingUrl
+    nextAnswers.calendly_last_booking_url_created_at = new Date().toISOString()
+    nextState.answers = nextAnswers
+    room.state = nextState
+    await dbUpsertSession({
+      code: roomCode,
+      contactId: room.contactId || currentItem.contactId || null,
+      opportunityId: room.opportunityId || currentItem.opportunityId || null,
+      state: nextState,
+    })
+    return res.json({
+      ok: true,
+      bookingUrl,
+      eventType: selectedEventType,
+    })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create Calendly booking link.' })
   }
 })
 
