@@ -393,6 +393,24 @@ function isCalendlyReady() {
   return Boolean(CALENDLY_API_BASE_URL && CALENDLY_PERSONAL_ACCESS_TOKEN)
 }
 
+function getCalendlyConfigDiagnostics() {
+  const missingEnvVars = []
+  if (!CALENDLY_PERSONAL_ACCESS_TOKEN) missingEnvVars.push('CALENDLY_PERSONAL_ACCESS_TOKEN')
+  if (!CALENDLY_API_BASE_URL) missingEnvVars.push('CALENDLY_API_BASE_URL')
+  const ready = missingEnvVars.length === 0
+  let statusMessage = 'Calendly is configured.'
+  if (!ready) {
+    statusMessage = missingEnvVars.includes('CALENDLY_PERSONAL_ACCESS_TOKEN')
+      ? 'Missing CALENDLY_PERSONAL_ACCESS_TOKEN on backend service.'
+      : `Missing backend Calendly config: ${missingEnvVars.join(', ')}`
+  }
+  return {
+    ready,
+    missingEnvVars,
+    statusMessage,
+  }
+}
+
 function getPrimaryAnswer(answers, keys = []) {
   for (const key of keys) {
     const value = answers?.[key]
@@ -3729,6 +3747,123 @@ async function listCalendlyEventTypes() {
     .filter((item) => !allowedUris.size || allowedUris.has(item.uri))
 }
 
+function extractCalendlyUuidFromUri(value = '') {
+  const raw = String(value || '').trim()
+  const match = raw.match(/\/([^/]+)$/)
+  return match ? match[1] : raw
+}
+
+async function listCalendlyScheduledEvents({ minStartTime = '', maxStartTime = '', status = '' } = {}) {
+  const identity = await getCalendlyIdentity()
+  const organizationUri = normalizeCalendlyUri(identity?.current_organization || identity?.organization)
+  const userUri = normalizeCalendlyUri(identity?.uri)
+  const data = await calendlyFetch('/scheduled_events', {
+    query: {
+      organization: organizationUri,
+      user: userUri,
+      min_start_time: minStartTime,
+      max_start_time: maxStartTime,
+      status,
+      sort: 'start_time:asc',
+      count: 100,
+    },
+  })
+  return Array.isArray(data?.collection) ? data.collection : []
+}
+
+async function listCalendlyEventInvitees(eventUri = '') {
+  const uuid = extractCalendlyUuidFromUri(eventUri)
+  if (!uuid) return []
+  const data = await calendlyFetch(`/scheduled_events/${encodeURIComponent(uuid)}/invitees`, {
+    query: { count: 100 },
+  })
+  return Array.isArray(data?.collection) ? data.collection : []
+}
+
+function buildCalendlyAppointmentFromEventInvitee(event = {}, invitee = {}) {
+  const host = Array.isArray(event?.event_memberships) ? event.event_memberships[0] : null
+  return {
+    id: String(invitee?.uri || event?.uri || '').trim(),
+    inviteeUri: String(invitee?.uri || '').trim(),
+    eventUri: String(event?.uri || invitee?.event || '').trim(),
+    title: String(event?.name || invitee?.name || 'Calendly appointment').trim(),
+    eventName: String(event?.name || '').trim(),
+    eventTypeName: String(event?.name || '').trim(),
+    startAt: String(event?.start_time || '').trim(),
+    endAt: String(event?.end_time || '').trim(),
+    status: String(invitee?.status || event?.status || '').trim(),
+    assignedTo: String(host?.user_name || '').trim(),
+    hostName: String(host?.user_name || '').trim(),
+    calendarName: 'Calendly',
+    cancelUrl: String(invitee?.cancel_url || '').trim(),
+    rescheduleUrl: String(invitee?.reschedule_url || '').trim(),
+    email: String(invitee?.email || '').trim(),
+    name: String(invitee?.name || '').trim(),
+    timezone: String(invitee?.timezone || '').trim(),
+    tracking: invitee?.tracking || {},
+    location: event?.location || null,
+    source: 'calendly',
+  }
+}
+
+async function importCalendlyScheduledEvents({ lookbackDays = 30, lookaheadDays = 120 } = {}) {
+  if (!isCalendlyReady()) {
+    return { ok: false, scanned: 0, matched: 0, imported: 0, message: 'Calendly is not configured.' }
+  }
+  const minStart = new Date(Date.now() - lookbackDays * 86400000).toISOString()
+  const maxStart = new Date(Date.now() + lookaheadDays * 86400000).toISOString()
+  const statuses = ['active', 'canceled']
+  let scanned = 0
+  let matched = 0
+  let imported = 0
+
+  for (const status of statuses) {
+    const events = await listCalendlyScheduledEvents({ minStartTime: minStart, maxStartTime: maxStart, status })
+    for (const event of events) {
+      scanned += 1
+      const invitees = await listCalendlyEventInvitees(event?.uri)
+      for (const invitee of invitees) {
+        const appointment = buildCalendlyAppointmentFromEventInvitee(event, invitee)
+        const matchedRow = await findSessionForCalendlyPayload({
+          ...invitee,
+          scheduled_event: event,
+        })
+        if (!matchedRow?.session_code) continue
+        matched += 1
+        const sessionCode = String(matchedRow.session_code)
+        const room = await ensureRoom(sessionCode)
+        const nextState = room?.state || initialRoomState()
+        const nextAnswers = { ...(nextState.answers || {}) }
+        const existingAppointments = parseStoredCalendlyAppointments(nextAnswers.calendly_appointments)
+        nextAnswers.calendly_appointments = stringifyStructuredValue(upsertCalendlyAppointment(existingAppointments, appointment), '[]')
+        nextAnswers.calendly_last_event = `import:${status}`
+        nextAnswers.calendly_last_synced_at = new Date().toISOString()
+        nextAnswers.calendly_last_invitee_uri = appointment.inviteeUri
+        nextAnswers.calendly_last_event_uri = appointment.eventUri
+        nextAnswers.calendly_last_email = appointment.email
+        nextAnswers.calendly_last_cancel_url = appointment.cancelUrl
+        nextAnswers.calendly_last_reschedule_url = appointment.rescheduleUrl
+        nextAnswers.calendly_sync_status = appointment.status || status
+        nextState.answers = nextAnswers
+        room.state = nextState
+        await dbUpsertSession({
+          code: sessionCode,
+          contactId: room.contactId || matchedRow.ghl_contact_id || null,
+          opportunityId: room.opportunityId || matchedRow.ghl_opportunity_id || null,
+          state: nextState,
+        })
+        imported += 1
+      }
+    }
+  }
+
+  if (imported > 0) {
+    emitDashboardRecordsUpdated({ reason: 'calendly_import_sync', imported })
+  }
+
+  return { ok: true, scanned, matched, imported, minStart, maxStart }
+}
+
 function buildCalendlyWebhookCallbackUrl(req) {
   return new URL('/webhooks/calendly', resolvePublicBaseUrl(req)).toString()
 }
@@ -6228,11 +6363,14 @@ app.post('/api/admin/consultations/sync-ghl', async (req, res) => {
 app.get('/api/admin/calendly', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
-    if (!isCalendlyReady()) {
+    const diagnostics = getCalendlyConfigDiagnostics()
+    if (!diagnostics.ready) {
       return res.json({
         ready: false,
         webhookConnected: false,
         callbackUrl: buildCalendlyWebhookCallbackUrl(req),
+        statusMessage: diagnostics.statusMessage,
+        missingEnvVars: diagnostics.missingEnvVars,
         eventTypes: [],
       })
     }
@@ -6245,6 +6383,8 @@ app.get('/api/admin/calendly', async (req, res) => {
       ready: true,
       callbackUrl: buildCalendlyWebhookCallbackUrl(req),
       webhookConnected: subscriptions.some((item) => String(item?.state || '').trim() === 'active'),
+      statusMessage: diagnostics.statusMessage,
+      missingEnvVars: diagnostics.missingEnvVars,
       user: {
         uri: normalizeCalendlyUri(identity?.uri),
         name: String(identity?.name || '').trim(),
@@ -6265,6 +6405,16 @@ app.post('/api/admin/calendly/connect', async (req, res) => {
     return res.json({ ok: true, subscription })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to connect Calendly webhook sync.' })
+  }
+})
+
+app.post('/api/admin/calendly/sync', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const summary = await importCalendlyScheduledEvents()
+    return res.json({ ok: true, summary })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync Calendly scheduled events.' })
   }
 })
 
