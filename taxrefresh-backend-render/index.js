@@ -336,11 +336,18 @@ async function fetchGoogleAutocompletePredictions(query = '') {
   if (!response.ok) throw new Error(`Google autocomplete failed with ${response.status}`)
   const payload = await response.json().catch(() => ({}))
   const predictions = Array.isArray(payload?.predictions) ? payload.predictions : []
-  return predictions.map((prediction) => ({
-    placeId: String(prediction?.place_id || '').trim(),
-    primary: String(prediction?.structured_formatting?.main_text || prediction?.description || '').trim(),
-    secondary: String(prediction?.structured_formatting?.secondary_text || '').trim(),
-  }))
+  return predictions.map((prediction) => {
+    const description = String(prediction?.description || '').trim()
+    const parts = description
+      .split(',')
+      .map((part) => String(part || '').trim())
+      .filter(Boolean)
+    return {
+      placeId: String(prediction?.place_id || '').trim(),
+      primary: String(parts[0] || prediction?.structured_formatting?.main_text || '').trim(),
+      secondary: String(parts.slice(1).join(', ') || prediction?.structured_formatting?.secondary_text || '').trim(),
+    }
+  })
 }
 
 async function fetchGooglePlaceDetails(placeId = '') {
