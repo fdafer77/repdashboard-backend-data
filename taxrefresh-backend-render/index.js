@@ -2897,7 +2897,8 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const sentAt = new Date().toISOString()
   const normalizedType = eventType.toLowerCase()
   const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
-  const spouseEmail = String(getSpouseSignerEmailFromAnswers(answers) || answers.spouse_email || '').trim().toLowerCase()
+  const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
+  const spouseEmail = getStoredBoldsignSpouseSignerEmail(answers, { clientEmail })
   const target = matchedTarget || (signerEmail && spouseEmail && signerEmail === spouseEmail ? 'spouse' : 'client')
   const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
   answers.current_8821_document_code = answers.current_8821_document_code || resolvedDocumentCode
@@ -3213,6 +3214,32 @@ function getSpouseSignerEmailFromAnswers(answers = {}) {
   return isValidEmailAddress(fallback) ? fallback : ''
 }
 
+function buildEmbeddedSignerAlias(email = '', suffix = 'spouse') {
+  const normalized = String(email || '').trim().toLowerCase()
+  if (!isValidEmailAddress(normalized)) return normalized
+  const atIndex = normalized.lastIndexOf('@')
+  if (atIndex <= 0) return normalized
+  const local = normalized.slice(0, atIndex)
+  const domain = normalized.slice(atIndex + 1)
+  return `${local}+${suffix}@${domain}`
+}
+
+function resolveBoldsignSignerEmail(email = '', { target = 'client', primaryEmail = '' } = {}) {
+  const normalized = String(email || '').trim().toLowerCase()
+  const normalizedPrimary = String(primaryEmail || '').trim().toLowerCase()
+  if (!normalized) return ''
+  if (target === 'spouse' && normalizedPrimary && normalized === normalizedPrimary) {
+    return buildEmbeddedSignerAlias(normalized, 'spouse')
+  }
+  return normalized
+}
+
+function getStoredBoldsignSpouseSignerEmail(answers = {}, { clientEmail = '' } = {}) {
+  const stored = String(answers.boldsign_8821_spouse_signer_email || '').trim().toLowerCase()
+  if (isValidEmailAddress(stored)) return stored
+  return resolveBoldsignSignerEmail(getSpouseSignerEmailFromAnswers(answers), { target: 'spouse', primaryEmail: clientEmail })
+}
+
 function getSpouseSignerNameFromAnswers(answers = {}) {
   const direct = String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || '').trim()
   if (direct) return direct
@@ -3381,6 +3408,9 @@ async function createBoldsign8821SigningLink({
     : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
   const isTemplateConfigured = Boolean(selectedTemplateId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
+  const spouseSignerEmailForBoldsign = isMarriedJoint
+    ? resolveBoldsignSignerEmail(spouseEmail, { target: 'spouse', primaryEmail: resolvedSignerEmail })
+    : ''
   const spouseName = isMarriedJoint ? String(spouseSignerName || getSpouseSignerNameFromAnswers(answers) || '').trim() : ''
   if (isTemplateConfigured && isMarriedJoint && !isValidEmailAddress(spouseEmail)) {
     throw new Error('Spouse email is required for married filing jointly signing.')
@@ -3420,7 +3450,7 @@ async function createBoldsign8821SigningLink({
                     {
                       RoleIndex: 2,
                       SignerName: spouseName || 'Spouse',
-                      SignerEmail: spouseEmail,
+                      SignerEmail: spouseSignerEmailForBoldsign,
                       SignerType: 'Signer',
                       Locale: 'EN',
                       ExistingFormFields: existingSpouseFormFields,
@@ -3490,6 +3520,9 @@ async function createBoldsign8821SigningLink({
       room.state.answers[`${documentFieldPrefix}_file_name`] = isTemplateConfigured ? 'TaxRefresh R.E.D Packet.pdf' : 'TaxRefresh Form 8821.pdf'
       room.state.answers[`${documentFieldPrefix}_sent_at`] = nextSentAt
       room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
+      if (isTemplateConfigured && isMarriedJoint) {
+        room.state.answers.boldsign_8821_spouse_signer_email = spouseSignerEmailForBoldsign
+      }
       if (createReceiptOnCreate) {
         room.state.answers.current_8821_document_code = nextDocumentCode
         room.state.answers.active_8821_document_code = nextDocumentCode
@@ -3548,11 +3581,16 @@ async function createBoldsign8821SigningLink({
   }
 
   try {
+    const embeddedSignerEmail =
+      String(target || 'client').trim().toLowerCase() === 'spouse' && spouseSignerEmailForBoldsign
+        ? spouseSignerEmailForBoldsign
+        : resolvedSignerEmail
     return {
       documentId,
+      spouseSignerEmail: spouseSignerEmailForBoldsign,
       signingUrl: await getBoldsignEmbeddedSignLink({
         documentId,
-        signerEmail: resolvedSignerEmail,
+        signerEmail: embeddedSignerEmail,
         redirectUrl: resolvedReturnUrl,
       }),
     }
@@ -4418,6 +4456,7 @@ function buildConsultationSummary(record) {
   const appointments = [
     ...parseStoredGhlCalendarEvents(answers.ghl_calendar_events).map((item) => normalizeGhlCalendarEvent(item)),
     ...parseStoredCalendlyAppointments(answers.calendly_appointments).map((item) => normalizeCalendlyAppointment(item)),
+    ...parseStoredInternalAppointments(answers.internal_appointments).map((item) => normalizeInternalAppointment(item)),
   ]
     .filter((item) => item.startAt)
     .sort((a, b) => String(a.startAt || '').localeCompare(String(b.startAt || '')))
@@ -4518,8 +4557,59 @@ function normalizeCalendlyAppointment(item = {}) {
     endAt: String(item?.endAt || item?.end_time || '').trim(),
     calendarName: String(item?.calendarName || item?.eventTypeName || 'Calendly').trim(),
     assignedTo: String(item?.assignedTo || item?.hostName || '').trim(),
+    inviteeUri: String(item?.inviteeUri || item?.uri || '').trim(),
+    eventUri: String(item?.eventUri || item?.event || '').trim(),
+    rescheduleUrl: String(item?.rescheduleUrl || item?.reschedule_url || '').trim(),
+    cancelUrl: String(item?.cancelUrl || item?.cancel_url || '').trim(),
+    email: String(item?.email || '').trim(),
+    name: String(item?.name || '').trim(),
+    timezone: String(item?.timezone || '').trim(),
     source: 'calendly',
   }
+}
+
+function parseStoredInternalAppointments(value) {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function normalizeInternalAppointment(item = {}) {
+  return {
+    id: String(item?.id || '').trim(),
+    title: String(item?.title || item?.eventName || 'Appointment').trim() || 'Appointment',
+    status: String(item?.status || 'scheduled').trim() || 'scheduled',
+    startAt: String(item?.startAt || item?.start_time || '').trim(),
+    endAt: String(item?.endAt || item?.end_time || '').trim(),
+    calendarName: String(item?.calendarName || 'Dashboard').trim() || 'Dashboard',
+    assignedTo: String(item?.assignedTo || item?.ownerName || '').trim(),
+    notes: String(item?.notes || '').trim(),
+    createdByName: String(item?.createdByName || '').trim(),
+    createdByEmail: String(item?.createdByEmail || '').trim(),
+    updatedAt: String(item?.updatedAt || '').trim(),
+    canceledAt: String(item?.canceledAt || '').trim(),
+    source: 'internal',
+  }
+}
+
+function upsertInternalAppointment(existingAppointments = [], nextItem = {}) {
+  const normalized = normalizeInternalAppointment(nextItem)
+  const nextList = Array.isArray(existingAppointments) ? [...existingAppointments] : []
+  const index = nextList.findIndex((item) => String(item?.id || '').trim() === normalized.id)
+  if (index >= 0) nextList[index] = { ...nextList[index], ...nextItem }
+  else nextList.push(nextItem)
+  return nextList
+}
+
+function generateInternalAppointmentId() {
+  return `appt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 }
 
 function upsertCalendlyAppointment(existingAppointments = [], nextItem = {}) {
@@ -6479,6 +6569,127 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
   }
 })
 
+app.post('/api/admin/consultations/:code/appointments/internal', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+
+    const title = String(req.body?.title || '').trim() || 'Appointment'
+    const startAt = String(req.body?.startAt || '').trim()
+    const endAt = String(req.body?.endAt || '').trim()
+    const notes = String(req.body?.notes || '').trim()
+    if (!startAt || !endAt) return res.status(400).json({ error: 'Start and end time are required.' })
+    if (Number.isNaN(new Date(startAt).getTime()) || Number.isNaN(new Date(endAt).getTime())) {
+      return res.status(400).json({ error: 'Start and end time must be valid date values.' })
+    }
+    if (new Date(endAt).getTime() <= new Date(startAt).getTime()) {
+      return res.status(400).json({ error: 'End time must be after the start time.' })
+    }
+
+    const room = await ensureRoom(roomCode)
+    const nextState = room?.state || initialRoomState()
+    const nextAnswers = { ...(nextState.answers || {}) }
+    const existingAppointments = parseStoredInternalAppointments(nextAnswers.internal_appointments)
+    const appointment = {
+      id: generateInternalAppointmentId(),
+      title,
+      status: 'scheduled',
+      startAt,
+      endAt,
+      notes,
+      calendarName: 'Dashboard',
+      assignedTo: String(currentItem.claimedByName || currentItem.assignedEaName || currentItem.assignedTo || req.adminUser?.displayName || '').trim(),
+      createdByName: String(req.adminUser?.displayName || '').trim(),
+      createdByEmail: String(req.adminUser?.email || '').trim(),
+      updatedAt: new Date().toISOString(),
+      source: 'internal',
+    }
+    nextAnswers.internal_appointments = stringifyStructuredValue(upsertInternalAppointment(existingAppointments, appointment), '[]')
+    nextState.answers = nextAnswers
+    room.state = nextState
+    await dbUpsertSession({
+      code: roomCode,
+      contactId: room.contactId || currentItem.contactId || null,
+      opportunityId: room.opportunityId || currentItem.opportunityId || null,
+      state: nextState,
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    emitDashboardRecordsUpdated({ reason: 'internal_appointment_created', roomCode, appointmentId: appointment.id })
+    return res.json({ ok: true, appointment: normalizeInternalAppointment(appointment), item })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create appointment.' })
+  }
+})
+
+app.patch('/api/admin/consultations/:code/appointments/internal/:appointmentId', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const appointmentId = String(req.params.appointmentId || '').trim()
+    if (!roomCode || !appointmentId) return res.status(400).json({ error: 'Consultation code and appointment ID are required.' })
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+
+    const room = await ensureRoom(roomCode)
+    const nextState = room?.state || initialRoomState()
+    const nextAnswers = { ...(nextState.answers || {}) }
+    const existingAppointments = parseStoredInternalAppointments(nextAnswers.internal_appointments)
+    const index = existingAppointments.findIndex((item) => String(item?.id || '').trim() === appointmentId)
+    if (index < 0) return res.status(404).json({ error: 'Appointment not found.' })
+    const currentAppointment = normalizeInternalAppointment(existingAppointments[index])
+    const title = req.body?.title === undefined ? currentAppointment.title : String(req.body?.title || '').trim() || 'Appointment'
+    const startAt = req.body?.startAt === undefined ? currentAppointment.startAt : String(req.body?.startAt || '').trim()
+    const endAt = req.body?.endAt === undefined ? currentAppointment.endAt : String(req.body?.endAt || '').trim()
+    const notes = req.body?.notes === undefined ? currentAppointment.notes : String(req.body?.notes || '').trim()
+    const status = req.body?.status === undefined ? currentAppointment.status : String(req.body?.status || '').trim() || currentAppointment.status
+    if (!startAt || !endAt) return res.status(400).json({ error: 'Start and end time are required.' })
+    if (Number.isNaN(new Date(startAt).getTime()) || Number.isNaN(new Date(endAt).getTime())) {
+      return res.status(400).json({ error: 'Start and end time must be valid date values.' })
+    }
+    if (new Date(endAt).getTime() <= new Date(startAt).getTime()) {
+      return res.status(400).json({ error: 'End time must be after the start time.' })
+    }
+
+    const nextAppointment = {
+      ...existingAppointments[index],
+      ...currentAppointment,
+      title,
+      startAt,
+      endAt,
+      notes,
+      status,
+      updatedAt: new Date().toISOString(),
+      canceledAt: status === 'canceled' ? new Date().toISOString() : '',
+    }
+    existingAppointments[index] = nextAppointment
+    nextAnswers.internal_appointments = stringifyStructuredValue(existingAppointments, '[]')
+    nextState.answers = nextAnswers
+    room.state = nextState
+    await dbUpsertSession({
+      code: roomCode,
+      contactId: room.contactId || currentItem.contactId || null,
+      opportunityId: room.opportunityId || currentItem.opportunityId || null,
+      state: nextState,
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    emitDashboardRecordsUpdated({ reason: 'internal_appointment_updated', roomCode, appointmentId })
+    return res.json({ ok: true, appointment: normalizeInternalAppointment(nextAppointment), item })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update appointment.' })
+  }
+})
+
 app.post('/api/admin/consultations/:code/soft-credit-check', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
@@ -7099,7 +7310,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       if (isMarriedJoint) {
         spouseSigningUrl = await getBoldsignEmbeddedSignLink({
           documentId: String(created?.documentId || '').trim(),
-          signerEmail: spouseRecipientEmail,
+          signerEmail: String(created?.spouseSignerEmail || getStoredBoldsignSpouseSignerEmail(answers, { clientEmail: resolvedRecipientEmail }) || spouseRecipientEmail).trim(),
           redirectUrl: spouseReturnUrl || clientReturnUrl,
         })
       }
@@ -7399,6 +7610,7 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     const roomState = await getSessionStateForCode(roomCode)
     if (!roomState) return res.status(404).json({ error: 'Session not found' })
     const answers = roomState.answers || {}
+    const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
     const logEntries = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
     const targetLog = Array.isArray(logEntries)
       ? logEntries.find((entry) => String(entry?.documentType || '').trim() === (target === 'spouse' ? '8821 Spouse' : '8821 Document'))
@@ -7418,6 +7630,8 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     if (!isValidEmailAddress(signerEmail)) {
       return res.status(400).json({ error: `No valid ${target === 'spouse' ? 'spouse' : 'client'} email is attached to this document yet.` })
     }
+    const embeddedSignerEmail =
+      target === 'spouse' ? getStoredBoldsignSpouseSignerEmail(answers, { clientEmail }) || resolveBoldsignSignerEmail(signerEmail, { target: 'spouse', primaryEmail: clientEmail }) : signerEmail
 
     const backendBase = getBackendBaseUrl()
     const returnUrl =
@@ -7443,7 +7657,7 @@ app.get('/api/session/:code/document-link', async (req, res) => {
       try {
         signingUrl = await getBoldsignEmbeddedSignLink({
           documentId: existingDocumentId,
-          signerEmail,
+          signerEmail: embeddedSignerEmail,
           redirectUrl: returnUrl,
         })
       } catch {
@@ -7456,7 +7670,6 @@ app.get('/api/session/:code/document-link', async (req, res) => {
         // Ensure spouse email is stored for MFJ template sending.
         if (!String(answers.spouse_email || '').trim()) answers.spouse_email = signerEmail
         const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim()
-        const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
         if (!isValidEmailAddress(clientEmail)) {
           return res.status(400).json({ error: 'No valid client email is attached to this record yet.' })
         }
@@ -7470,7 +7683,7 @@ app.get('/api/session/:code/document-link', async (req, res) => {
         })
         signingUrl = await getBoldsignEmbeddedSignLink({
           documentId: String(created?.documentId || '').trim(),
-          signerEmail,
+          signerEmail: String(created?.spouseSignerEmail || embeddedSignerEmail || signerEmail).trim(),
           redirectUrl: returnUrl,
         })
       } else {
