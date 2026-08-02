@@ -46,6 +46,15 @@ const ADMIN_DASHBOARD_PASSCODE = String(process.env.ADMIN_DASHBOARD_PASSCODE || 
 const SESSION_STORE_PATH = path.resolve(process.env.SESSION_STORE_PATH || path.join(process.cwd(), '.data', 'sessions.json'))
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_PUBLISHABLE_KEY = String(process.env.STRIPE_PUBLISHABLE_KEY || '').trim()
+const GOOGLE_PLACES_SERVER_API_KEY = String(
+  process.env.GOOGLE_PLACES_SERVER_API_KEY ||
+    process.env.GOOGLE_MAPS_SERVER_API_KEY ||
+    process.env.GOOGLE_SERVER_API_KEY ||
+    process.env.GOOGLE_PLACES_API_KEY ||
+    process.env.GOOGLE_MAPS_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    '',
+).trim()
 const SOFT_CREDIT_CHECK_PROVIDER = 'Experian'
 const SOFT_CREDIT_CHECK_CONSENT_VERSION = String(process.env.SOFT_CREDIT_CHECK_CONSENT_VERSION || '2026-07-30-v1').trim()
 const EXPERIAN_SOFT_PULL_URL = String(process.env.EXPERIAN_SOFT_PULL_URL || '').trim()
@@ -298,6 +307,82 @@ app.use(
 )
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
+
+function parseGoogleAddressComponents(components = []) {
+  const list = Array.isArray(components) ? components : []
+  const findPart = (type, mode = 'long_name') =>
+    String(
+      list.find((component) => Array.isArray(component?.types) && component.types.includes(type))?.[mode] || '',
+    ).trim()
+  const street = [findPart('street_number'), findPart('route')].filter(Boolean).join(' ').trim()
+  return {
+    street,
+    city: findPart('locality') || findPart('postal_town') || findPart('sublocality_level_1') || findPart('administrative_area_level_2'),
+    stateCode: findPart('administrative_area_level_1', 'short_name'),
+    zip: findPart('postal_code'),
+  }
+}
+
+async function fetchGoogleAutocompletePredictions(query = '') {
+  const input = String(query || '').trim()
+  if (!GOOGLE_PLACES_SERVER_API_KEY || input.length < 3) return []
+  const url = new URL('https://maps.googleapis.com/maps/api/place/autocomplete/json')
+  url.searchParams.set('input', input)
+  url.searchParams.set('types', 'address')
+  url.searchParams.set('components', 'country:us')
+  url.searchParams.set('language', 'en')
+  url.searchParams.set('key', GOOGLE_PLACES_SERVER_API_KEY)
+  const response = await fetch(url, { headers: { Accept: 'application/json' } })
+  if (!response.ok) throw new Error(`Google autocomplete failed with ${response.status}`)
+  const payload = await response.json().catch(() => ({}))
+  const predictions = Array.isArray(payload?.predictions) ? payload.predictions : []
+  return predictions.map((prediction) => ({
+    placeId: String(prediction?.place_id || '').trim(),
+    primary: String(prediction?.structured_formatting?.main_text || prediction?.description || '').trim(),
+    secondary: String(prediction?.structured_formatting?.secondary_text || '').trim(),
+  }))
+}
+
+async function fetchGooglePlaceDetails(placeId = '') {
+  const normalized = String(placeId || '').trim()
+  if (!GOOGLE_PLACES_SERVER_API_KEY || !normalized) return null
+  const url = new URL('https://maps.googleapis.com/maps/api/place/details/json')
+  url.searchParams.set('place_id', normalized)
+  url.searchParams.set('fields', 'formatted_address,address_component')
+  url.searchParams.set('key', GOOGLE_PLACES_SERVER_API_KEY)
+  const response = await fetch(url, { headers: { Accept: 'application/json' } })
+  if (!response.ok) throw new Error(`Google place details failed with ${response.status}`)
+  const payload = await response.json().catch(() => ({}))
+  const result = payload?.result && typeof payload.result === 'object' ? payload.result : null
+  if (!result) return null
+  return {
+    formattedAddress: String(result?.formatted_address || '').trim(),
+    ...parseGoogleAddressComponents(result?.address_components),
+  }
+}
+
+app.get('/api/address-autocomplete', async (req, res) => {
+  const query = String(req.query?.q || '').trim()
+  if (query.length < 3) return res.json({ suggestions: [] })
+  try {
+    const suggestions = await fetchGoogleAutocompletePredictions(query)
+    return res.json({ suggestions })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch address suggestions.' })
+  }
+})
+
+app.get('/api/address-place-details', async (req, res) => {
+  const placeId = String(req.query?.placeId || '').trim()
+  if (!placeId) return res.status(400).json({ error: 'placeId is required' })
+  try {
+    const details = await fetchGooglePlaceDetails(placeId)
+    if (!details) return res.status(404).json({ error: 'Place details unavailable' })
+    return res.json(details)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch place details.' })
+  }
+})
 
 app.post('/webhooks/calendly', express.raw({ type: 'application/json' }), async (req, res) => {
   const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
