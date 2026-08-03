@@ -8186,6 +8186,8 @@ function buildConsultationAnalytics(items = [], account = null) {
   const monthlyRevenue = new Map()
   const pipelineBuckets = new Map()
   const stageBuckets = new Map()
+  const paymentSchedules = []
+  const failedPayments = []
   let processedRevenueTotal = 0
   let pendingRevenueTotal = 0
   let failedRevenueTotal = 0
@@ -8199,10 +8201,27 @@ function buildConsultationAnalytics(items = [], account = null) {
       let processedRevenue = 0
       let pendingRevenue = 0
       let failedRevenue = 0
-      scheduleRows.forEach((row) => {
+      scheduleRows.forEach((row, rowIndex) => {
         const amount = toNumberValue(row?.amount)
         const tone = getBillingStatusTone(row)
-        const monthKey = normalizeBillingDateValue(row?.processedAt || row?.date || '').slice(0, 7)
+        const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
+        const monthKey = normalizedDate.slice(0, 7)
+        const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : 'Pending'
+        const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
+        const paymentScheduleEntry = {
+          id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
+          sessionCode: String(item.sessionCode || '').trim(),
+          clientName: String(item.clientName || 'Unknown client').trim() || 'Unknown client',
+          pipelineName: String(item.pipelineName || 'No pipeline').trim() || 'No pipeline',
+          stageName: String(item.stageName || '').trim(),
+          scheduledDate: normalizedDate,
+          amount,
+          statusTone: tone,
+          statusLabel,
+          failureReason,
+          updatedAt: String(item.updatedAt || '').trim(),
+        }
+        paymentSchedules.push(paymentScheduleEntry)
         if (tone === 'processed') {
           processedRevenue += amount
           processedRevenueTotal += amount
@@ -8215,6 +8234,7 @@ function buildConsultationAnalytics(items = [], account = null) {
         } else if (tone === 'failed') {
           failedRevenue += amount
           failedRevenueTotal += amount
+          failedPayments.push(paymentScheduleEntry)
         } else {
           pendingRevenue += amount
           pendingRevenueTotal += amount
@@ -8286,6 +8306,18 @@ function buildConsultationAnalytics(items = [], account = null) {
     monthlyRevenue: Array.from(monthlyRevenue.values())
       .sort((a, b) => String(a.month).localeCompare(String(b.month)))
       .slice(-8),
+    paymentSchedules: paymentSchedules.sort((a, b) => {
+      const leftDate = String(a.scheduledDate || '9999-12-31')
+      const rightDate = String(b.scheduledDate || '9999-12-31')
+      if (leftDate !== rightDate) return leftDate.localeCompare(rightDate)
+      return String(a.clientName || '').localeCompare(String(b.clientName || ''))
+    }),
+    failedPayments: failedPayments.sort((a, b) => {
+      const leftDate = String(a.scheduledDate || '')
+      const rightDate = String(b.scheduledDate || '')
+      if (leftDate !== rightDate) return rightDate.localeCompare(leftDate)
+      return String(a.clientName || '').localeCompare(String(b.clientName || ''))
+    }),
     pipelines: Array.from(pipelineBuckets.values()).sort((a, b) => b.value - a.value),
     stages: Array.from(stageBuckets.values()).sort((a, b) => b.count - a.count),
     topOpportunities: topOpportunities.slice(0, 12),
