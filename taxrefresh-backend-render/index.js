@@ -2561,10 +2561,30 @@ function getClientFirstName(value = '') {
   return safeValue.split(/\s+/)[0] || 'Client'
 }
 
-function build8821EmailHtml({ clientName, signingLink }) {
+function build8821EmailHtml({ clientName, signingLink, secondarySigningLink = '', secondaryLabel = 'Open spouse signature' }) {
   const safeName = escapeHtml(getClientFirstName(clientName))
   const safeLink = String(signingLink || '').trim()
   const safeHref = escapeHtml(safeLink || '#')
+  const safeSecondaryLink = String(secondarySigningLink || '').trim()
+  const safeSecondaryHref = escapeHtml(safeSecondaryLink || '#')
+  const safeSecondaryLabel = escapeHtml(String(secondaryLabel || 'Open spouse signature').trim() || 'Open spouse signature')
+  const secondaryBlock = safeSecondaryLink
+    ? `
+                <div style="margin:18px 0 0 0; padding:18px; border-radius:16px; background:#ffffff; border:1px solid #dce8f8;">
+                  <div style="font-size:14px; font-weight:800; color:#1c3158; margin-bottom:8px;">
+                    Additional signing link
+                  </div>
+                  <p style="margin:0 0 14px 0; font-size:14px; line-height:1.7; color:#4d5b74;">
+                    If the same person is signing for the spouse too, use this second secure link after finishing the first signature.
+                  </p>
+                  <a
+                    href="${safeSecondaryHref}"
+                    style="display:inline-block; padding:12px 20px; border-radius:12px; background:#eef6ff; color:#1d5fd1; font-size:14px; font-weight:800; text-decoration:none;"
+                  >
+                    ${safeSecondaryLabel}
+                  </a>
+                </div>`
+    : ''
   return `<!DOCTYPE html>
 <html lang="en">
   <head>
@@ -2642,6 +2662,7 @@ function build8821EmailHtml({ clientName, signingLink }) {
                       </td>
                     </tr>
                   </table>
+                  ${secondaryBlock}
                 </div>
                 <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 28px auto;">
                   <tr>
@@ -7428,12 +7449,22 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         form8821ClientLink: clientSigningUrl,
         form8821SpouseLink: spouseSigningUrl,
       }
+      const spouseSharesClientEmail =
+        Boolean(spouseRecipientEmail) &&
+        String(spouseRecipientEmail || '').trim().toLowerCase() === String(resolvedRecipientEmail || '').trim().toLowerCase()
       await sendGhlEmailMessage({
         contactId,
         emailTo: resolvedRecipientEmail,
         subject: 'TaxRefresh Signature Request',
-        message: `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
-        html: build8821EmailHtml({ clientName, signingLink: links.form8821ClientLink }),
+        message: spouseSharesClientEmail && links.form8821SpouseLink
+          ? `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}\nThen sign the spouse portion here: ${links.form8821SpouseLink}`
+          : `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
+        html: build8821EmailHtml({
+          clientName,
+          signingLink: links.form8821ClientLink,
+          secondarySigningLink: spouseSharesClientEmail ? links.form8821SpouseLink : '',
+          secondaryLabel: 'Open spouse signature',
+        }),
       })
       nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
       logEntries.push({
@@ -7460,13 +7491,15 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         if (!links.form8821SpouseLink) {
           return res.status(500).json({ error: 'Unable to create a secure spouse signing link for this document.' })
         }
-        await sendGhlEmailMessage({
-          contactId,
-          emailTo: spouseRecipientEmail,
-          subject: 'TaxRefresh Signature Request',
-          message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${links.form8821SpouseLink}`,
-          html: build8821EmailHtml({ clientName: String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || 'Spouse'), signingLink: links.form8821SpouseLink }),
-        })
+        if (!spouseSharesClientEmail) {
+          await sendGhlEmailMessage({
+            contactId,
+            emailTo: spouseRecipientEmail,
+            subject: 'TaxRefresh Signature Request',
+            message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${links.form8821SpouseLink}`,
+            html: build8821EmailHtml({ clientName: String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || 'Spouse'), signingLink: links.form8821SpouseLink }),
+          })
+        }
         nextReceipts.push({ name: '8821 Spouse', documentCode, status: 'Sent' })
         logEntries.push({
           id: `doc_email_${Date.now().toString(36)}_spouse`,
