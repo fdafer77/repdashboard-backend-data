@@ -7638,7 +7638,14 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
     const target = String(req.body?.target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
     const roomState = await getSessionStateForCode(sessionCode)
     const answers = roomState?.answers || {}
-    const existingDocumentId = String(answers.boldsign_8821_document_id || '').trim()
+    const boldsignConfig = getBoldsignConfig()
+    const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+    const selectedTemplateId = isMarriedJoint
+      ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
+      : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+    const templateConfigured = Boolean(selectedTemplateId)
+    const documentFieldPrefix = templateConfigured ? 'boldsign_8821' : target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
+    const existingDocumentId = String(answers[`${documentFieldPrefix}_document_id`] || '').trim()
     if (existingDocumentId && is8821TargetAlreadySigned(answers, target)) {
       return res.json({ alreadySigned: true, documentId: existingDocumentId, target })
     }
@@ -7651,6 +7658,7 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
       persistDocument: true,
       createReceiptOnCreate: true,
       receiptRecipientEmail: String(req.body?.email || '').trim(),
+      documentFieldPrefix,
       target,
     })
     return res.json(result)
