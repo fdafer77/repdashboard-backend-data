@@ -3066,6 +3066,10 @@ function getBoldsignConfig() {
   const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
   const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || '').trim()
   const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || '').trim()
+  const brandId = String(process.env.BOLDSIGN_BRAND_ID || '').trim()
+  const brandIdMfj = String(process.env.BOLDSIGN_BRAND_ID_MFJ || '').trim()
+  const brandIdSingle = String(process.env.BOLDSIGN_BRAND_ID_SINGLE || '').trim()
+  const hideDocumentId = ['1', 'true', 'yes', 'on'].includes(String(process.env.BOLDSIGN_HIDE_DOCUMENT_ID || '').trim().toLowerCase())
 
   return {
     apiBase,
@@ -3074,6 +3078,10 @@ function getBoldsignConfig() {
     templateId,
     templateIdMfj,
     templateIdSingle,
+    brandId,
+    brandIdMfj,
+    brandIdSingle,
+    hideDocumentId,
     ready: Boolean(apiKey),
   }
 }
@@ -3498,6 +3506,10 @@ async function createBoldsign8821SigningLink({
   const selectedTemplateId = isMarriedJoint
     ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
     : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+  const selectedBrandId = isMarriedJoint
+    ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
+    : String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+  const hideDocumentId = Boolean(boldsignConfig.hideDocumentId)
   const isTemplateConfigured = Boolean(selectedTemplateId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
   const spouseSignerEmailForBoldsign = isMarriedJoint
@@ -3525,6 +3537,8 @@ async function createBoldsign8821SigningLink({
           body: {
             Title: 'TaxRefresh R.E.D Packet',
             Message: '',
+            ...(selectedBrandId ? { BrandId: selectedBrandId } : {}),
+            ...(hideDocumentId ? { HideDocumentId: true } : {}),
             DisableEmails: true,
             EnableEmbeddedSigning: true,
             EnableSigningOrder: false,
@@ -3570,6 +3584,8 @@ async function createBoldsign8821SigningLink({
             body: {
               Title: 'Form 8821 - Tax Information Authorization',
               Message: '',
+              ...(selectedBrandId ? { BrandId: selectedBrandId } : {}),
+              ...(hideDocumentId ? { HideDocumentId: true } : {}),
               DisableEmails: true,
               AutoDetectFields: true,
               EnableEmbeddedSigning: true,

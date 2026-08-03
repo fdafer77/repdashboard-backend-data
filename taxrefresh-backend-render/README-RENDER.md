@@ -30,6 +30,10 @@ Optional, only if you use them:
 - `STRIPE_SECRET_KEY`
 - `STRIPE_PUBLISHABLE_KEY`
 - `BOLDSIGN_API_KEY`
+- `BOLDSIGN_BRAND_ID`
+- `BOLDSIGN_BRAND_ID_MFJ`
+- `BOLDSIGN_BRAND_ID_SINGLE`
+- `BOLDSIGN_HIDE_DOCUMENT_ID`
 - `GHL_SYNC_WEBHOOK_URL`
 - `GHL_SYNC_WEBHOOK_SECRET`
 
@@ -55,6 +59,17 @@ These are already set in `render.yaml`:
 - `PUBLIC_BASE_URL=https://secure.taxrefresh.us`
 - `EXPERIENCE_BASE_URL=https://secure.taxrefresh.us`
 - `BOLDSIGN_8821_PDF_PATH=./assets/f8821.pdf`
+
+## BoldSign branding control
+
+The backend can now force a specific BoldSign brand when sending 8821 documents.
+
+- `BOLDSIGN_BRAND_ID`: default brand for all 8821 sends
+- `BOLDSIGN_BRAND_ID_MFJ`: optional override for MFJ packets
+- `BOLDSIGN_BRAND_ID_SINGLE`: optional override for single filers
+- `BOLDSIGN_HIDE_DOCUMENT_ID=1`: tells BoldSign to hide the document ID on newly sent 8821 documents
+
+If these are not set, BoldSign will fall back to the account or template default brand.
 
 ## After deployment
 
