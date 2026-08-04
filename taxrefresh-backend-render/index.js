@@ -3060,14 +3060,6 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
       roomCode,
       target: normalizedTarget,
     })
-    await ensureSigned8821StoredOnRecord(roomCode, room)
-    logMemoryDiagnostics('markBoldsign8821Completed:after-store', {
-      roomCode,
-      target: normalizedTarget,
-    })
-    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
-      console.error('Signed 8821 client email failed:', error)
-    })
     void runSoftCreditCheckForRoom({
       roomCode,
       room,
@@ -3084,6 +3076,21 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     await dbUpsertSession({ code: roomCode, state: room.state })
   } catch {
     // ignore; session still works in-memory
+  }
+  if (isForm8821FullySigned(room.state.answers)) {
+    void ensureSigned8821StoredOnRecord(roomCode, room)
+      .then(() => {
+        logMemoryDiagnostics('markBoldsign8821Completed:after-store', {
+          roomCode,
+          target: normalizedTarget,
+        })
+      })
+      .catch((error) => {
+        console.error('Signed 8821 storage failed:', error)
+      })
+    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+      console.error('Signed 8821 client email failed:', error)
+    })
   }
   logMemoryDiagnostics('markBoldsign8821Completed:after-persist', {
     roomCode,
@@ -8471,6 +8478,12 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
     const target = String(req.body?.target || req.body?.signer || 'client').trim().toLowerCase()
     if (!roomCode) return res.status(400).json({ error: 'sessionCode is required' })
     await markBoldsign8821Completed({ roomCode, completedDocumentCode, target })
+    emitDashboardRecordsUpdated({
+      reason: 'boldsign_complete_endpoint',
+      roomCode,
+      target,
+      documentCode: completedDocumentCode,
+    })
     return res.json({ ok: true })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to mark Form 8821 complete.' })
