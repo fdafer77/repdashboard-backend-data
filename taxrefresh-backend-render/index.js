@@ -2734,18 +2734,12 @@ async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = 
   if (!isValidEmailAddress(clientEmail)) throw new Error('A valid client email is required before releasing the spouse signature email.')
   if (!isValidEmailAddress(spouseRecipientEmail)) throw new Error('A valid spouse email is required before releasing the spouse signature email.')
 
-  let contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
-  if (!contactId) {
-    const created = await createGhlContactForEmail({ email: clientEmail, name: clientName, phone })
-    contactId = String(created?.id || '').trim()
-    if (!contactId) throw new Error('A CRM contact id is required before emailing the spouse document.')
-    room.contactId = contactId
-    answers.ghl_contact_id = contactId
-    answers.ghl_contact_created_at = answers.ghl_contact_created_at || new Date().toISOString()
-  }
-  if (!spouseUsesClientEmail) {
-    await ensureGhlContactEmail({ contactId, email: clientEmail, name: clientName, phone })
-  }
+  const priorContactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
+  const contactId = await resolveGhlContactIdForEmail({ contactId: priorContactId, email: clientEmail, name: clientName, phone })
+  if (!contactId) throw new Error('A CRM contact id is required before emailing the spouse document.')
+  if (room) room.contactId = contactId
+  answers.ghl_contact_id = contactId
+  answers.ghl_contact_created_at = answers.ghl_contact_created_at || new Date().toISOString()
 
   const backendBase = String(getBackendBaseUrl() || '').trim().replace(/\/+$/, '')
   const spouseReturnUrl = backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=spouse` : ''
@@ -3138,7 +3132,21 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
   const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
   const spouseEmail = getStoredBoldsignSpouseSignerEmail(answers, { clientEmail })
-  const target = matchedTarget || (signerEmail && spouseEmail && signerEmail === spouseEmail ? 'spouse' : 'client')
+  const actorId = String(eventPayload?.context?.actor?.id || '').trim()
+  const signerDetails = Array.isArray(data?.signerDetails)
+    ? data.signerDetails
+    : Array.isArray(document?.signerDetails)
+      ? document.signerDetails
+      : []
+  let signerOrder = Number(data?.signer?.order || data?.signer?.signerOrder || 0)
+  if (!signerOrder && actorId && signerDetails.length) {
+    const actorMatch = signerDetails.find((entry) => String(entry?.id || '').trim() === actorId)
+    signerOrder = Number(actorMatch?.order || 0)
+  }
+  const isMfj = isMarriedJointFilingAnswers(answers)
+  const target =
+    matchedTarget ||
+    (isMfj && signerOrder >= 2 ? 'spouse' : signerEmail && spouseEmail && spouseEmail !== clientEmail && signerEmail === spouseEmail ? 'spouse' : 'client')
   const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
   answers.current_8821_document_code = answers.current_8821_document_code || resolvedDocumentCode
   answers.active_8821_document_code = answers.active_8821_document_code || resolvedDocumentCode
@@ -4453,9 +4461,43 @@ async function findGhlDuplicateContactByEmail(email = '') {
       email: normalizedEmail,
     },
   })
-  const contact = data?.contact || data?.duplicateContact || data?.duplicate || data || null
+  const contact =
+    data?.contact ||
+    data?.duplicateContact ||
+    data?.duplicate ||
+    (Array.isArray(data?.contacts) ? data.contacts[0] : null) ||
+    data ||
+    null
   const id = String(contact?.id || contact?._id || '').trim()
   return id ? { id, contact } : null
+}
+
+function isGhlDuplicateContactError(error) {
+  const message = String(error?.message || error?.error || '').toLowerCase()
+  return message.includes('duplicated contacts') || message.includes('duplicate contact')
+}
+
+async function resolveGhlContactIdForEmail({ contactId = '', email = '', name = '', phone = '' } = {}) {
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+  if (!isValidEmailAddress(normalizedEmail)) throw new Error('A valid email is required to resolve the CRM contact.')
+
+  let resolvedContactId = String(contactId || '').trim()
+  if (!resolvedContactId) {
+    const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+    if (duplicate?.id) return String(duplicate.id)
+    const created = await createGhlContactForEmail({ email: normalizedEmail, name, phone })
+    return String(created?.id || '').trim()
+  }
+
+  try {
+    await ensureGhlContactEmail({ contactId: resolvedContactId, email: normalizedEmail, name, phone })
+    return resolvedContactId
+  } catch (error) {
+    if (!isGhlDuplicateContactError(error)) throw error
+    const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+    if (duplicate?.id) return String(duplicate.id)
+    throw error
+  }
 }
 
 async function createGhlContactForEmail({ email = '', name = '', phone = '' } = {}) {
@@ -7498,20 +7540,17 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     let links = buildExternalDocumentLinks(roomCode, room, baseUrl)
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
     const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
-    let contactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
-    if (!contactId) {
-      const created = await createGhlContactForEmail({ email: resolvedRecipientEmail, name: clientName, phone })
-      contactId = created.id
-      room.contactId = contactId
-      room.state.answers.ghl_contact_id = contactId
-      room.state.answers.ghl_contact_created_at = new Date().toISOString()
-      try {
-        await dbUpsertSession({ code: roomCode, contactId, state: room.state })
-      } catch {
-        // ignore; state still updates in-memory
-      }
+    const priorContactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
+    const contactId = await resolveGhlContactIdForEmail({ contactId: priorContactId, email: resolvedRecipientEmail, name: clientName, phone })
+    if (!contactId) throw new Error('A CRM contact id is required before emailing this document.')
+    room.contactId = contactId
+    room.state.answers.ghl_contact_id = contactId
+    room.state.answers.ghl_contact_created_at = room.state.answers.ghl_contact_created_at || new Date().toISOString()
+    try {
+      await dbUpsertSession({ code: roomCode, contactId, state: room.state })
+    } catch {
+      // ignore; state still updates in-memory
     }
-    await ensureGhlContactEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
 
     const documentEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
     const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
