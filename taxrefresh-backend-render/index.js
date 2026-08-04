@@ -1254,10 +1254,7 @@ async function refreshSigned8821FirstPageStoredPdf(roomCode, room) {
 
 function get8821PdfValues(answers = {}) {
   const fullName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || '').trim()
-  const spouseFullName = String(
-    getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) ||
-      [getPrimaryAnswer(answers, ['spouseFirstName', 'spouse_first_name']), getPrimaryAnswer(answers, ['spouseLastName', 'spouse_last_name'])].filter(Boolean).join(' '),
-  ).trim()
+  const spouseFullName = getNormalizedSpouseName(answers)
   const street = getPrimaryAnswer(answers, ['street', 'address1', 'address'])
   const apt = getPrimaryAnswer(answers, ['apt', 'address2'])
   const city = getPrimaryAnswer(answers, ['city'])
@@ -1491,9 +1488,7 @@ function getRedPacketRenderContext(answers = {}) {
   const ssn = formatSsnLabel(getPrimaryAnswer(answers, ['ssn']))
   const spouseFirstName = String(getPrimaryAnswer(answers, ['spouseFirstName', 'spouse_first_name']) || '').trim()
   const spouseLastName = String(getPrimaryAnswer(answers, ['spouseLastName', 'spouse_last_name']) || '').trim()
-  const spouseFullName = String(
-    getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || [spouseFirstName, spouseLastName].filter(Boolean).join(' '),
-  ).trim()
+  const spouseFullName = getNormalizedSpouseName(answers)
   const spouseSsn = formatSsnLabel(getPrimaryAnswer(answers, ['spouse_ssn', 'spouseSsn']))
   const spouseDob = formatDobValue(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
   const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || '').trim()
@@ -3595,12 +3590,16 @@ function getStoredBoldsignSpouseSignerEmail(answers = {}, { clientEmail = '' } =
   return resolveBoldsignSignerEmail(getSpouseSignerEmailFromAnswers(answers), { target: 'spouse', primaryEmail: clientEmail })
 }
 
-function getSpouseSignerNameFromAnswers(answers = {}) {
-  const direct = String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || '').trim()
-  if (direct) return direct
+function getNormalizedSpouseName(answers = {}) {
   const first = String(getPrimaryAnswer(answers, ['spouse_first_name', 'spouseFirstName']) || '').trim()
   const last = String(getPrimaryAnswer(answers, ['spouse_last_name', 'spouseLastName']) || '').trim()
-  return [first, last].filter(Boolean).join(' ') || 'Spouse'
+  const combined = [first, last].filter(Boolean).join(' ').trim()
+  if (combined) return combined
+  return String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || '').trim()
+}
+
+function getSpouseSignerNameFromAnswers(answers = {}) {
+  return getNormalizedSpouseName(answers) || 'Spouse'
 }
 
 function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
@@ -8293,7 +8292,7 @@ app.get('/api/session/:code/document-link', async (req, res) => {
       target === 'spouse'
         ? String(
             req.query?.name ||
-              getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) ||
+              getNormalizedSpouseName(answers) ||
               'Spouse',
           ).trim()
         : String(req.query?.name || getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim()
