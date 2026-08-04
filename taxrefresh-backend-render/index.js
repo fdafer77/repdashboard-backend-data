@@ -7551,7 +7551,8 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!canEnrolledAgentAccessItem(item, req.adminUser) && String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
       return res.status(403).json({ error: 'You do not have access to this consultation record.' })
     }
-    if (!hasDirectGhlConfig()) {
+    const requiresCrmEmail = documentType !== '8821 Document'
+    if (requiresCrmEmail && !hasDirectGhlConfig()) {
       return res.status(503).json({ error: 'CRM email sending is not configured.' })
     }
 
@@ -7566,16 +7567,19 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     let links = buildExternalDocumentLinks(roomCode, room, baseUrl)
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
     const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
-    const priorContactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
-    const contactId = await resolveGhlContactIdForEmail({ contactId: priorContactId, email: resolvedRecipientEmail, name: clientName, phone })
-    if (!contactId) throw new Error('A CRM contact id is required before emailing this document.')
-    room.contactId = contactId
-    room.state.answers.ghl_contact_id = contactId
-    room.state.answers.ghl_contact_created_at = room.state.answers.ghl_contact_created_at || new Date().toISOString()
-    try {
-      await dbUpsertSession({ code: roomCode, contactId, state: room.state })
-    } catch {
-      // ignore; state still updates in-memory
+    let contactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
+    if (requiresCrmEmail) {
+      const resolved = await resolveGhlContactIdForEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
+      contactId = String(resolved || '').trim()
+      if (!contactId) throw new Error('A CRM contact id is required before emailing this document.')
+      room.contactId = contactId
+      room.state.answers.ghl_contact_id = contactId
+      room.state.answers.ghl_contact_created_at = room.state.answers.ghl_contact_created_at || new Date().toISOString()
+      try {
+        await dbUpsertSession({ code: roomCode, contactId, state: room.state })
+      } catch {
+        // ignore; state still updates in-memory
+      }
     }
 
     const documentEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
