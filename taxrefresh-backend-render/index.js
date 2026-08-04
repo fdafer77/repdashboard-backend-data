@@ -7729,9 +7729,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!canEnrolledAgentAccessItem(item, req.adminUser) && String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
       return res.status(403).json({ error: 'You do not have access to this consultation record.' })
     }
-    const wantsCustomEmail = documentType === '8821 Document'
-    const requiresCrmEmail = !wantsCustomEmail && documentType !== '8821 Document'
-    if ((requiresCrmEmail || wantsCustomEmail) && !hasDirectGhlConfig()) {
+    const wantsCustomEmail = false
+    const requiresCrmEmail = documentType !== '8821 Document'
+    if (requiresCrmEmail && !hasDirectGhlConfig()) {
       return res.status(503).json({ error: 'CRM email sending is not configured.' })
     }
 
@@ -7747,7 +7747,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || item.clientName || 'Client').trim() || 'Client'
     const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || item.phone || '').trim()
     let contactId = String(room.contactId || answers.ghl_contact_id || item.contactId || '').trim()
-    if (requiresCrmEmail || wantsCustomEmail) {
+    if (requiresCrmEmail) {
       const resolved = await resolveGhlContactIdForEmail({ contactId, email: resolvedRecipientEmail, name: clientName, phone })
       contactId = String(resolved || '').trim()
       if (!contactId) throw new Error('A CRM contact id is required before emailing this document.')
@@ -7797,7 +7797,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.form8821_spouse_release_error = ''
       answers.form8821_spouse_release_attempted_at = ''
       answers.form8821_spouse_released_at = ''
-      answers.boldsign_8821_delivery_mode = 'custom_email'
+      answers.boldsign_8821_delivery_mode = 'boldsign_email'
       answers.form8821_status = 'launching'
 
       // Ensure we create the BoldSign document immediately when the rep clicks
@@ -7833,7 +7833,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         signerEmail: resolvedRecipientEmail,
         returnUrl: clientReturnUrl,
         onBehalfOf: String(req.adminUser?.email || '').trim(),
-        disableEmails: true,
+        disableEmails: false,
         persistDocument: true,
         documentFieldPrefix: 'boldsign_8821',
         forceNewDocument: true,
@@ -7845,15 +7845,6 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         form8821ClientLink: clientSigningUrl,
         form8821SpouseLink: '',
       }
-
-      // Deliver the signature request using the prior custom HTML email template.
-      await sendGhlEmailMessage({
-        contactId,
-        emailTo: resolvedRecipientEmail,
-        subject: 'TaxRefresh Signature Request',
-        message: `Your TaxRefresh Form 8821 and Service Agreement are ready for review and signature: ${clientSigningUrl}`,
-        html: build8821EmailHtml({ clientName, signingLink: clientSigningUrl }),
-      })
 
       nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
       logEntries.push({
@@ -7870,7 +7861,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         name: '8821 Document',
         documentCode,
         status: 'Sent',
-        method: 'Email',
+        method: 'BoldSign Email',
         sentAt,
         recipientEmail: resolvedRecipientEmail,
         sentBy: String(req.adminUser?.email || '').trim(),
