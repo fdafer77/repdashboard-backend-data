@@ -277,7 +277,19 @@ async function fallbackListSessions() {
 }
 
 const app = express()
-app.use(express.json())
+// Capture the raw request body for webhook signature validation (BoldSign/Calendly).
+// Without this, `express.json()` consumes the body and signature checks will fail.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      try {
+        req.rawBody = Buffer.isBuffer(buf) ? buf.toString('utf8') : ''
+      } catch {
+        req.rawBody = ''
+      }
+    },
+  }),
+)
 const configuredOrigins = CLIENT_ORIGIN === '*' ? [] : CLIENT_ORIGIN.split(',').map((v) => v.trim()).filter(Boolean)
 function isAllowedCorsOrigin(origin = '') {
   if (!origin) return true
@@ -392,7 +404,14 @@ app.get('/api/address-place-details', async (req, res) => {
 })
 
 app.post('/webhooks/calendly', express.raw({ type: 'application/json' }), async (req, res) => {
-  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
+  const rawBody =
+    typeof req.rawBody === 'string' && req.rawBody
+      ? req.rawBody
+      : Buffer.isBuffer(req.body)
+        ? req.body.toString('utf8')
+        : typeof req.body === 'string'
+          ? req.body
+          : ''
   let payload = {}
   try {
     payload = rawBody ? JSON.parse(rawBody) : {}
@@ -411,7 +430,14 @@ app.post('/webhooks/calendly', express.raw({ type: 'application/json' }), async 
 })
 
 app.post('/webhooks/boldsign', express.raw({ type: 'application/json' }), async (req, res) => {
-  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : typeof req.body === 'string' ? req.body : ''
+  const rawBody =
+    typeof req.rawBody === 'string' && req.rawBody
+      ? req.rawBody
+      : Buffer.isBuffer(req.body)
+        ? req.body.toString('utf8')
+        : typeof req.body === 'string'
+          ? req.body
+          : ''
   let payload = {}
   try {
     payload = rawBody ? JSON.parse(rawBody) : {}
