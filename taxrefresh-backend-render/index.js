@@ -2564,10 +2564,19 @@ async function sendGhlSmsMessage({ contactId, phoneNumber, message }) {
   })
 }
 
+function buildStoredDocumentReceiptKey(receipt = {}) {
+  const name = String(receipt?.name || '').trim().toLowerCase()
+  const documentCode = String(receipt?.documentCode || '').trim().toLowerCase()
+  const recipientEmail = String(receipt?.recipientEmail || '').trim().toLowerCase()
+  const sentAt = String(receipt?.sentAt || '').trim().toLowerCase()
+  return [name || 'document', documentCode || 'no-document-code', recipientEmail || 'no-recipient', sentAt || 'no-time'].join('__')
+}
+
 function upsertDocumentReceipts(existingReceipts, nextReceipts) {
   const current = Array.isArray(existingReceipts) ? existingReceipts : parseStoredObject(existingReceipts, [])
   const currentList = Array.isArray(current) ? current : []
-  const remaining = currentList.filter((entry) => !nextReceipts.some((next) => next?.name === entry?.name))
+  const nextKeys = new Set((Array.isArray(nextReceipts) ? nextReceipts : []).map((entry) => buildStoredDocumentReceiptKey(entry)))
+  const remaining = currentList.filter((entry) => !nextKeys.has(buildStoredDocumentReceiptKey(entry)))
   return [...nextReceipts, ...remaining]
 }
 
