@@ -3013,6 +3013,13 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
 
   const normalizedTarget = String(target || 'client').trim().toLowerCase() === 'spouse' ? 'spouse' : 'client'
   if (normalizedTarget === 'spouse') {
+    // In MFJ signing-order flows, the spouse cannot complete unless the client
+    // has already completed signer order 1. Backfill the client-complete state
+    // here so the overall packet still resolves to fully signed even if the
+    // earlier client completion callback/webhook was missed.
+    if (isMarriedJointFilingAnswers(room.state.answers)) {
+      room.state.answers.form8821_status = 'completed'
+    }
     room.state.answers.form8821_spouse_status = 'completed'
   } else {
     room.state.answers.form8821_status = 'completed'
