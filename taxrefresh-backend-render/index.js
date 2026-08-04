@@ -2399,31 +2399,18 @@ async function sendGhlEmailMessage({ contactId, emailTo, subject, html, message 
   const normalizedEmail = String(emailTo || '').trim()
   if (!normalizedContactId) throw new Error('A CRM contact id is required before emailing this document.')
   if (!isValidEmailAddress(normalizedEmail)) throw new Error('A valid recipient email is required.')
-  const baseBody = {
-    type: 'Email',
-    contactId: normalizedContactId,
-    subject: String(subject || '').trim(),
-    html: String(html || '').trim(),
-    message: String(message || '').trim(),
-    status: 'delivered',
-  }
-  try {
-    return await ghlFetch('conversations/messages', {
-      method: 'POST',
-      version: '2021-04-15',
-      body: {
-        ...baseBody,
-        emailTo: normalizedEmail,
-      },
-    })
-  } catch (error) {
-    if (!isGhlDuplicateContactError(error)) throw error
-    return ghlFetch('conversations/messages', {
-      method: 'POST',
-      version: '2021-04-15',
-      body: baseBody,
-    })
-  }
+  return ghlFetch('conversations/messages', {
+    method: 'POST',
+    version: '2021-04-15',
+    body: {
+      type: 'Email',
+      contactId: normalizedContactId,
+      subject: String(subject || '').trim(),
+      html: String(html || '').trim(),
+      message: String(message || '').trim(),
+      status: 'delivered',
+    },
+  })
 }
 
 function normalizePhoneForSms(value = '') {
@@ -4613,6 +4600,9 @@ async function resolveGhlContactIdForEmail({ contactId = '', email = '', name = 
     const created = await createGhlContactForEmail({ email: normalizedEmail, name, phone })
     return String(created?.id || '').trim()
   }
+
+  const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+  if (duplicate?.id) return String(duplicate.id)
 
   // For messaging, an existing contact id is enough. Do not try to overwrite the
   // contact's email here because locations with duplicate protection enabled can
