@@ -3000,17 +3000,21 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     isMarriedJointFilingAnswers(room.state.answers) &&
     String(room.state.answers.form8821_spouse_status || '').trim().toLowerCase() !== 'completed'
   ) {
-    room.state.answers.form8821_spouse_release_attempted_at = new Date().toISOString()
-    try {
-      await releasePendingMfj8821SpouseEmail({
-        roomCode,
-        room,
-        senderEmail: String(room.state.answers.boldsign_8821_sender_email || '').trim(),
-      })
-    } catch (error) {
-      room.state.answers.form8821_spouse_status = 'release_failed'
-      room.state.answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
-      console.error('MFJ spouse signing release failed:', error)
+    if (String(room.state.answers.boldsign_8821_delivery_mode || '').trim().toLowerCase() === 'boldsign_email') {
+      room.state.answers.form8821_spouse_status = 'launching'
+    } else {
+      room.state.answers.form8821_spouse_release_attempted_at = new Date().toISOString()
+      try {
+        await releasePendingMfj8821SpouseEmail({
+          roomCode,
+          room,
+          senderEmail: String(room.state.answers.boldsign_8821_sender_email || '').trim(),
+        })
+      } catch (error) {
+        room.state.answers.form8821_spouse_status = 'release_failed'
+        room.state.answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
+        console.error('MFJ spouse signing release failed:', error)
+      }
     }
   }
 
@@ -3627,6 +3631,7 @@ async function createBoldsign8821SigningLink({
   signerEmail,
   returnUrl = '',
   onBehalfOf = '',
+  disableEmails = true,
   persistDocument = true,
   documentFieldPrefix = 'boldsign_8821',
   spouseSignerEmail = '',
@@ -3702,7 +3707,7 @@ async function createBoldsign8821SigningLink({
             Message: '',
             ...(selectedBrandId ? { BrandId: selectedBrandId } : {}),
             ...(hideDocumentId ? { HideDocumentId: true } : {}),
-            DisableEmails: true,
+            DisableEmails: disableEmails,
             EnableEmbeddedSigning: true,
             EnableSigningOrder: isMarriedJoint,
             ...(isMarriedJoint
@@ -3751,7 +3756,7 @@ async function createBoldsign8821SigningLink({
               Message: '',
               ...(selectedBrandId ? { BrandId: selectedBrandId } : {}),
               ...(hideDocumentId ? { HideDocumentId: true } : {}),
-              DisableEmails: true,
+              DisableEmails: disableEmails,
               AutoDetectFields: true,
               EnableEmbeddedSigning: true,
               UseTextTags: false,
@@ -7609,6 +7614,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.form8821_spouse_release_error = ''
       answers.form8821_spouse_release_attempted_at = ''
       answers.form8821_spouse_released_at = ''
+      answers.boldsign_8821_delivery_mode = 'boldsign_email'
       answers.form8821_status = 'launching'
 
       // Ensure we create the BoldSign document immediately when the rep clicks
@@ -7644,40 +7650,25 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         signerEmail: resolvedRecipientEmail,
         returnUrl: clientReturnUrl,
         onBehalfOf: String(req.adminUser?.email || '').trim(),
+        disableEmails: false,
         persistDocument: true,
         documentFieldPrefix: 'boldsign_8821',
         forceNewDocument: true,
       })
 
       const clientSigningUrl = String(created?.signingUrl || '').trim()
-      if (!clientSigningUrl) {
-        return res.status(500).json({ error: 'Unable to create a secure signing link for this document.' })
-      }
-
       links = {
         ...links,
         form8821ClientLink: clientSigningUrl,
         form8821SpouseLink: '',
       }
-      await sendGhlEmailMessage({
-        contactId,
-        emailTo: resolvedRecipientEmail,
-        subject: 'TaxRefresh Signature Request',
-        message: isMarriedJoint
-          ? `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}\nOnce your signature is complete, the spouse email will be released automatically.`
-          : `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
-        html: build8821EmailHtml({
-          clientName,
-          signingLink: links.form8821ClientLink,
-        }),
-      })
       nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_client`,
         documentType: '8821 Document',
         documentCode,
         recipientEmail: resolvedRecipientEmail,
-        link: links.form8821ClientLink,
+        link: links.form8821ClientLink || '',
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
@@ -7686,7 +7677,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         name: '8821 Document',
         documentCode,
         status: 'Sent',
-        method: 'Email',
+        method: 'BoldSign Email',
         sentAt,
         recipientEmail: resolvedRecipientEmail,
         sentBy: String(req.adminUser?.email || '').trim(),
