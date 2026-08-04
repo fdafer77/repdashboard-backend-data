@@ -4614,19 +4614,9 @@ async function resolveGhlContactIdForEmail({ contactId = '', email = '', name = 
     return String(created?.id || '').trim()
   }
 
-  // IMPORTANT: For messaging we only need a valid contactId. Forcing the contact email to match
-  // can trip the "no duplicate contacts" rule if that email already belongs to another contact.
-  // So we keep this best-effort and never block document delivery on it.
-  try {
-    await ensureGhlContactEmail({ contactId: resolvedContactId, email: normalizedEmail, name, phone })
-  } catch (error) {
-    if (isGhlDuplicateContactError(error)) {
-      const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
-      if (duplicate?.id) return String(duplicate.id)
-      return resolvedContactId
-    }
-    return resolvedContactId
-  }
+  // For messaging, an existing contact id is enough. Do not try to overwrite the
+  // contact's email here because locations with duplicate protection enabled can
+  // reject the update even though the existing contact is valid for sending.
   return resolvedContactId
 }
 
