@@ -8372,6 +8372,7 @@ function buildConsultationAnalytics(items = [], account = null) {
   const accessibleItems = String(account?.designatedPosition || '').trim() === 'Enrolled Agent'
     ? items.filter((item) => canEnrolledAgentAccessItem(item, account))
     : items
+  const analyticsItems = accessibleItems.filter((item) => !isTrainingLeadItem(item))
 
   const monthlyRevenue = new Map()
   const pipelineBuckets = new Map()
@@ -8384,7 +8385,7 @@ function buildConsultationAnalytics(items = [], account = null) {
   let openTasks = 0
   let documentsUploaded = 0
 
-  const topOpportunities = accessibleItems
+  const topOpportunities = analyticsItems
     .map((item) => {
       const answers = item?.answers || {}
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
@@ -8471,17 +8472,17 @@ function buildConsultationAnalytics(items = [], account = null) {
     })
     .sort((a, b) => b.opportunityValue - a.opportunityValue)
 
-  const activeClients = accessibleItems.filter((item) => getLifecycleLabel(item) === 'Active Client').length
-  const activeProspects = accessibleItems.filter((item) => getLifecycleLabel(item) === 'Active Prospect').length
-  const pendingEaReview = accessibleItems.filter((item) => String(item.eaCaseStatus || '').trim() === 'Pending EA Review').length
-  const sentToEa = accessibleItems.filter((item) => isEnrolledAgentHandoffSent(item.readyForEnrolledAgent)).length
-  const averageLiability = accessibleItems.length
-    ? accessibleItems.reduce((sum, item) => sum + Number(item.liability || 0), 0) / accessibleItems.length
+  const activeClients = analyticsItems.filter((item) => getLifecycleLabel(item) === 'Active Client').length
+  const activeProspects = analyticsItems.filter((item) => getLifecycleLabel(item) === 'Active Prospect').length
+  const pendingEaReview = analyticsItems.filter((item) => String(item.eaCaseStatus || '').trim() === 'Pending EA Review').length
+  const sentToEa = analyticsItems.filter((item) => isEnrolledAgentHandoffSent(item.readyForEnrolledAgent)).length
+  const averageLiability = analyticsItems.length
+    ? analyticsItems.reduce((sum, item) => sum + Number(item.liability || 0), 0) / analyticsItems.length
     : 0
 
   return {
     overview: {
-      totalRecords: accessibleItems.length,
+      totalRecords: analyticsItems.length,
       activeClients,
       activeProspects,
       sentToEa,
