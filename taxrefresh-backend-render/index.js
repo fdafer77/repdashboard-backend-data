@@ -3477,6 +3477,47 @@ async function boldsignDownloadDocument(documentId, { onBehalfOf } = {}) {
   }
 }
 
+async function getBoldsignDocumentProperties(documentId, { onBehalfOf } = {}) {
+  const normalizedDocumentId = String(documentId || '').trim()
+  if (!normalizedDocumentId) throw new Error('A BoldSign document id is required.')
+  return boldsignFetch('v1/document/properties', {
+    query: {
+      documentId: normalizedDocumentId,
+      ...(onBehalfOf ? { onBehalfOf: String(onBehalfOf).trim() } : {}),
+    },
+  })
+}
+
+async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
+  const roomState = state || initialRoomState()
+  const answers = roomState.answers || {}
+  const documentId = String(answers.boldsign_8821_document_id || '').trim()
+  if (!documentId) return false
+  if (isForm8821FullySigned(answers)) return false
+
+  try {
+    const properties = await getBoldsignDocumentProperties(documentId)
+    const status = String(properties?.status || '').trim().toLowerCase()
+    if (status !== 'completed') return false
+
+    answers.form8821_status = 'completed'
+    if (isMarriedJointFilingAnswers(answers)) {
+      answers.form8821_spouse_status = 'completed'
+    }
+    answers.onboarding_status = 'documents_signed'
+    answers.completed_at = answers.completed_at || new Date().toISOString()
+    answers.boldsign_8821_signed_at = answers.boldsign_8821_signed_at || new Date().toISOString()
+    markSigned8821DeliveryEntries(answers, answers.boldsign_8821_signed_at, getActive8821DocumentCode(answers))
+    roomState.answers = answers
+    await persist(roomState)
+    emitDashboardRecordsUpdated({ reason: 'boldsign_reconciled_completed', roomCode, documentCode: getActive8821DocumentCode(answers) })
+    return true
+  } catch (error) {
+    console.error('Failed to reconcile BoldSign 8821 status:', error)
+    return false
+  }
+}
+
 async function loadBoldsign8821PdfDataUri() {
   const { pdfPath } = getBoldsignConfig()
   const resolvedPath =
@@ -6792,6 +6833,14 @@ async function getConsultationRecordByCode(code) {
   if (!normalized) return null
   const row = await dbGetSession(normalized)
   if (row) {
+    await reconcileBoldsign8821Status({
+      roomCode: row.session_code,
+      state: row.state,
+      persist: async (nextState) => {
+        row.state = nextState
+        await dbUpsertSession({ code: row.session_code, state: nextState })
+      },
+    })
     return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -6803,6 +6852,14 @@ async function getConsultationRecordByCode(code) {
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
   if (!room) return null
+  await reconcileBoldsign8821Status({
+    roomCode: normalized,
+    state: room.state,
+    persist: async (nextState) => {
+      room.state = nextState
+      await dbUpsertSession({ code: normalized, state: nextState })
+    },
+  })
   return attachSmsThreadToConsultationDetail(buildConsultationDetail({
     sessionCode: normalized,
     contactId: room.contactId,
