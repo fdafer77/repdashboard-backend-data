@@ -4483,21 +4483,27 @@ async function resolveGhlContactIdForEmail({ contactId = '', email = '', name = 
 
   let resolvedContactId = String(contactId || '').trim()
   if (!resolvedContactId) {
+    // First try to reuse an existing contact for this email (works when duplicates are disabled).
     const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
     if (duplicate?.id) return String(duplicate.id)
     const created = await createGhlContactForEmail({ email: normalizedEmail, name, phone })
     return String(created?.id || '').trim()
   }
 
+  // IMPORTANT: For messaging we only need a valid contactId. Forcing the contact email to match
+  // can trip the "no duplicate contacts" rule if that email already belongs to another contact.
+  // So we keep this best-effort and never block document delivery on it.
   try {
     await ensureGhlContactEmail({ contactId: resolvedContactId, email: normalizedEmail, name, phone })
-    return resolvedContactId
   } catch (error) {
-    if (!isGhlDuplicateContactError(error)) throw error
-    const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
-    if (duplicate?.id) return String(duplicate.id)
-    throw error
+    if (isGhlDuplicateContactError(error)) {
+      const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+      if (duplicate?.id) return String(duplicate.id)
+      return resolvedContactId
+    }
+    return resolvedContactId
   }
+  return resolvedContactId
 }
 
 async function createGhlContactForEmail({ email = '', name = '', phone = '' } = {}) {
@@ -4519,8 +4525,11 @@ async function createGhlContactForEmail({ email = '', name = '', phone = '' } = 
     if (!id) throw new Error('CRM contact creation failed to return an id.')
     return { id, contact }
   } catch (error) {
-    const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
-    if (duplicate?.id) return duplicate
+    if (isGhlDuplicateContactError(error)) {
+      // If this location disallows duplicates, reuse existing contact instead of failing.
+      const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+      if (duplicate?.id) return duplicate
+    }
     throw error
   }
 }
