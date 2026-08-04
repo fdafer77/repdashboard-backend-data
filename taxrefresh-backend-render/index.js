@@ -4578,6 +4578,7 @@ function buildConsultationSummary(record) {
   const clientName = getPrimaryAnswer(answers, ['full_name', 'name']) || 'Unnamed client'
   const email = getPrimaryAnswer(answers, ['email', 'email_address'])
   const phone = getPrimaryAnswer(answers, ['phone', 'phone_number'])
+  const clientState = String(getPrimaryAnswer(answers, ['mailing_state', 'mailingState', 'state', 'stateCode', 'expenseState']) || '').trim()
   const liability = Math.max(0, irsBalance + stateBalance, directLiability)
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
@@ -4602,6 +4603,7 @@ function buildConsultationSummary(record) {
     clientName,
     email,
     phone,
+    clientState,
     claimedByName: String(answers.claimed_by_name || ''),
     claimedByEmail: String(answers.claimed_by_email || ''),
     assignedEaName: String(answers.assigned_ea_name || ''),
@@ -6713,6 +6715,7 @@ app.post('/api/admin/consultations/:code/appointments/internal', async (req, res
     const startAt = String(req.body?.startAt || '').trim()
     const endAt = String(req.body?.endAt || '').trim()
     const notes = String(req.body?.notes || '').trim()
+    const assignedTo = String(req.body?.assignedTo || '').trim()
     if (!startAt || !endAt) return res.status(400).json({ error: 'Start and end time are required.' })
     if (Number.isNaN(new Date(startAt).getTime()) || Number.isNaN(new Date(endAt).getTime())) {
       return res.status(400).json({ error: 'Start and end time must be valid date values.' })
@@ -6733,7 +6736,7 @@ app.post('/api/admin/consultations/:code/appointments/internal', async (req, res
       endAt,
       notes,
       calendarName: 'Dashboard',
-      assignedTo: String(currentItem.claimedByName || currentItem.assignedEaName || currentItem.assignedTo || req.adminUser?.displayName || '').trim(),
+      assignedTo: assignedTo || String(currentItem.claimedByName || currentItem.assignedEaName || currentItem.assignedTo || req.adminUser?.displayName || '').trim(),
       createdByName: String(req.adminUser?.displayName || '').trim(),
       createdByEmail: String(req.adminUser?.email || '').trim(),
       updatedAt: new Date().toISOString(),
@@ -6781,6 +6784,7 @@ app.patch('/api/admin/consultations/:code/appointments/internal/:appointmentId',
     const endAt = req.body?.endAt === undefined ? currentAppointment.endAt : String(req.body?.endAt || '').trim()
     const notes = req.body?.notes === undefined ? currentAppointment.notes : String(req.body?.notes || '').trim()
     const status = req.body?.status === undefined ? currentAppointment.status : String(req.body?.status || '').trim() || currentAppointment.status
+    const assignedTo = req.body?.assignedTo === undefined ? currentAppointment.assignedTo : String(req.body?.assignedTo || '').trim()
     if (!startAt || !endAt) return res.status(400).json({ error: 'Start and end time are required.' })
     if (Number.isNaN(new Date(startAt).getTime()) || Number.isNaN(new Date(endAt).getTime())) {
       return res.status(400).json({ error: 'Start and end time must be valid date values.' })
@@ -6797,6 +6801,7 @@ app.patch('/api/admin/consultations/:code/appointments/internal/:appointmentId',
       endAt,
       notes,
       status,
+      assignedTo,
       updatedAt: new Date().toISOString(),
       canceledAt: status === 'canceled' ? new Date().toISOString() : '',
     }
