@@ -1497,6 +1497,7 @@ function getRedPacketRenderContext(answers = {}) {
   const spouseSsn = formatSsnLabel(getPrimaryAnswer(answers, ['spouse_ssn', 'spouseSsn']))
   const spouseDob = formatDobValue(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
   const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || '').trim()
+  const spouseMailingAddress = [mailingStreet, mailingCity, mailingState, mailingZip].filter(Boolean).join(', ').replace(', ,', ',')
   const taxTypeValue = String(getPrimaryAnswer(answers, ['taxType']) || '').trim().toLowerCase()
   const taxTypeLabel = taxTypeValue === 'personal' ? 'Personal' : taxTypeValue === 'business' ? 'Business' : taxTypeValue === 'both' ? 'Both' : ''
   const taxAgencyLabel = normalizeTaxAgencyLabel(String(getPrimaryAnswer(answers, ['taxAgency', 'tax_agency']) || getPrimaryAnswer(answers, ['owe']) || '').trim())
@@ -1521,6 +1522,8 @@ function getRedPacketRenderContext(answers = {}) {
   const billingScheduleAmount2Label = String(billingSchedule[1]?.amount || '').trim()
   const billingScheduleDate3Label = formatCurrentDateLabel(billingSchedule[2]?.date || '')
   const billingScheduleAmount3Label = String(billingSchedule[2]?.amount || '').trim()
+  const signatureDates = parseStoredTargetMap(answers['esign_dates_by_target'])
+  const spouseSignatureDateLabel = formatCurrentDateLabel(signatureDates['agreement-spouse-signature'] || '')
   const paymentMethod = (() => {
     const direct = parseStoredObject(answers['billing_payment_method'], null)
     if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct
@@ -1612,6 +1615,8 @@ function getRedPacketRenderContext(answers = {}) {
     spouseSsn,
     spouseDob,
     spousePhone,
+    spouseMailingAddress,
+    spouseSignatureDateLabel,
     businessName: String(getPrimaryAnswer(answers, ['business_name', 'businessName']) || '').trim(),
     businessEin: String(getPrimaryAnswer(answers, ['business_ein', 'businessEin', 'ein']) || '').trim(),
     businessWorkPhone: String(getPrimaryAnswer(answers, ['business_phone', 'business_work_phone', 'businessWorkPhone']) || '').trim(),
@@ -3672,6 +3677,12 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_SSN: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
     Spouse_DOB: isMarriedJoint ? String(context.spouseDob || '').trim() : '',
     Spouse_Phone_Number: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
+    Spouse_mailing_address: isMarriedJoint ? String(context.spouseMailingAddress || '').trim() : '',
+    Spouse_Full_Name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
+    Spouse_SSN2: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
+    Spouse_Phone_Number2: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
+    Spouse_full_name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
+    Spouse_date_signed2: isMarriedJoint ? String(context.spouseSignatureDateLabel || '').trim() : '',
   }
 
   return {
