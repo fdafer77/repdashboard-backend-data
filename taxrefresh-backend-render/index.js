@@ -3682,7 +3682,6 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_SSN2: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
     Spouse_Phone_Number2: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
     Spouse_full_name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
-    Spouse_date_signed2: isMarriedJoint ? String(context.spouseSignatureDateLabel || '').trim() : '',
   }
 
   return {
