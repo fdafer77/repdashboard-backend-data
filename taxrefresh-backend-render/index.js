@@ -2368,19 +2368,31 @@ async function sendGhlEmailMessage({ contactId, emailTo, subject, html, message 
   const normalizedEmail = String(emailTo || '').trim()
   if (!normalizedContactId) throw new Error('A CRM contact id is required before emailing this document.')
   if (!isValidEmailAddress(normalizedEmail)) throw new Error('A valid recipient email is required.')
-  return ghlFetch('conversations/messages', {
-    method: 'POST',
-    version: '2021-04-15',
-    body: {
-      type: 'Email',
-      contactId: normalizedContactId,
-      emailTo: normalizedEmail,
-      subject: String(subject || '').trim(),
-      html: String(html || '').trim(),
-      message: String(message || '').trim(),
-      status: 'delivered',
-    },
-  })
+  const baseBody = {
+    type: 'Email',
+    contactId: normalizedContactId,
+    subject: String(subject || '').trim(),
+    html: String(html || '').trim(),
+    message: String(message || '').trim(),
+    status: 'delivered',
+  }
+  try {
+    return await ghlFetch('conversations/messages', {
+      method: 'POST',
+      version: '2021-04-15',
+      body: {
+        ...baseBody,
+        emailTo: normalizedEmail,
+      },
+    })
+  } catch (error) {
+    if (!isGhlDuplicateContactError(error)) throw error
+    return ghlFetch('conversations/messages', {
+      method: 'POST',
+      version: '2021-04-15',
+      body: baseBody,
+    })
+  }
 }
 
 function normalizePhoneForSms(value = '') {
