@@ -2711,6 +2711,110 @@ function build8821EmailHtml({ clientName, signingLink, secondarySigningLink = ''
 </html>`
 }
 
+async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = '' } = {}) {
+  const answers = room?.state?.answers || {}
+  if (!isMarriedJointFilingAnswers(answers)) return { sent: false, reason: 'not_married_joint' }
+
+  const documentCode = String(answers.active_8821_document_code || answers.current_8821_document_code || '').trim()
+  if (!documentCode) return { sent: false, reason: 'missing_document_code' }
+  if (hasDocumentLifecycleEntry(answers, { name: '8821 Spouse', documentCode })) {
+    return { sent: false, reason: 'already_sent' }
+  }
+  if (String(answers.form8821_status || '').trim().toLowerCase() !== 'completed') {
+    return { sent: false, reason: 'client_not_completed' }
+  }
+
+  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim() || 'Client'
+  const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  const spouseRecipientEmail = String(answers.spouse_email || getSpouseSignerEmailFromAnswers(answers) || '').trim()
+  const spouseName = String(getSpouseSignerNameFromAnswers(answers) || 'Spouse').trim() || 'Spouse'
+  const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || '').trim()
+
+  if (!isValidEmailAddress(clientEmail)) throw new Error('A valid client email is required before releasing the spouse signature email.')
+  if (!isValidEmailAddress(spouseRecipientEmail)) throw new Error('A valid spouse email is required before releasing the spouse signature email.')
+
+  let contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
+  if (!contactId) {
+    const created = await createGhlContactForEmail({ email: clientEmail, name: clientName, phone })
+    contactId = String(created?.id || '').trim()
+    if (!contactId) throw new Error('A CRM contact id is required before emailing the spouse document.')
+    room.contactId = contactId
+    answers.ghl_contact_id = contactId
+    answers.ghl_contact_created_at = answers.ghl_contact_created_at || new Date().toISOString()
+  }
+  await ensureGhlContactEmail({ contactId, email: clientEmail, name: clientName, phone })
+
+  const backendBase = String(getBackendBaseUrl() || '').trim().replace(/\/+$/, '')
+  const spouseReturnUrl = backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=spouse` : ''
+  const created = await createBoldsign8821SigningLink({
+    sessionCode: roomCode,
+    signerName: clientName,
+    signerEmail: clientEmail,
+    spouseSignerName: spouseName,
+    spouseSignerEmail: spouseRecipientEmail,
+    target: 'spouse',
+    returnUrl: spouseReturnUrl,
+    onBehalfOf: String(senderEmail || answers.boldsign_8821_sender_email || '').trim(),
+    persistDocument: false,
+    documentFieldPrefix: 'boldsign_8821',
+  })
+
+  const spouseSigningUrl = String(created?.signingUrl || '').trim()
+  if (!spouseSigningUrl) throw new Error('Unable to create a secure spouse signing link for this document.')
+
+  await sendGhlEmailMessage({
+    contactId,
+    emailTo: spouseRecipientEmail,
+    subject: 'TaxRefresh Signature Request',
+    message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${spouseSigningUrl}`,
+    html: build8821EmailHtml({ clientName: spouseName, signingLink: spouseSigningUrl }),
+  })
+
+  const sentAt = new Date().toISOString()
+  answers.form8821_spouse_status = 'launching'
+  answers.form8821_spouse_release_error = ''
+  answers.form8821_spouse_release_attempted_at = sentAt
+  answers.form8821_spouse_released_at = sentAt
+  answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
+    {
+      name: '8821 Spouse',
+      documentCode,
+      status: 'Sent',
+      method: 'Email',
+      sentAt,
+      recipientEmail: spouseRecipientEmail,
+      sentBy: String(senderEmail || answers.boldsign_8821_sender_email || 'System').trim() || 'System',
+    },
+  ])
+  const nextEmailLog = Array.isArray(answers.document_email_log) ? answers.document_email_log : parseStoredObject(answers.document_email_log, [])
+  answers.document_email_log = [
+    {
+      id: `doc_email_${Date.now().toString(36)}_spouse`,
+      documentType: '8821 Spouse',
+      documentCode,
+      recipientEmail: spouseRecipientEmail,
+      link: spouseSigningUrl,
+      sentAt,
+      sentBy: String(senderEmail || answers.boldsign_8821_sender_email || '').trim(),
+    },
+    ...nextEmailLog,
+  ]
+  appendDocumentDeliveryLogEntry(answers, {
+    id: `doc_delivery_${Date.now().toString(36)}_spouse`,
+    name: '8821 Spouse',
+    documentCode,
+    status: 'Sent',
+    method: 'Email',
+    sentAt,
+    recipientEmail: spouseRecipientEmail,
+    sentBy: String(senderEmail || answers.boldsign_8821_sender_email || 'System').trim() || 'System',
+  })
+  const hiddenReceiptNames = parseStoredObject(answers.hidden_document_receipt_names, []).filter((name) => typeof name === 'string' && name.trim())
+  answers.hidden_document_receipt_names = hiddenReceiptNames.filter((name) => String(name || '').trim() !== '8821 Spouse')
+
+  return { sent: true, signingUrl: spouseSigningUrl, recipientEmail: spouseRecipientEmail, sentAt, documentCode }
+}
+
 function buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }) {
   const safeName = escapeHtml(getClientFirstName(clientName))
   const safeLink = String(downloadLink || '').trim()
@@ -2879,6 +2983,25 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     room.state.answers.form8821_status = 'completed'
     if (!isMarriedJointFilingAnswers(room.state.answers)) {
       room.state.answers.form8821_spouse_status = room.state.answers.form8821_spouse_status || 'not_required'
+    }
+  }
+
+  if (
+    normalizedTarget === 'client' &&
+    isMarriedJointFilingAnswers(room.state.answers) &&
+    String(room.state.answers.form8821_spouse_status || '').trim().toLowerCase() !== 'completed'
+  ) {
+    room.state.answers.form8821_spouse_release_attempted_at = new Date().toISOString()
+    try {
+      await releasePendingMfj8821SpouseEmail({
+        roomCode,
+        room,
+        senderEmail: String(room.state.answers.boldsign_8821_sender_email || '').trim(),
+      })
+    } catch (error) {
+      room.state.answers.form8821_spouse_status = 'release_failed'
+      room.state.answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
+      console.error('MFJ spouse signing release failed:', error)
     }
   }
 
@@ -3562,7 +3685,7 @@ async function createBoldsign8821SigningLink({
             ...(hideDocumentId ? { HideDocumentId: true } : {}),
             DisableEmails: true,
             EnableEmbeddedSigning: true,
-            EnableSigningOrder: false,
+            EnableSigningOrder: isMarriedJoint,
             ...(isMarriedJoint
               ? {
                   Roles: [
@@ -3570,6 +3693,7 @@ async function createBoldsign8821SigningLink({
                       RoleIndex: 1,
                       SignerName: resolvedSignerName,
                       SignerEmail: resolvedSignerEmail,
+                      SignerOrder: 1,
                       SignerType: 'Signer',
                       Locale: 'EN',
                       ExistingFormFields: existingClientFormFields,
@@ -3578,6 +3702,7 @@ async function createBoldsign8821SigningLink({
                       RoleIndex: 2,
                       SignerName: spouseName || 'Spouse',
                       SignerEmail: spouseSignerEmailForBoldsign,
+                      SignerOrder: 2,
                       SignerType: 'Signer',
                       Locale: 'EN',
                       ExistingFormFields: existingSpouseFormFields,
@@ -7400,6 +7525,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       answers.signed_8821_client_email_sending_at = ''
       answers.signed_8821_render_version = ''
       answers.signed_8821_first_page_render_version = ''
+      answers.form8821_spouse_release_error = ''
+      answers.form8821_spouse_release_attempted_at = ''
+      answers.form8821_spouse_released_at = ''
       answers.form8821_status = 'launching'
 
       // Ensure we create the BoldSign document immediately when the rep clicks
@@ -7413,13 +7541,18 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         : ''
 
       const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+      const boldsignConfig = getBoldsignConfig()
+      const mfjTemplateId = String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
       if (isMarriedJoint) {
         if (!isValidEmailAddress(spouseRecipientEmail)) {
           return res.status(400).json({ error: 'Spouse email is required for married filing jointly.' })
         }
+        if (!mfjTemplateId) {
+          return res.status(503).json({ error: 'The married filing jointly BoldSign template is not configured yet.' })
+        }
         // Store spouse email so template sending can attach spouse as RoleIndex 2.
         answers.spouse_email = spouseRecipientEmail
-        answers.form8821_spouse_status = 'launching'
+        answers.form8821_spouse_status = 'awaiting_client_signature'
       } else {
         answers.form8821_spouse_status = 'not_required'
       }
@@ -7440,35 +7573,21 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         return res.status(500).json({ error: 'Unable to create a secure signing link for this document.' })
       }
 
-      let spouseSigningUrl = ''
-      if (isMarriedJoint) {
-        spouseSigningUrl = await getBoldsignEmbeddedSignLink({
-          documentId: String(created?.documentId || '').trim(),
-          signerEmail: String(created?.spouseSignerEmail || getStoredBoldsignSpouseSignerEmail(answers, { clientEmail: resolvedRecipientEmail }) || spouseRecipientEmail).trim(),
-          redirectUrl: spouseReturnUrl || clientReturnUrl,
-        })
-      }
-
       links = {
         ...links,
         form8821ClientLink: clientSigningUrl,
-        form8821SpouseLink: spouseSigningUrl,
+        form8821SpouseLink: '',
       }
-      const spouseSharesClientEmail =
-        Boolean(spouseRecipientEmail) &&
-        String(spouseRecipientEmail || '').trim().toLowerCase() === String(resolvedRecipientEmail || '').trim().toLowerCase()
       await sendGhlEmailMessage({
         contactId,
         emailTo: resolvedRecipientEmail,
         subject: 'TaxRefresh Signature Request',
-        message: spouseSharesClientEmail && links.form8821SpouseLink
-          ? `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}\nThen sign the spouse portion here: ${links.form8821SpouseLink}`
+        message: isMarriedJoint
+          ? `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}\nOnce your signature is complete, the spouse email will be released automatically.`
           : `Open and sign your TaxRefresh Form 8821: ${links.form8821ClientLink}`,
         html: build8821EmailHtml({
           clientName,
           signingLink: links.form8821ClientLink,
-          secondarySigningLink: spouseSharesClientEmail ? links.form8821SpouseLink : '',
-          secondaryLabel: 'Open spouse signature',
         }),
       })
       nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
@@ -7491,41 +7610,6 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         recipientEmail: resolvedRecipientEmail,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
-
-      if (isMarriedJointFilingAnswers(answers) && spouseRecipientEmail) {
-        if (!links.form8821SpouseLink) {
-          return res.status(500).json({ error: 'Unable to create a secure spouse signing link for this document.' })
-        }
-        if (!spouseSharesClientEmail) {
-          await sendGhlEmailMessage({
-            contactId,
-            emailTo: spouseRecipientEmail,
-            subject: 'TaxRefresh Signature Request',
-            message: `Open and sign the spouse portion of TaxRefresh Form 8821: ${links.form8821SpouseLink}`,
-            html: build8821EmailHtml({ clientName: String(getPrimaryAnswer(answers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || 'Spouse'), signingLink: links.form8821SpouseLink }),
-          })
-        }
-        nextReceipts.push({ name: '8821 Spouse', documentCode, status: 'Sent' })
-        logEntries.push({
-          id: `doc_email_${Date.now().toString(36)}_spouse`,
-          documentType: '8821 Spouse',
-          documentCode,
-          recipientEmail: spouseRecipientEmail,
-          link: links.form8821SpouseLink,
-          sentAt,
-          sentBy: String(req.adminUser?.email || '').trim(),
-        })
-        deliveryEntries.push({
-          id: `doc_delivery_${Date.now().toString(36)}_spouse`,
-          name: '8821 Spouse',
-          documentCode,
-          status: 'Sent',
-          method: 'Email',
-          sentAt,
-          recipientEmail: spouseRecipientEmail,
-          sentBy: String(req.adminUser?.email || '').trim(),
-        })
-      }
 
       answers.onboarding_status = 'documents_ready_for_signature'
     } else {
@@ -7615,6 +7699,93 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
   }
 })
 
+app.post('/api/admin/consultations/:code/release-spouse-document-email', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
+
+    const room = await ensureRoom(roomCode)
+    const item = await getConsultationRecordByCode(roomCode)
+    if (!item) return res.status(404).json({ error: 'Consultation record not found.' })
+    if (!canEnrolledAgentAccessItem(item, req.adminUser) && String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+    if (!hasDirectGhlConfig()) {
+      return res.status(503).json({ error: 'CRM email sending is not configured.' })
+    }
+
+    const answers = room.state.answers || {}
+    if (!isMarriedJointFilingAnswers(answers)) {
+      return res.status(400).json({ error: 'Spouse document release only applies to married filing jointly records.' })
+    }
+    if (String(answers.form8821_status || '').trim().toLowerCase() !== 'completed') {
+      return res.status(409).json({ error: 'The client must complete signing before the spouse email can be released.' })
+    }
+    if (String(answers.form8821_spouse_status || '').trim().toLowerCase() === 'completed') {
+      return res.status(409).json({ error: 'The spouse signature is already complete for this document.' })
+    }
+
+    answers.form8821_spouse_release_attempted_at = new Date().toISOString()
+    answers.form8821_spouse_release_error = ''
+
+    const releaseResult = await releasePendingMfj8821SpouseEmail({
+      roomCode,
+      room,
+      senderEmail: String(req.adminUser?.email || answers.boldsign_8821_sender_email || '').trim(),
+    })
+
+    room.state.updatedAt = Date.now()
+    await persistRoomState(roomCode, room, [
+      { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_release_error', value: answers.form8821_spouse_release_error || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_released_at', value: answers.form8821_spouse_released_at || '' },
+      { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
+      { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
+      { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
+      { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
+    ])
+
+    const refreshedItem = buildConsultationDetail({
+      sessionCode: roomCode,
+      contactId: room.contactId,
+      opportunityId: room.opportunityId,
+      state: room.state,
+      createdAt: room.state?.updatedAt || Date.now(),
+      updatedAt: room.state?.updatedAt || Date.now(),
+    })
+    emitDashboardRecordsUpdated({ reason: 'spouse_document_released', sessionCode: roomCode })
+    return res.json({
+      ok: true,
+      item: refreshedItem,
+      sentAt: releaseResult.sentAt || answers.form8821_spouse_released_at || '',
+      spouseRecipientEmail: releaseResult.recipientEmail || answers.spouse_email || '',
+      spouseLink: releaseResult.signingUrl || '',
+    })
+  } catch (error) {
+    try {
+      const roomCode = String(req.params.code || '').trim()
+      if (roomCode) {
+        const room = await ensureRoom(roomCode)
+        const answers = room.state.answers || {}
+        answers.form8821_spouse_status = 'release_failed'
+        answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
+        answers.form8821_spouse_release_attempted_at = answers.form8821_spouse_release_attempted_at || new Date().toISOString()
+        room.state.updatedAt = Date.now()
+        await persistRoomState(roomCode, room, [
+          { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+          { type: 'setAnswer', questionId: 'form8821_spouse_release_error', value: answers.form8821_spouse_release_error || '' },
+          { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
+        ])
+      }
+    } catch {
+      // ignore persistence failures during error handling
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to release spouse document email.' })
+  }
+})
+
 app.post('/api/session', (_req, res) => {
   ;(async () => {
     let code = generateSessionId()
@@ -7682,6 +7853,13 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
       ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
       : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
+    if (
+      target === 'spouse' &&
+      isMarriedJoint &&
+      String(answers.form8821_status || '').trim().toLowerCase() !== 'completed'
+    ) {
+      return res.status(409).json({ error: 'The spouse signing link is released only after the client completes the first signature.' })
+    }
     const documentFieldPrefix = templateConfigured ? 'boldsign_8821' : target === 'spouse' ? 'boldsign_8821_spouse' : 'boldsign_8821'
     const existingDocumentId = String(answers[`${documentFieldPrefix}_document_id`] || '').trim()
     if (existingDocumentId && is8821TargetAlreadySigned(answers, target)) {
@@ -7798,6 +7976,13 @@ app.get('/api/session/:code/document-link', async (req, res) => {
       ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
       : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
+    if (
+      target === 'spouse' &&
+      isMarriedJoint &&
+      String(answers.form8821_status || '').trim().toLowerCase() !== 'completed'
+    ) {
+      return res.status(409).json({ error: 'The spouse signing link is released only after the client completes the first signature.' })
+    }
 
     // When we use a BoldSign template (client + spouse roles), we keep a single
     // BoldSign document id (`boldsign_8821_document_id`) and just generate
