@@ -7786,6 +7786,92 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
   }
 })
 
+app.post('/api/session/:code/release-spouse-document-email', async (req, res) => {
+  try {
+    const roomCode = String(req.params.code || '').toUpperCase().trim()
+    if (!roomCode) return res.status(400).json({ error: 'code is required' })
+
+    const room = await ensureRoom(roomCode)
+    const answers = room.state.answers || {}
+    if (!isMarriedJointFilingAnswers(answers)) {
+      return res.status(400).json({ error: 'This session does not require a spouse signature.' })
+    }
+    if (String(answers.form8821_status || '').trim().toLowerCase() !== 'completed') {
+      return res.status(409).json({ error: 'The client must finish signing before the spouse email can be released.' })
+    }
+
+    const spouseStatus = String(answers.form8821_spouse_status || '').trim().toLowerCase()
+    if (spouseStatus === 'completed') {
+      return res.json({
+        ok: true,
+        spouseStatus: 'completed',
+        spouseReleasedAt: answers.form8821_spouse_released_at || '',
+        spouseRecipientEmail: answers.spouse_email || '',
+      })
+    }
+    if (spouseStatus === 'launching' || spouseStatus === 'signing') {
+      return res.json({
+        ok: true,
+        spouseStatus,
+        spouseReleasedAt: answers.form8821_spouse_released_at || '',
+        spouseRecipientEmail: answers.spouse_email || '',
+      })
+    }
+
+    answers.form8821_spouse_release_attempted_at = new Date().toISOString()
+    answers.form8821_spouse_release_error = ''
+
+    const releaseResult = await releasePendingMfj8821SpouseEmail({
+      roomCode,
+      room,
+      senderEmail: String(answers.boldsign_8821_sender_email || '').trim(),
+    })
+
+    if (!releaseResult.sent && releaseResult.reason === 'already_sent') {
+      answers.form8821_spouse_status = answers.form8821_spouse_status || 'launching'
+    }
+
+    room.state.updatedAt = Date.now()
+    await persistRoomState(roomCode, room, [
+      { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_release_error', value: answers.form8821_spouse_release_error || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
+      { type: 'setAnswer', questionId: 'form8821_spouse_released_at', value: answers.form8821_spouse_released_at || '' },
+      { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
+      { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
+      { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
+      { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
+    ])
+
+    return res.json({
+      ok: true,
+      spouseStatus: answers.form8821_spouse_status || '',
+      spouseReleasedAt: answers.form8821_spouse_released_at || '',
+      spouseRecipientEmail: releaseResult.recipientEmail || answers.spouse_email || '',
+    })
+  } catch (error) {
+    try {
+      const roomCode = String(req.params.code || '').toUpperCase().trim()
+      if (roomCode) {
+        const room = await ensureRoom(roomCode)
+        const answers = room.state.answers || {}
+        answers.form8821_spouse_status = 'release_failed'
+        answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
+        answers.form8821_spouse_release_attempted_at = answers.form8821_spouse_release_attempted_at || new Date().toISOString()
+        room.state.updatedAt = Date.now()
+        await persistRoomState(roomCode, room, [
+          { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+          { type: 'setAnswer', questionId: 'form8821_spouse_release_error', value: answers.form8821_spouse_release_error || '' },
+          { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
+        ])
+      }
+    } catch {
+      // ignore persistence failures during error handling
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to release spouse document email.' })
+  }
+})
+
 app.post('/api/session', (_req, res) => {
   ;(async () => {
     let code = generateSessionId()
