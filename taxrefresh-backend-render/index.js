@@ -3243,9 +3243,17 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   }
 
   if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
-    await markBoldsign8821Completed({ roomCode, completedDocumentCode: resolvedDocumentCode, target })
-    emitDashboardRecordsUpdated({ reason: 'boldsign_webhook_completed', roomCode, eventType, target, documentCode: resolvedDocumentCode })
-    return { handled: true, reason: 'completed', roomCode, eventType, target }
+    const completionTarget =
+      isMfj && usesSharedMfjDocument && normalizedType.includes('completed') && !actorId && !signerOrder ? 'spouse' : target
+    await markBoldsign8821Completed({ roomCode, completedDocumentCode: resolvedDocumentCode, target: completionTarget })
+    emitDashboardRecordsUpdated({
+      reason: 'boldsign_webhook_completed',
+      roomCode,
+      eventType,
+      target: completionTarget,
+      documentCode: resolvedDocumentCode,
+    })
+    return { handled: true, reason: 'completed', roomCode, eventType, target: completionTarget }
   }
 
   room.state.updatedAt = Date.now()
