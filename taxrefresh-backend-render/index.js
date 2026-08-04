@@ -2729,6 +2729,7 @@ async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = 
   const spouseRecipientEmail = String(answers.spouse_email || getSpouseSignerEmailFromAnswers(answers) || '').trim()
   const spouseName = String(getSpouseSignerNameFromAnswers(answers) || 'Spouse').trim() || 'Spouse'
   const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || '').trim()
+  const spouseUsesClientEmail = clientEmail.trim().toLowerCase() === spouseRecipientEmail.trim().toLowerCase()
 
   if (!isValidEmailAddress(clientEmail)) throw new Error('A valid client email is required before releasing the spouse signature email.')
   if (!isValidEmailAddress(spouseRecipientEmail)) throw new Error('A valid spouse email is required before releasing the spouse signature email.')
@@ -2742,7 +2743,9 @@ async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = 
     answers.ghl_contact_id = contactId
     answers.ghl_contact_created_at = answers.ghl_contact_created_at || new Date().toISOString()
   }
-  await ensureGhlContactEmail({ contactId, email: clientEmail, name: clientName, phone })
+  if (!spouseUsesClientEmail) {
+    await ensureGhlContactEmail({ contactId, email: clientEmail, name: clientName, phone })
+  }
 
   const backendBase = String(getBackendBaseUrl() || '').trim().replace(/\/+$/, '')
   const spouseReturnUrl = backendBase ? `${backendBase}/api/session/${encodeURIComponent(roomCode)}/document-complete?target=spouse` : ''
@@ -3470,11 +3473,7 @@ function buildEmbeddedSignerAlias(email = '', suffix = 'spouse') {
 
 function resolveBoldsignSignerEmail(email = '', { target = 'client', primaryEmail = '' } = {}) {
   const normalized = String(email || '').trim().toLowerCase()
-  const normalizedPrimary = String(primaryEmail || '').trim().toLowerCase()
   if (!normalized) return ''
-  if (target === 'spouse' && normalizedPrimary && normalized === normalizedPrimary) {
-    return buildEmbeddedSignerAlias(normalized, 'spouse')
-  }
   return normalized
 }
 
@@ -4443,6 +4442,22 @@ async function fetchGhlContactById(contactId = '') {
   return data?.contact || data || null
 }
 
+async function findGhlDuplicateContactByEmail(email = '') {
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+  if (!normalizedEmail || !hasDirectGhlConfig() || !GHL_LOCATION_ID) return null
+  const data = await ghlFetch('contacts/search/duplicate', {
+    method: 'GET',
+    version: 'v3',
+    query: {
+      locationId: GHL_LOCATION_ID,
+      email: normalizedEmail,
+    },
+  })
+  const contact = data?.contact || data?.duplicateContact || data?.duplicate || data || null
+  const id = String(contact?.id || contact?._id || '').trim()
+  return id ? { id, contact } : null
+}
+
 async function createGhlContactForEmail({ email = '', name = '', phone = '' } = {}) {
   const normalizedEmail = String(email || '').trim().toLowerCase()
   if (!hasDirectGhlConfig()) throw new Error('Direct CRM sync is not configured.')
@@ -4455,11 +4470,17 @@ async function createGhlContactForEmail({ email = '', name = '', phone = '' } = 
     phone: String(phone || '').trim() || undefined,
     source: 'taxrefresh-dashboard',
   }
-  const data = await ghlFetch('contacts/', { method: 'POST', version: 'v3', body: payload })
-  const contact = data?.contact || data || null
-  const id = String(contact?.id || '').trim()
-  if (!id) throw new Error('CRM contact creation failed to return an id.')
-  return { id, contact }
+  try {
+    const data = await ghlFetch('contacts/', { method: 'POST', version: 'v3', body: payload })
+    const contact = data?.contact || data || null
+    const id = String(contact?.id || '').trim()
+    if (!id) throw new Error('CRM contact creation failed to return an id.')
+    return { id, contact }
+  } catch (error) {
+    const duplicate = await findGhlDuplicateContactByEmail(normalizedEmail).catch(() => null)
+    if (duplicate?.id) return duplicate
+    throw error
+  }
 }
 
 async function ensureGhlContactEmail({ contactId = '', email = '', name = '', phone = '' } = {}) {
