@@ -3160,9 +3160,16 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
     signerOrder = Number(actorMatch?.order || 0)
   }
   const isMfj = isMarriedJointFilingAnswers(answers)
-  const target =
-    matchedTarget ||
-    (isMfj && signerOrder >= 2 ? 'spouse' : signerEmail && spouseEmail && spouseEmail !== clientEmail && signerEmail === spouseEmail ? 'spouse' : 'client')
+  const usesSharedMfjDocument = Boolean(isMfj && clientDocumentId && (!spouseDocumentId || spouseDocumentId === clientDocumentId))
+  const inferredTarget =
+    isMfj && signerOrder >= 2
+      ? 'spouse'
+      : isMfj && signerOrder === 1
+        ? 'client'
+        : signerEmail && spouseEmail && spouseEmail !== clientEmail && signerEmail === spouseEmail
+          ? 'spouse'
+          : 'client'
+  const target = usesSharedMfjDocument ? inferredTarget : matchedTarget || inferredTarget
   const receiptName = target === 'spouse' ? '8821 Spouse' : '8821 Document'
   answers.current_8821_document_code = answers.current_8821_document_code || resolvedDocumentCode
   answers.active_8821_document_code = answers.active_8821_document_code || resolvedDocumentCode
