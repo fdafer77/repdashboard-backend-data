@@ -1491,7 +1491,7 @@ function getRedPacketRenderContext(answers = {}) {
   const spouseFullName = getNormalizedSpouseName(answers)
   const spouseSsn = formatSsnLabel(getPrimaryAnswer(answers, ['spouse_ssn', 'spouseSsn']))
   const spouseDob = formatDobValue(getPrimaryAnswer(answers, ['spouse_dob', 'spouseDob']))
-  const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || '').trim()
+  const spousePhone = String(getPrimaryAnswer(answers, ['spouse_phone', 'spousePhone']) || phone || '').trim()
   const spouseMailingAddress = [mailingStreet, mailingCity, mailingState, mailingZip].filter(Boolean).join(', ').replace(', ,', ',')
   const taxTypeValue = String(getPrimaryAnswer(answers, ['taxType']) || '').trim().toLowerCase()
   const taxTypeLabel = taxTypeValue === 'personal' ? 'Personal' : taxTypeValue === 'business' ? 'Business' : taxTypeValue === 'both' ? 'Both' : ''
