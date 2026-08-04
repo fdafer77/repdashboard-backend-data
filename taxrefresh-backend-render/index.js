@@ -2736,7 +2736,7 @@ function build8821EmailHtml({ clientName, signingLink, secondarySigningLink = ''
 </html>`
 }
 
-async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = '' } = {}) {
+async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = '', spouseRecipientEmail: overrideSpouseRecipientEmail = '' } = {}) {
   const answers = room?.state?.answers || {}
   if (!isMarriedJointFilingAnswers(answers)) return { sent: false, reason: 'not_married_joint' }
 
@@ -2751,13 +2751,14 @@ async function releasePendingMfj8821SpouseEmail({ roomCode, room, senderEmail = 
 
   const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'Client').trim() || 'Client'
   const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
-  const spouseRecipientEmail = String(answers.spouse_email || getSpouseSignerEmailFromAnswers(answers) || '').trim()
+  const spouseRecipientEmail = String(overrideSpouseRecipientEmail || answers.spouse_email || getSpouseSignerEmailFromAnswers(answers) || '').trim()
   const spouseName = String(getSpouseSignerNameFromAnswers(answers) || 'Spouse').trim() || 'Spouse'
   const phone = String(getPrimaryAnswer(answers, ['phone', 'phone_number']) || '').trim()
   const spouseUsesClientEmail = clientEmail.trim().toLowerCase() === spouseRecipientEmail.trim().toLowerCase()
 
   if (!isValidEmailAddress(clientEmail)) throw new Error('A valid client email is required before releasing the spouse signature email.')
   if (!isValidEmailAddress(spouseRecipientEmail)) throw new Error('A valid spouse email is required before releasing the spouse signature email.')
+  answers.spouse_email = spouseRecipientEmail
 
   const priorContactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
   const contactId = await resolveGhlContactIdForEmail({ contactId: priorContactId, email: clientEmail, name: clientName, phone })
@@ -7830,6 +7831,8 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         sessionCode: roomCode,
         signerName: clientName,
         signerEmail: resolvedRecipientEmail,
+        spouseSignerName: String(getSpouseSignerNameFromAnswers(answers) || '').trim(),
+        spouseSignerEmail: String(answers.spouse_email || spouseRecipientEmail || '').trim(),
         returnUrl: clientReturnUrl,
         onBehalfOf: String(req.adminUser?.email || '').trim(),
         disableEmails: false,
@@ -7984,10 +7987,15 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
     answers.form8821_spouse_release_attempted_at = new Date().toISOString()
     answers.form8821_spouse_release_error = ''
 
+    const overrideSpouseRecipientEmail = String(req.body?.spouseRecipientEmail || '').trim()
+    if (overrideSpouseRecipientEmail) {
+      answers.spouse_email = overrideSpouseRecipientEmail
+    }
     const releaseResult = await releasePendingMfj8821SpouseEmail({
       roomCode,
       room,
       senderEmail: String(req.adminUser?.email || answers.boldsign_8821_sender_email || '').trim(),
+      spouseRecipientEmail: overrideSpouseRecipientEmail,
     })
 
     room.state.updatedAt = Date.now()
@@ -7996,6 +8004,7 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
       { type: 'setAnswer', questionId: 'form8821_spouse_release_error', value: answers.form8821_spouse_release_error || '' },
       { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
       { type: 'setAnswer', questionId: 'form8821_spouse_released_at', value: answers.form8821_spouse_released_at || '' },
+      { type: 'setAnswer', questionId: 'spouse_email', value: answers.spouse_email || '' },
       { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
       { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
       { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
