@@ -7254,9 +7254,29 @@ app.get('/api/admin/consultations/:code/signed-8821', async (req, res) => {
 
     const roomCode = String(item.sessionCode || req.params.code || '').toUpperCase().trim()
     const room = await ensureRoom(roomCode)
+    await reconcileBoldsign8821Status({
+      roomCode,
+      state: room?.state,
+      persist: async (nextState) => {
+        if (!room) return
+        room.state = nextState
+        await dbUpsertSession({ code: roomCode, state: nextState })
+      },
+    })
     const payload = await loadSigned8821DocumentPayload(roomCode, room)
     if (!payload?.fileBuffer?.length) {
-      return res.status(404).json({ error: 'No signed Form 8821 document is available for this client yet.' })
+      await ensureSigned8821StoredOnRecord(roomCode, room).catch(() => false)
+      const retryPayload = await loadSigned8821DocumentPayload(roomCode, room)
+      if (!retryPayload?.fileBuffer?.length) {
+        return res.status(404).json({ error: 'No signed Form 8821 document is available for this client yet.' })
+      }
+      res.setHeader('Content-Type', retryPayload.contentType || 'application/pdf')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader(
+        'Content-Disposition',
+        `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${retryPayload.filename || 'signed-document.pdf'}"`,
+      )
+      return res.send(retryPayload.fileBuffer)
     }
 
     res.setHeader('Content-Type', payload.contentType || 'application/pdf')
@@ -7282,9 +7302,29 @@ app.get('/api/admin/consultations/:code/signed-8821-page-1', async (req, res) =>
     }
     const roomCode = String(item.sessionCode || req.params.code || '').toUpperCase().trim()
     const room = await ensureRoom(roomCode)
+    await reconcileBoldsign8821Status({
+      roomCode,
+      state: room?.state,
+      persist: async (nextState) => {
+        if (!room) return
+        room.state = nextState
+        await dbUpsertSession({ code: roomCode, state: nextState })
+      },
+    })
     const payload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
     if (!payload?.fileBuffer?.length) {
-      return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this client yet.' })
+      await ensureSigned8821StoredOnRecord(roomCode, room).catch(() => false)
+      const retryPayload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
+      if (!retryPayload?.fileBuffer?.length) {
+        return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this client yet.' })
+      }
+      res.setHeader('Content-Type', retryPayload.contentType || 'application/pdf')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader(
+        'Content-Disposition',
+        `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${retryPayload.filename || 'signed-8821-page-1.pdf'}"`,
+      )
+      return res.send(retryPayload.fileBuffer)
     }
     res.setHeader('Content-Type', payload.contentType || 'application/pdf')
     res.setHeader('Cache-Control', 'no-store')
@@ -7301,14 +7341,32 @@ app.get('/api/session/:code/signed-8821', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Session code is required.' })
 
     const room = await ensureRoom(roomCode)
+    await reconcileBoldsign8821Status({
+      roomCode,
+      state: room?.state,
+      persist: async (nextState) => {
+        if (!room) return
+        room.state = nextState
+        await dbUpsertSession({ code: roomCode, state: nextState })
+      },
+    })
     const answers = room?.state?.answers || {}
-    if (!isForm8821FullySigned(answers)) {
-      return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
-    }
+    if (!isForm8821FullySigned(answers)) return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
 
     const payload = await loadSigned8821DocumentPayload(roomCode, room)
     if (!payload?.fileBuffer?.length) {
-      return res.status(404).json({ error: 'No signed Form 8821 document is available for this session yet.' })
+      await ensureSigned8821StoredOnRecord(roomCode, room).catch(() => false)
+      const retryPayload = await loadSigned8821DocumentPayload(roomCode, room)
+      if (!retryPayload?.fileBuffer?.length) {
+        return res.status(404).json({ error: 'No signed Form 8821 document is available for this session yet.' })
+      }
+      res.setHeader('Content-Type', retryPayload.contentType || 'application/pdf')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader(
+        'Content-Disposition',
+        `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${retryPayload.filename || 'signed-document.pdf'}"`,
+      )
+      return res.send(retryPayload.fileBuffer)
     }
 
     res.setHeader('Content-Type', payload.contentType || 'application/pdf')
@@ -7326,13 +7384,30 @@ app.get('/api/session/:code/signed-8821-page-1', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Session code is required.' })
     const room = await ensureRoom(roomCode)
     if (!room) return res.status(404).json({ error: 'Session not found.' })
+    await reconcileBoldsign8821Status({
+      roomCode,
+      state: room?.state,
+      persist: async (nextState) => {
+        room.state = nextState
+        await dbUpsertSession({ code: roomCode, state: nextState })
+      },
+    })
     const answers = room.state.answers || {}
-    if (!isForm8821FullySigned(answers)) {
-      return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
-    }
+    if (!isForm8821FullySigned(answers)) return res.status(409).json({ error: 'Form 8821 is not fully signed yet.' })
     const payload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
     if (!payload?.fileBuffer?.length) {
-      return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this session.' })
+      await ensureSigned8821StoredOnRecord(roomCode, room).catch(() => false)
+      const retryPayload = await loadSigned8821FirstPageDocumentPayload(roomCode, room)
+      if (!retryPayload?.fileBuffer?.length) {
+        return res.status(404).json({ error: 'No signed Form 8821 page 1 document is available for this session.' })
+      }
+      res.setHeader('Content-Type', retryPayload.contentType || 'application/pdf')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader(
+        'Content-Disposition',
+        `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${retryPayload.filename || 'signed-8821-page-1.pdf'}"`,
+      )
+      return res.send(retryPayload.fileBuffer)
     }
     res.setHeader('Content-Type', payload.contentType || 'application/pdf')
     res.setHeader('Cache-Control', 'no-store')
