@@ -3723,6 +3723,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_SSN2: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
     Spouse_Phone_Number2: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
     Spouse_full_name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
+    Spouse_Years_Owed: isMarriedJoint ? String(context.unfiledYearsLabel || '').trim() : '',
   }
 
   return {
