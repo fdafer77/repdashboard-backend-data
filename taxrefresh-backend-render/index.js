@@ -262,6 +262,16 @@ async function fallbackUpsertSession({ code, contactId = null, opportunityId = n
   await scheduleFallbackPersist()
 }
 
+async function fallbackDeleteSession(code) {
+  await ensureFallbackStoreLoaded()
+  let deleted = false
+  for (const candidate of getCodeVariants(code)) {
+    if (fallbackSessions.delete(candidate)) deleted = true
+  }
+  if (deleted) await scheduleFallbackPersist()
+  return deleted
+}
+
 async function fallbackFindSessionCode({ contactId = '', opportunityId = '' } = {}) {
   await ensureFallbackStoreLoaded()
   const values = Array.from(fallbackSessions.values()).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
@@ -6494,6 +6504,14 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
   )
 }
 
+async function dbDeleteSession(code) {
+  if (!pool) return fallbackDeleteSession(code)
+  const existing = await dbGetSession(code)
+  if (!existing?.session_code) return false
+  await pool.query('delete from ti_sessions where session_code=$1', [existing.session_code])
+  return true
+}
+
 async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {}) {
   if (!pool) {
     const existingCode = await fallbackFindSessionCode({ contactId, opportunityId })
@@ -7052,6 +7070,27 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
     return res.json({ item })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation detail' })
+  }
+})
+
+app.delete('/api/admin/consultations/:code', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const item = await getConsultationRecordByCode(roomCode)
+    if (!item) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+    await dbDeleteSession(item.sessionCode)
+    for (const candidate of getCodeVariants(item.sessionCode)) {
+      if (rooms.has(candidate)) rooms.delete(candidate)
+    }
+    io.to(item.sessionCode).emit('room_deleted', { sessionCode: item.sessionCode, deletedAt: new Date().toISOString() })
+    return res.json({ ok: true, deletedCode: item.sessionCode })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete consultation record' })
   }
 })
 
