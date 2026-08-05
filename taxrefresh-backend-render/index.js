@@ -6394,6 +6394,34 @@ function buildStripePaymentMethodRecord(paymentMethod, { customerId = '', setupI
       addedAt: new Date().toISOString(),
     }
   }
+  if (type === 'us_bank_account') {
+    const last4 = String(paymentMethod?.us_bank_account?.last4 || '').trim()
+    const bankName = String(paymentMethod?.us_bank_account?.bank_name || '').trim()
+    const routingNumber = String(paymentMethod?.us_bank_account?.routing_number || '').trim()
+    const accountTypeRaw = String(paymentMethod?.us_bank_account?.account_type || '').trim()
+    const bankAccountType = accountTypeRaw ? accountTypeRaw.charAt(0).toUpperCase() + accountTypeRaw.slice(1) : ''
+    const labelParts = [bankName || 'ACH', bankAccountType ? `${bankAccountType.toLowerCase()} account` : 'account', last4 ? `ending in ${last4}` : '']
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return {
+      provider: 'stripe',
+      type: 'ACH',
+      stripeType: 'us_bank_account',
+      stripePaymentMethodId: paymentMethod.id,
+      stripeCustomerId: customerId || '',
+      stripeSetupIntentId: setupIntentId || '',
+      label: labelParts || (last4 ? `ACH ending in ${last4}` : 'ACH account'),
+      institutionName: bankName,
+      bankAccountType,
+      accountHolderName: String(paymentMethod?.billing_details?.name || '').trim(),
+      routingNumber,
+      accountNumber: last4,
+      last4,
+      addedAt: new Date().toISOString(),
+    }
+  }
   return {
     provider: 'stripe',
     type: type ? type.toUpperCase() : 'Payment Method',
