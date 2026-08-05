@@ -7529,13 +7529,25 @@ app.post('/api/admin/consultations/:code/stripe/setup-intent', async (req, res) 
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     const room = await ensureRoom(roomCode)
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    const requestedType = String(req.body?.paymentMethodType || 'card').trim().toLowerCase()
+    const paymentMethodType = requestedType === 'us_bank_account' || requestedType === 'ach' ? 'us_bank_account' : 'card'
     const intent = await stripe.setupIntents.create({
       customer: customerId,
       usage: 'off_session',
-      payment_method_types: ['card'],
+      payment_method_types: [paymentMethodType],
+      ...(paymentMethodType === 'us_bank_account'
+        ? {
+            payment_method_options: {
+              us_bank_account: {
+                verification_method: 'microdeposits',
+              },
+            },
+          }
+        : {}),
       metadata: {
         sessionCode: roomCode,
         createdBy: String(req.adminUser?.email || ''),
+        paymentMethodType,
       },
     })
     return res.json({
@@ -7544,6 +7556,7 @@ app.post('/api/admin/consultations/:code/stripe/setup-intent', async (req, res) 
       clientSecret: intent.client_secret,
       customerId,
       setupIntentId: intent.id,
+      paymentMethodType,
     })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create Stripe setup intent' })
@@ -7660,6 +7673,9 @@ function getStripePaymentFailureReason(error) {
   }
 
   const normalizedMessage = message.toLowerCase()
+  if (normalizedMessage.includes('microdeposit') || normalizedMessage.includes('micro-deposit') || normalizedMessage.includes('verify')) {
+    return 'Payment failed: this ACH bank account needs to be verified before it can be charged.'
+  }
   if (normalizedMessage.includes('insufficient funds')) return 'Payment failed: insufficient funds.'
   if (normalizedMessage.includes('do not honor')) return 'Payment failed: do not honor. The issuer declined the charge.'
   if (normalizedMessage.includes('invalid card number')) return 'Payment failed: invalid card number.'
@@ -7693,13 +7709,15 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     const amount = Number(targetRow.amount || 0)
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'The scheduled amount is invalid.' })
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    const isUsBankAccount = String(paymentMethod?.type || '').trim().toLowerCase() === 'us_bank_account'
     const intent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency: 'usd',
       customer: customerId,
       payment_method: paymentMethodId,
       confirm: true,
-      off_session: true,
+      off_session: !isUsBankAccount,
       metadata: {
         sessionCode: roomCode,
         scheduleIndex: String(scheduleIndex),
@@ -7708,7 +7726,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     })
     rows[scheduleIndex] = {
       ...targetRow,
-      status: 'Processed',
+      status: intent.status === 'succeeded' ? 'Processed' : intent.status === 'processing' ? 'Processing' : 'Processed',
       failureReason: '',
       processorReason: '',
       reason: '',
