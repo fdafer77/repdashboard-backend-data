@@ -2182,7 +2182,17 @@ function isTrainingLeadItem(item = {}) {
 
 function getLifecycleLabel(item = {}) {
   if (isTrainingLeadItem(item)) return 'Test Lead'
+  const onboardingStatus = String(item.onboardingStatus || '').trim().toLowerCase()
+  const form8821Status = String(item.form8821Status || '').trim().toLowerCase()
+  const readyForEnrolledAgent = String(item.readyForEnrolledAgent || '').trim().toLowerCase()
+  const eaCaseStatus = String(item.eaCaseStatus || '').trim().toLowerCase()
   if (Boolean(item.hasProcessedPayment)) return 'Active Client'
+  if (form8821Status === 'completed') return 'Active Client'
+  if (onboardingStatus.includes('signed') || onboardingStatus.includes('payment') || onboardingStatus.includes('document')) {
+    return 'Active Client'
+  }
+  if (readyForEnrolledAgent === 'sent' || readyForEnrolledAgent === 'complete') return 'Active Client'
+  if (eaCaseStatus) return 'Active Client'
   return 'Active Prospect'
 }
 
