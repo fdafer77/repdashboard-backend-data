@@ -2244,7 +2244,9 @@ const ADMIN_ALLOWED_USERS = {
     designatedPosition: 'Enrolled Agent',
   },
 }
-const ADMIN_LOGIN_PASSWORD = String(process.env.ADMIN_DASHBOARD_PASSWORD || 'TAXREFRESH26').trim()
+const ADMIN_LOGIN_PASSWORD = String(
+  process.env.ADMIN_DASHBOARD_PASSWORD || ADMIN_DASHBOARD_PASSCODE || 'Trf!A9vK#72pLmQ4xN8s',
+).trim()
 const ADMIN_EMAIL_DOMAIN_ALLOWLIST = ['taxrefresh.info']
 const ENROLLED_AGENT_ALLOWED_ANSWER_KEYS = new Set([
   'consultation_notes',
