@@ -2212,6 +2212,14 @@ function safeEqualText(a = '', b = '') {
   }
 }
 
+function deriveNameParts(fullName = '') {
+  const parts = String(fullName || '').trim().split(/\s+/).filter(Boolean)
+  return {
+    firstName: parts[0] || '',
+    lastName: parts.length > 1 ? parts.slice(1).join(' ') : '',
+  }
+}
+
 const ADMIN_DESIGNATED_POSITIONS = [
   'Owner',
   'Settlement Officer',
@@ -7559,12 +7567,36 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
     }
     const nextValue = req.body?.value
     room.state.answers[answerKey] = nextValue === null || nextValue === undefined ? '' : nextValue
+    if (answerKey === 'name' || answerKey === 'full_name') {
+      const fullName = String(room.state.answers[answerKey] || '').trim()
+      const { firstName, lastName } = deriveNameParts(fullName)
+      room.state.answers.name = fullName
+      room.state.answers.full_name = fullName
+      room.state.answers.first_name = firstName
+      room.state.answers.last_name = lastName
+    } else if (answerKey === 'first_name' || answerKey === 'last_name') {
+      const firstName = String(answerKey === 'first_name' ? room.state.answers.first_name : room.state.answers.first_name || '').trim()
+      const lastName = String(answerKey === 'last_name' ? room.state.answers.last_name : room.state.answers.last_name || '').trim()
+      const fullName = [firstName, lastName].filter(Boolean).join(' ').trim()
+      room.state.answers.name = fullName
+      room.state.answers.full_name = fullName
+    }
     room.state.updatedAt = Date.now()
 
     io.to(roomCode).emit('room_patch', {
       patch: { type: 'setAnswer', questionId: answerKey, value: room.state.answers[answerKey] },
       updatedAt: room.state.updatedAt,
     })
+    if (answerKey === 'name' || answerKey === 'full_name') {
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'name', value: room.state.answers.name },
+        updatedAt: room.state.updatedAt,
+      })
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'full_name', value: room.state.answers.full_name },
+        updatedAt: room.state.updatedAt,
+      })
+    }
     io.to(roomCode).emit('room_state', room.state)
 
     try {
