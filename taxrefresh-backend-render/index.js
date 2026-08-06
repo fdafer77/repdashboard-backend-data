@@ -6445,6 +6445,69 @@ function buildStripePaymentMethodRecord(paymentMethod, { customerId = '', setupI
   }
 }
 
+function normalizeRawCardDigits(value = '') {
+  return String(value || '').replace(/\D/g, '')
+}
+
+function parseCardExpirationParts(value = '') {
+  const digits = normalizeRawCardDigits(value).slice(0, 4)
+  if (digits.length !== 4) return null
+  const month = Number.parseInt(digits.slice(0, 2), 10)
+  const shortYear = Number.parseInt(digits.slice(2, 4), 10)
+  if (!month || month < 1 || month > 12 || !Number.isFinite(shortYear)) return null
+  return {
+    month,
+    year: 2000 + shortYear,
+    formatted: `${String(month).padStart(2, '0')}/${String(shortYear).padStart(2, '0')}`,
+  }
+}
+
+async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = '', cardNumber = '', expiration = '', cvv = '' } = {}) {
+  if (!stripe) throw new Error('Stripe is not configured.')
+  const digits = normalizeRawCardDigits(cardNumber)
+  const cvc = normalizeRawCardDigits(cvv).slice(0, 4)
+  const exp = parseCardExpirationParts(expiration)
+  if (!digits || digits.length < 15) throw new Error('A valid card number is required.')
+  if (!exp) throw new Error('A valid card expiration is required.')
+  if (!cvc || cvc.length < 3) throw new Error('A valid card security code is required.')
+  const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+  const paymentMethod = await stripe.paymentMethods.create({
+    type: 'card',
+    card: {
+      number: digits,
+      exp_month: exp.month,
+      exp_year: exp.year,
+      cvc,
+    },
+    billing_details: {
+      name: String(cardholderName || '').trim() || undefined,
+      email: String(room?.state?.answers?.email || '').trim() || undefined,
+      phone: String(room?.state?.answers?.phone || '').trim() || undefined,
+    },
+    metadata: {
+      sessionCode: roomCode,
+      source: 'legacy_saved_card',
+    },
+  })
+  if (String(paymentMethod.customer || '') !== customerId) {
+    await stripe.paymentMethods.attach(paymentMethod.id, { customer: customerId })
+  }
+  try {
+    await stripe.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: paymentMethod.id,
+      },
+    })
+  } catch {
+    // Ignore default-payment-method update failures; the reusable method is still attached.
+  }
+  return {
+    customerId,
+    paymentMethod,
+    nextMethod: buildStripePaymentMethodRecord(paymentMethod, { customerId }),
+  }
+}
+
 async function persistRoomState(roomCode, room, patches = []) {
   room.state.updatedAt = Date.now()
   patches.forEach((patch) => {
@@ -7640,6 +7703,42 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
   }
 })
 
+app.post('/api/admin/consultations/:code/stripe/link-stored-card', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const room = await ensureRoom(roomCode)
+    const storedMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods)
+    const requestedIndexRaw = Number(req.body?.methodIndex)
+    const requestedIndex = Number.isInteger(requestedIndexRaw) ? requestedIndexRaw : -1
+    const fallbackIndex = storedMethods.findLastIndex(
+      (entry) => entry && !String(entry?.stripePaymentMethodId || '').trim() && String(entry?.type || '').trim().toLowerCase() !== 'ach',
+    )
+    const targetIndex = requestedIndex >= 0 && requestedIndex < storedMethods.length ? requestedIndex : fallbackIndex
+    const targetMethod = targetIndex >= 0 ? storedMethods[targetIndex] : null
+    const cardholderName = String(targetMethod?.cardholderName || room.state.answers.payment_cardholder_name || room.state.answers.full_name || room.state.answers.name || '').trim()
+    const cardNumber = String(targetMethod?.cardNumber || room.state.answers.payment_card_number || room.state.answers._ui_pay_cardNumber || '').trim()
+    const expiration = String(targetMethod?.expiration || room.state.answers.payment_card_expiration || room.state.answers._ui_pay_expiry || '').trim()
+    const cvv = String(targetMethod?.cvv || room.state.answers.payment_card_cvv || room.state.answers._ui_pay_cvv || '').trim()
+    if (!targetMethod && !cardNumber) return res.status(400).json({ error: 'No saved card is available to link.' })
+    const { nextMethod } = await createStripeLinkedCardForRoom(roomCode, room, { cardholderName, cardNumber, expiration, cvv })
+    const nextMethods = storedMethods.filter((_, index) => index !== targetIndex && String(storedMethods[index]?.stripePaymentMethodId || '') !== nextMethod.stripePaymentMethodId)
+    nextMethods.push(nextMethod)
+    room.state.answers.billing_payment_methods = nextMethods
+    room.state.answers.billing_payment_method = nextMethod
+    await persistRoomState(roomCode, room, [
+      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
+      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
+    ])
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, paymentMethod: nextMethod })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to link saved card to Stripe' })
+  }
+})
+
 app.delete('/api/admin/consultations/:code/payment-methods/:paymentMethodId', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
@@ -7668,6 +7767,34 @@ app.delete('/api/admin/consultations/:code/payment-methods/:paymentMethodId', as
     return res.json({ ok: true, item })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to remove payment method' })
+  }
+})
+
+app.post('/api/session/:code/stripe/link-card', async (req, res) => {
+  if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
+    const room = await ensureRoom(roomCode)
+    const cardholderName = String(req.body?.cardholderName || room.state.answers.payment_cardholder_name || room.state.answers.full_name || room.state.answers.name || '').trim()
+    const cardNumber = String(req.body?.cardNumber || '').trim()
+    const expiration = String(req.body?.expiration || '').trim()
+    const cvv = String(req.body?.cvv || '').trim()
+    const { nextMethod } = await createStripeLinkedCardForRoom(roomCode, room, { cardholderName, cardNumber, expiration, cvv })
+    const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods).filter(
+      (entry) => String(entry?.stripePaymentMethodId || '') !== nextMethod.stripePaymentMethodId,
+    )
+    const nextMethods = [...existingMethods, nextMethod]
+    room.state.answers.billing_payment_methods = nextMethods
+    room.state.answers.billing_payment_method = nextMethod
+    await persistRoomState(roomCode, room, [
+      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
+      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
+    ])
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, paymentMethod: nextMethod })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to link card to Stripe' })
   }
 })
 
