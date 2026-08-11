@@ -117,6 +117,11 @@ const fallbackSessions = new Map()
 let fallbackStoreLoaded = false
 let fallbackStoreLoadPromise = null
 let fallbackStoreWritePromise = Promise.resolve()
+const portalSmsCodeStore = new Map()
+const CLIENT_PORTAL_SMS_CODE_LENGTH = Math.max(4, Math.min(8, Number(process.env.CLIENT_PORTAL_SMS_CODE_LENGTH || 6) || 6))
+const CLIENT_PORTAL_SMS_CODE_TTL_MS = Math.max(60_000, Number(process.env.CLIENT_PORTAL_SMS_CODE_TTL_MS || 10 * 60_000) || 10 * 60_000)
+const CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS = Math.max(15_000, Number(process.env.CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS || 45_000) || 45_000)
+const CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS = Math.max(3, Math.min(10, Number(process.env.CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS || 5) || 5))
 
 function serializeCrashError(error) {
   if (error instanceof Error) {
@@ -6843,6 +6848,103 @@ async function findLatestSessionByEmail(email = '') {
   return liveCandidates[0] || null
 }
 
+function getPortalPhoneDigits(value = '') {
+  const digits = digitsOnly(value)
+  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1)
+  return digits.slice(0, 10)
+}
+
+function getAnswerPhoneForPortal(answers = {}) {
+  return normalizePhoneForSms(getPrimaryAnswer(answers, ['phone', 'phone_number', 'mobile', 'mobile_phone', 'cell', 'cell_phone']) || '')
+}
+
+function maskPortalPhoneNumber(value = '') {
+  const digits = getPortalPhoneDigits(value)
+  if (digits.length !== 10) return String(value || '').trim()
+  return `(***) ***-${digits.slice(6)}`
+}
+
+async function findLatestSessionByPhone(phone = '') {
+  const normalizedDigits = getPortalPhoneDigits(phone)
+  if (normalizedDigits.length !== 10) return null
+
+  if (pool) {
+    const query = `
+      select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+      from ti_sessions
+      where
+        right(regexp_replace(coalesce(state->'answers'->>'phone', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'phone_number', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'mobile', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'mobile_phone', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'cell', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'cell_phone', ''), '[^0-9]', '', 'g'), 10) = $1
+      order by updated_at desc
+      limit 1
+    `
+    const res = await pool.query(query, [normalizedDigits])
+    return res.rows?.[0] || null
+  }
+
+  const persistedRows = await fallbackListSessions()
+  const candidates = persistedRows
+    .map((row) => {
+      const answers = row?.state?.answers || {}
+      const rowDigits = getPortalPhoneDigits(getAnswerPhoneForPortal(answers))
+      if (!rowDigits || rowDigits !== normalizedDigits) return null
+      return row
+    })
+    .filter(Boolean)
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+
+  if (candidates[0]) return candidates[0]
+
+  const liveCandidates = Array.from(rooms.entries())
+    .map(([sessionCode, room]) => {
+      const answers = room?.state?.answers || {}
+      const rowDigits = getPortalPhoneDigits(getAnswerPhoneForPortal(answers))
+      if (!rowDigits || rowDigits !== normalizedDigits) return null
+      return {
+        session_code: sessionCode,
+        ghl_contact_id: room?.contactId || null,
+        ghl_opportunity_id: room?.opportunityId || null,
+        state: room?.state || null,
+        created_at: null,
+        updated_at: new Date(Number(room?.state?.updatedAt) || Date.now()),
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+
+  return liveCandidates[0] || null
+}
+
+function createPortalAuthSuccessPayload(row) {
+  const answers = row?.state?.answers || {}
+  return {
+    code: String(row?.session_code || ''),
+    clientName: String(getPrimaryAnswer(answers, ['full_name', 'name']) || '').trim(),
+    contactId: row?.ghl_contact_id || '',
+    opportunityId: row?.ghl_opportunity_id || '',
+  }
+}
+
+function createPortalSmsCode() {
+  const max = 10 ** CLIENT_PORTAL_SMS_CODE_LENGTH
+  return String(crypto.randomInt(0, max)).padStart(CLIENT_PORTAL_SMS_CODE_LENGTH, '0')
+}
+
+function getPortalSmsMessage(code = '') {
+  const minutes = Math.max(1, Math.round(CLIENT_PORTAL_SMS_CODE_TTL_MS / 60_000))
+  return `TaxRefresh sign-in code: ${String(code || '').trim()}. This code expires in ${minutes} minute${minutes === 1 ? '' : 's'}.`
+}
+
+function cleanupExpiredPortalSmsCodes() {
+  const now = Date.now()
+  for (const [key, entry] of portalSmsCodeStore.entries()) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) portalSmsCodeStore.delete(key)
+  }
+}
 function getAnswerSsnLast4(answers = {}) {
   const candidates = [
     'ssn_last4',
@@ -8760,14 +8862,121 @@ app.post('/api/client-portal/auth', (req, res) => {
       return res.status(401).json({ error: "We couldn't verify your account with that SSN. Please try again or contact support for help signing in." })
     }
 
-    const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || '').trim()
-    return res.json({
-      code: String(row.session_code),
-      clientName,
-      contactId: row.ghl_contact_id || '',
-      opportunityId: row.ghl_opportunity_id || '',
-    })
+    return res.json(createPortalAuthSuccessPayload(row))
   })().catch((error) => res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to verify client portal account' }))
+})
+
+app.post('/api/client-portal/send-sms-code', (req, res) => {
+  ;(async () => {
+    cleanupExpiredPortalSmsCodes()
+    const phone = String(req.body?.phone || '').trim()
+    const normalizedPhone = normalizePhoneForSms(phone)
+    const phoneDigits = getPortalPhoneDigits(normalizedPhone)
+    if (phoneDigits.length !== 10) return res.status(400).json({ error: 'A valid 10-digit phone number is required.' })
+
+    const row = await findLatestSessionByPhone(normalizedPhone)
+    if (!row?.session_code) return res.status(404).json({ error: 'No client portal record found for that phone number.' })
+
+    const answers = row?.state?.answers || {}
+    if (!isPortalAuthorizedForAnswers(answers)) {
+      return res
+        .status(403)
+        .json({ error: 'Your client portal access will unlock after your signed Form 8821 authorization is received.' })
+    }
+
+    const storedPhone = getAnswerPhoneForPortal(answers)
+    const storedDigits = getPortalPhoneDigits(storedPhone)
+    if (storedDigits.length !== 10 || storedDigits !== phoneDigits) {
+      return res.status(401).json({ error: "We couldn't verify your account with that phone number. Please try again or contact support for help signing in." })
+    }
+
+    const contactId = String(row.ghl_contact_id || '').trim()
+    if (!contactId) return res.status(400).json({ error: 'This account is missing the contact record required to send a text message.' })
+
+    const existing = portalSmsCodeStore.get(storedDigits)
+    const now = Date.now()
+    if (existing && Number(existing.nextSendAt || 0) > now) {
+      const waitSeconds = Math.max(1, Math.ceil((Number(existing.nextSendAt || 0) - now) / 1000))
+      return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another code.` })
+    }
+
+    const code = createPortalSmsCode()
+    const message = getPortalSmsMessage(code)
+    const roomCode = String(row.session_code || '').trim().toUpperCase()
+    const room = await ensureRoom(roomCode)
+    const response = await sendGhlSmsMessage({ contactId, phoneNumber: storedPhone, message })
+    const conversationId = String(response?.conversationId || answers?.ghl_sms_conversation_id || answers?.ghl_conversation_id || '').trim()
+    const outboundEntry = normalizeSmsThreadEntry({
+      id: String(response?.messageId || '').trim(),
+      conversationId,
+      contactId,
+      body: message,
+      direction: 'outbound',
+      status: 'delivered',
+      messageType: 'SMS',
+      dateAdded: new Date().toISOString(),
+      from: '',
+      to: normalizedPhone,
+      source: 'client_portal_auth',
+    })
+    await persistSmsThreadForRoom({ roomCode, room, entries: [outboundEntry], conversationId, contactId })
+
+    portalSmsCodeStore.set(storedDigits, {
+      code,
+      expiresAt: now + CLIENT_PORTAL_SMS_CODE_TTL_MS,
+      nextSendAt: now + CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS,
+      attempts: 0,
+      sessionCode: String(row.session_code || '').trim(),
+      ghlContactId: contactId,
+      ghlOpportunityId: String(row.ghl_opportunity_id || '').trim(),
+      clientName: String(getPrimaryAnswer(answers, ['full_name', 'name']) || '').trim(),
+      phone: normalizedPhone,
+    })
+
+    return res.json({
+      ok: true,
+      maskedPhone: maskPortalPhoneNumber(normalizedPhone),
+      expiresInSeconds: Math.floor(CLIENT_PORTAL_SMS_CODE_TTL_MS / 1000),
+    })
+  })().catch((error) => res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to send sign-in code' }))
+})
+
+app.post('/api/client-portal/verify-sms-code', (req, res) => {
+  ;(async () => {
+    cleanupExpiredPortalSmsCodes()
+    const phone = String(req.body?.phone || '').trim()
+    const submittedCode = String(req.body?.code || '').replace(/\D/g, '').slice(0, CLIENT_PORTAL_SMS_CODE_LENGTH)
+    const phoneDigits = getPortalPhoneDigits(phone)
+    if (phoneDigits.length !== 10) return res.status(400).json({ error: 'A valid 10-digit phone number is required.' })
+    if (submittedCode.length !== CLIENT_PORTAL_SMS_CODE_LENGTH) {
+      return res.status(400).json({ error: `Enter the ${CLIENT_PORTAL_SMS_CODE_LENGTH}-digit code from your text message.` })
+    }
+
+    const pending = portalSmsCodeStore.get(phoneDigits)
+    if (!pending) return res.status(400).json({ error: 'Please request a new sign-in code.' })
+    if (Number(pending.expiresAt || 0) <= Date.now()) {
+      portalSmsCodeStore.delete(phoneDigits)
+      return res.status(410).json({ error: 'That code has expired. Please request a new sign-in code.' })
+    }
+    if (String(pending.code || '') !== submittedCode) {
+      pending.attempts = Number(pending.attempts || 0) + 1
+      if (pending.attempts >= CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS) {
+        portalSmsCodeStore.delete(phoneDigits)
+        return res.status(401).json({ error: 'Too many incorrect attempts. Please request a new sign-in code.' })
+      }
+      portalSmsCodeStore.set(phoneDigits, pending)
+      return res.status(401).json({ error: 'That code did not match. Please try again.' })
+    }
+
+    portalSmsCodeStore.delete(phoneDigits)
+    return res.json({
+      ok: true,
+      code: String(pending.sessionCode || ''),
+      clientName: String(pending.clientName || '').trim(),
+      contactId: String(pending.ghlContactId || '').trim(),
+      opportunityId: String(pending.ghlOpportunityId || '').trim(),
+    })
+  })().catch((error) => res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to verify sign-in code' }))
 })
 
 // Rep login (single shared password) -> JWT
