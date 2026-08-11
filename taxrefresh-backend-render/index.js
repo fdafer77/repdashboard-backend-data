@@ -6854,8 +6854,8 @@ function getPortalPhoneDigits(value = '') {
   return digits.slice(0, 10)
 }
 
-function getAnswerPhoneForPortal(answers = {}) {
-  return normalizePhoneForSms(getPrimaryAnswer(answers, ['phone', 'phone_number', 'mobile', 'mobile_phone', 'cell', 'cell_phone']) || '')
+function getDashboardPhoneForPortal(answers = {}) {
+  return normalizePhoneForSms(getPrimaryAnswer(answers, ['phone', 'phone_number']) || '')
 }
 
 function maskPortalPhoneNumber(value = '') {
@@ -6890,7 +6890,7 @@ async function findLatestSessionByPhone(phone = '') {
   const candidates = persistedRows
     .map((row) => {
       const answers = row?.state?.answers || {}
-      const rowDigits = getPortalPhoneDigits(getAnswerPhoneForPortal(answers))
+      const rowDigits = getPortalPhoneDigits(getDashboardPhoneForPortal(answers))
       if (!rowDigits || rowDigits !== normalizedDigits) return null
       return row
     })
@@ -6902,7 +6902,7 @@ async function findLatestSessionByPhone(phone = '') {
   const liveCandidates = Array.from(rooms.entries())
     .map(([sessionCode, room]) => {
       const answers = room?.state?.answers || {}
-      const rowDigits = getPortalPhoneDigits(getAnswerPhoneForPortal(answers))
+      const rowDigits = getPortalPhoneDigits(getDashboardPhoneForPortal(answers))
       if (!rowDigits || rowDigits !== normalizedDigits) return null
       return {
         session_code: sessionCode,
@@ -8884,7 +8884,7 @@ app.post('/api/client-portal/send-sms-code', (req, res) => {
         .json({ error: 'Your client portal access will unlock after your signed Form 8821 authorization is received.' })
     }
 
-    const storedPhone = getAnswerPhoneForPortal(answers)
+    const storedPhone = getDashboardPhoneForPortal(answers)
     const storedDigits = getPortalPhoneDigits(storedPhone)
     if (storedDigits.length !== 10 || storedDigits !== phoneDigits) {
       return res.status(401).json({ error: "We couldn't verify your account with that phone number. Please try again or contact support for help signing in." })
