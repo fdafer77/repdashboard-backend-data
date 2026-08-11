@@ -8891,7 +8891,11 @@ app.post('/api/client-portal/send-sms-code', (req, res) => {
     }
 
     const contactId = String(row.ghl_contact_id || '').trim()
-    if (!contactId) return res.status(400).json({ error: 'This account is missing the contact record required to send a text message.' })
+    if (!contactId) {
+      return res
+        .status(400)
+        .json({ error: 'We found your phone number, but this account is not fully set up for text verification yet. Please contact TaxRefresh for help signing in.' })
+    }
 
     const existing = portalSmsCodeStore.get(storedDigits)
     const now = Date.now()
