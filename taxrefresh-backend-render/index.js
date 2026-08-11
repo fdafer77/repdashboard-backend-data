@@ -43,6 +43,10 @@ if (GHL_INSECURE_SSL) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 }
 const ADMIN_DASHBOARD_PASSCODE = String(process.env.ADMIN_DASHBOARD_PASSCODE || process.env.INTERNAL_DASHBOARD_PASSCODE || '').trim()
+const ADMIN_OWNER_PASSWORD_DEFAULTS = {
+  'farouk.dafer@taxrefresh.info': 'kjICOLSwD5)*T$tT@Lp495',
+  'zach.risheq@taxrefresh.info': 'Rweg2F1&VCx2q^UNJ$eFZg',
+}
 const SESSION_STORE_PATH = path.resolve(process.env.SESSION_STORE_PATH || path.join(process.cwd(), '.data', 'sessions.json'))
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_PUBLISHABLE_KEY = String(process.env.STRIPE_PUBLISHABLE_KEY || '').trim()
@@ -2252,7 +2256,15 @@ const ADMIN_ALLOWED_USERS = {
 const ADMIN_LOGIN_PASSWORD = String(
   process.env.ADMIN_DASHBOARD_PASSWORD || ADMIN_DASHBOARD_PASSCODE || 'Trf!A9vK#72pLmQ4xN8s',
 ).trim()
-const ADMIN_EMAIL_DOMAIN_ALLOWLIST = ['taxrefresh.info']
+const ADMIN_USER_PASSWORDS = {
+  'farouk.dafer@taxrefresh.info': String(
+    process.env.ADMIN_DASHBOARD_PASSWORD_FAROUK_DAFER || ADMIN_OWNER_PASSWORD_DEFAULTS['farouk.dafer@taxrefresh.info'],
+  ).trim(),
+  'zach.risheq@taxrefresh.info': String(
+    process.env.ADMIN_DASHBOARD_PASSWORD_ZACH_RISHEQ || ADMIN_OWNER_PASSWORD_DEFAULTS['zach.risheq@taxrefresh.info'],
+  ).trim(),
+  'caprizio.fornaro@taxrefresh.info': String(process.env.ADMIN_DASHBOARD_PASSWORD_CAPRIZIO_FORNARO || ADMIN_LOGIN_PASSWORD).trim(),
+}
 const ENROLLED_AGENT_ALLOWED_ANSWER_KEYS = new Set([
   'consultation_notes',
   'ea_case_status',
@@ -2272,30 +2284,13 @@ function readAdminCredentials(req) {
   }
 }
 
-function buildDefaultAdminAccount(email = '') {
-  const normalized = String(email || '').trim().toLowerCase()
-  if (!normalized || !normalized.includes('@')) return null
-  const [, domain = ''] = normalized.split('@')
-  if (!ADMIN_EMAIL_DOMAIN_ALLOWLIST.includes(String(domain || '').trim().toLowerCase())) return null
-  const local = normalized.split('@')[0] || ''
-  const name = local
-    .split(/[._-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
-  return {
-    email: normalized,
-    name: name || normalized,
-    designatedPosition: 'Management',
-  }
-}
-
 function authenticateAdmin(req) {
   const { email, password } = readAdminCredentials(req)
-  if (!ADMIN_LOGIN_PASSWORD) return null
-  if (!safeEqualText(password, ADMIN_LOGIN_PASSWORD)) return null
-  const account = ADMIN_ALLOWED_USERS[email] || buildDefaultAdminAccount(email)
+  const account = ADMIN_ALLOWED_USERS[email]
   if (!account) return null
+  const expectedPassword = String(ADMIN_USER_PASSWORDS[email] || '').trim()
+  if (!expectedPassword) return null
+  if (!safeEqualText(password, expectedPassword)) return null
   return {
     ...account,
     designatedPosition: ADMIN_DESIGNATED_POSITIONS.includes(account.designatedPosition)

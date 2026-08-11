@@ -23,6 +23,12 @@ services:
         value: https://secure.taxrefresh.us
       - key: EXPERIENCE_BASE_URL
         value: https://secure.taxrefresh.us
+      - key: ADMIN_DASHBOARD_PASSWORD_FAROUK_DAFER
+        sync: false
+      - key: ADMIN_DASHBOARD_PASSWORD_ZACH_RISHEQ
+        sync: false
+      - key: ADMIN_DASHBOARD_PASSWORD_CAPRIZIO_FORNARO
+        sync: false
       - key: BOLDSIGN_8821_PDF_PATH
         value: ./assets/f8821.pdf
       - key: EXPERIAN_SOFT_PULL_URL
