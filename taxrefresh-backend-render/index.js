@@ -200,6 +200,31 @@ function buildFallbackRow(entry) {
   }
 }
 
+const MIRRORED_ANSWER_KEY_GROUPS = [
+  ['email', 'email_address'],
+  ['phone', 'phone_number'],
+  ['dob', 'date_of_birth', 'birthdate'],
+  ['address', 'street', 'address1'],
+  ['state', 'stateCode', 'expenseState'],
+  ['zip', 'postalCode'],
+  ['spouse_dob', 'spouseDob', 'spouse_date_of_birth', 'spouseBirthDate'],
+  ['spouse_ssn', 'spouseSsn'],
+  ['spouse_phone', 'spousePhone'],
+  ['spouse_email', 'spouseEmail'],
+  ['spouse_first_name', 'spouseFirstName'],
+  ['spouse_last_name', 'spouseLastName'],
+]
+
+function mirrorAnswerAliases(answers, answerKey, nextValue) {
+  const normalizedKey = String(answerKey || '').trim()
+  if (!normalizedKey) return
+  const group = MIRRORED_ANSWER_KEY_GROUPS.find((keys) => keys.includes(normalizedKey))
+  if (!group) return
+  group.forEach((key) => {
+    answers[key] = nextValue
+  })
+}
+
 async function persistFallbackSessions() {
   const payload = {
     sessions: Array.from(fallbackSessions.values()).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))),
@@ -4768,8 +4793,8 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
       ghl_last_status_change_at: String(opportunity?.lastStatusChangeAt || ''),
       ghl_last_stage_change_at: String(opportunity?.lastStageChangeAt || ''),
       ghl_calendar_events: stringifyStructuredValue(calendarEvents, '[]'),
-      name: contactName || String(existingAnswers.name || ''),
-      full_name: contactName || String(existingAnswers.full_name || ''),
+      name: String(existingAnswers.name || existingAnswers.full_name || '').trim() || contactName,
+      full_name: String(existingAnswers.full_name || existingAnswers.name || '').trim() || contactName,
       email: contactEmail || String(existingAnswers.email || existingAnswers.email_address || ''),
       email_address: contactEmail || String(existingAnswers.email_address || existingAnswers.email || ''),
       phone: contactPhone || String(existingAnswers.phone || existingAnswers.phone_number || ''),
@@ -7665,7 +7690,9 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
       }
     }
     const nextValue = req.body?.value
-    room.state.answers[answerKey] = nextValue === null || nextValue === undefined ? '' : nextValue
+    const normalizedValue = nextValue === null || nextValue === undefined ? '' : nextValue
+    room.state.answers[answerKey] = normalizedValue
+    mirrorAnswerAliases(room.state.answers, answerKey, normalizedValue)
     if (answerKey === 'name' || answerKey === 'full_name') {
       const fullName = String(room.state.answers[answerKey] || '').trim()
       const { firstName, lastName } = deriveNameParts(fullName)
