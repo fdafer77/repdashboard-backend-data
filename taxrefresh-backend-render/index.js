@@ -3796,7 +3796,7 @@ function getResolutionTaxFormLabel(taxTypeValue = '') {
   return '1040'
 }
 
-function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
+function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
   const context = getRedPacketRenderContext(answers)
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
   const fullName = [String(context.firstName || '').trim(), String(context.lastName || '').trim()].filter(Boolean).join(' ')
@@ -3847,9 +3847,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}, { se
     Tax_Type: taxTypeLabel,
     Tax_Form: taxFormLabel,
     Years_Owed: yearsOwedLabel,
-    Client_Date_Signed: sentDateLabel,
     Client_Full_Name2: fullName,
-    Date_Signed3: sentDateLabel,
     Client_Full_Name4: fullName,
     Client_Last_Name: String(context.lastName || '').trim(),
     Client_First_Name: String(context.firstName || '').trim(),
@@ -3868,9 +3866,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}, { se
     Years_Owed4: yearsOwedLabel,
     Resolution_Cost2: resolutionCostLabel,
     Client_Full_Name3: fullName,
-    Date_Signed: sentDateLabel,
     Client_Full_Name5: fullName,
-    Date_Signed2: sentDateLabel,
   }
 
   const spouseFields = {
@@ -3878,14 +3874,12 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}, { se
     Spouse_Mailing_address: spouseMailingAddress,
     Spouse_SSN: spouseSsn,
     Spouse_Phone_Number: spousePhone,
-    Spouse_Date_Signed: isMarriedJoint ? sentDateLabel : '',
     Spouse_Full_Name2: spouseFullName,
     Spouse_Last_Name: spouseLastName,
     Spouse_First_name: spouseFirstName,
     Spouse_DOB: spouseDob,
     Spouse_Full_Name3: spouseFullName,
     Spouse_Full_Name4: spouseFullName,
-    Spouse_Date_Signed3: isMarriedJoint ? sentDateLabel : '',
   }
 
   return {
@@ -3934,10 +3928,7 @@ async function createBoldsignResolutionSigningLink({
     throw new Error('Spouse email is required for married filing jointly resolution documents.')
   }
 
-  const sendDateLabel = formatMmDdYyyy(new Date())
-  const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignResolutionExistingFormFieldsFromAnswers(answers, {
-    sentDateLabel: sendDateLabel,
-  })
+  const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignResolutionExistingFormFieldsFromAnswers(answers)
 
   const sendResult = await boldsignFetch('v1/template/send', {
     method: 'POST',
