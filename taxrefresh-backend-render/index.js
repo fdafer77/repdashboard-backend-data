@@ -325,6 +325,9 @@ const app = express()
 // Without this, `express.json()` consumes the body and signature checks will fail.
 app.use(
   express.json({
+    // EA transcript uploads can include large base64 data URLs; raise the JSON limit accordingly.
+    // (Express default is ~100kb, which can cause 413 responses for real transcript PDFs/exports.)
+    limit: '25mb',
     verify: (req, _res, buf) => {
       try {
         req.rawBody = Buffer.isBuffer(buf) ? buf.toString('utf8') : ''
@@ -3327,6 +3330,16 @@ function buildResolutionEmailHtml({ clientName, portalLink }) {
   ].join('')
 }
 
+const BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK = '91f2ebc9-830d-4c85-9349-63ba0dda3964'
+const RESOLUTION_EA_PROFILE = {
+  name: 'Tax Refresh',
+  address: '405 Rockefeller, Irvine, CA 92612',
+  phone: '(949) 702-2723',
+  fax: '(941)-340-2146',
+  caf: '0317-33812',
+  ptin: 'P03152236',
+}
+
 function getBoldsignConfig() {
   const apiBase = String(process.env.BOLDSIGN_BASE_URI || 'https://api.boldsign.com').trim().replace(/\/$/, '')
   const apiKey = String(process.env.BOLDSIGN_API_KEY || '').trim()
@@ -3334,6 +3347,7 @@ function getBoldsignConfig() {
   const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
   const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || '').trim()
   const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || '').trim()
+  const resolutionTemplateId = String(process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID || BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK).trim()
   const brandId = String(process.env.BOLDSIGN_BRAND_ID || '').trim()
   const brandIdMfj = String(process.env.BOLDSIGN_BRAND_ID_MFJ || '').trim()
   const brandIdSingle = String(process.env.BOLDSIGN_BRAND_ID_SINGLE || '').trim()
@@ -3346,6 +3360,7 @@ function getBoldsignConfig() {
     templateId,
     templateIdMfj,
     templateIdSingle,
+    resolutionTemplateId,
     brandId,
     brandIdMfj,
     brandIdSingle,
@@ -3772,6 +3787,228 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     clientFields: Object.entries(clientFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
     spouseFields: Object.entries(spouseFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
   }
+}
+
+function getResolutionTaxFormLabel(taxTypeValue = '') {
+  const normalized = String(taxTypeValue || '').trim().toLowerCase()
+  if (normalized === 'business') return '1120'
+  if (normalized === 'both') return '1040, 1120'
+  return '1040'
+}
+
+function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}, { sentDateLabel = '' } = {}) {
+  const context = getRedPacketRenderContext(answers)
+  const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const fullName = [String(context.firstName || '').trim(), String(context.lastName || '').trim()].filter(Boolean).join(' ')
+  const mailingFull = [
+    String(context.mailingAddress || '').trim(),
+    String(context.mailingCity || '').trim(),
+    String(context.mailingState || '').trim(),
+    String(context.mailingZip || '').trim(),
+  ]
+    .filter(Boolean)
+    .join(', ')
+  const clientStreet = String(context.physicalAddress || '').trim()
+  const clientCity = String(context.city || '').trim()
+  const clientState = String(context.stateCode || '').trim()
+  const clientZip = String(context.zipCode || '').trim()
+  const clientPhone = String(context.phone || '').trim()
+  const clientEmail = String(context.email || '').trim()
+  const clientSsn = String(context.ssn || '').trim()
+  const clientDob = String(context.dob || '').trim()
+
+  const spouseFullName = isMarriedJoint ? String(context.spouseFullName || '').trim() : ''
+  const spouseFirstName = isMarriedJoint ? String(context.spouseFirstName || '').trim() : ''
+  const spouseLastName = isMarriedJoint ? String(context.spouseLastName || '').trim() : ''
+  const spouseMailingAddress = isMarriedJoint ? String(context.spouseMailingAddress || '').trim() : ''
+  const spouseSsn = isMarriedJoint ? String(context.spouseSsn || '').trim() : ''
+  const spousePhone = isMarriedJoint ? String(context.spousePhone || '').trim() : ''
+  const spouseDob = isMarriedJoint ? String(context.spouseDob || '').trim() : ''
+
+  const taxTypeLabel = String(context.taxTypeLabel || '').trim()
+  const taxAgencyLabel = String(context.taxAgencyLabel || '').trim()
+  const yearsOwedLabel = String(context.unfiledYearsLabel || '').trim()
+  const taxBalanceLabel = String(context.estimatedLiabilityLabel || '').trim()
+  const resolutionCostLabel = formatUsdLabel(Number(context.effectiveInvoiceAmount || 0))
+  const taxFormLabel = getResolutionTaxFormLabel(context.taxTypeValue || getPrimaryAnswer(answers, ['taxType']) || '')
+  const cafValue = String(getPrimaryAnswer(answers, ['ea_caf_number', 'irs_caf_number', 'caf_number']) || RESOLUTION_EA_PROFILE.caf).trim()
+
+  const clientFields = {
+    Client_Full_Name: fullName,
+    Client_Mailing_Address: mailingFull,
+    Client_SSN: clientSsn,
+    Client_Phone_Number: clientPhone,
+    Enrolled_Agent_Fax: RESOLUTION_EA_PROFILE.fax,
+    Enrolled_Agent_Name: RESOLUTION_EA_PROFILE.name,
+    Enrolled_Agent_Address: RESOLUTION_EA_PROFILE.address,
+    Enrolled_Agent_CAF: cafValue,
+    Enrolled_Agent_PTIN: RESOLUTION_EA_PROFILE.ptin,
+    Enrolled_Agent_Phone: RESOLUTION_EA_PROFILE.phone,
+    Tax_Type: taxTypeLabel,
+    Tax_Form: taxFormLabel,
+    Years_Owed: yearsOwedLabel,
+    Client_Date_Signed: sentDateLabel,
+    Client_Full_Name2: fullName,
+    Date_Signed3: sentDateLabel,
+    Client_Full_Name4: fullName,
+    Client_Last_Name: String(context.lastName || '').trim(),
+    Client_First_Name: String(context.firstName || '').trim(),
+    Client_DOB: clientDob,
+    Client_Address: clientStreet,
+    Client_City: clientCity,
+    Client_State: clientState,
+    Client_Zip_Code: clientZip,
+    Client_Email: clientEmail,
+    Client_Phone_Number2: clientPhone,
+    Tax_Agency: taxAgencyLabel,
+    Tax_Type3: taxTypeLabel,
+    Years_Owed3: yearsOwedLabel,
+    Tax_Balance: taxBalanceLabel,
+    Resolution_Cost: resolutionCostLabel,
+    Years_Owed4: yearsOwedLabel,
+    Resolution_Cost2: resolutionCostLabel,
+    Client_Full_Name3: fullName,
+    Date_Signed: sentDateLabel,
+    Client_Full_Name5: fullName,
+    Date_Signed2: sentDateLabel,
+  }
+
+  const spouseFields = {
+    Spouse_Full_Name: spouseFullName,
+    Spouse_Mailing_address: spouseMailingAddress,
+    Spouse_SSN: spouseSsn,
+    Spouse_Phone_Number: spousePhone,
+    Spouse_Date_Signed: isMarriedJoint ? sentDateLabel : '',
+    Spouse_Full_Name2: spouseFullName,
+    Spouse_Last_Name: spouseLastName,
+    Spouse_First_name: spouseFirstName,
+    Spouse_DOB: spouseDob,
+    Spouse_Full_Name3: spouseFullName,
+    Spouse_Full_Name4: spouseFullName,
+    Spouse_Date_Signed3: isMarriedJoint ? sentDateLabel : '',
+  }
+
+  return {
+    clientFields: Object.entries(clientFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
+    spouseFields: Object.entries(spouseFields).map(([Id, Value]) => ({ Id, Value: String(Value ?? '') })),
+  }
+}
+
+async function createBoldsignResolutionSigningLink({
+  sessionCode,
+  signerName,
+  signerEmail,
+  spouseSignerEmail = '',
+  spouseSignerName = '',
+  onBehalfOf = '',
+  disableEmails = false,
+  persistDocument = true,
+  documentFieldPrefix = 'boldsign_resolution',
+} = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) throw new Error('sessionCode is required')
+
+  const roomState = await getSessionStateForCode(normalizedSessionCode)
+  if (!roomState) throw new Error('Session not found')
+
+  const answers = roomState.answers || {}
+  const resolvedSignerName = String(signerName || getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
+  const resolvedSignerEmail = String(signerEmail || getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+  if (!resolvedSignerEmail) throw new Error('A client email is required before launching the resolution document.')
+
+  const boldsignConfig = getBoldsignConfig()
+  const resolutionTemplateId = String(boldsignConfig.resolutionTemplateId || '').trim()
+  if (!resolutionTemplateId) throw new Error('The BoldSign resolution template is not configured yet.')
+
+  const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const selectedBrandId = isMarriedJoint
+    ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
+    : String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+  const hideDocumentId = Boolean(boldsignConfig.hideDocumentId)
+  const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
+  const spouseSignerEmailForBoldsign = isMarriedJoint
+    ? resolveBoldsignSignerEmail(spouseEmail, { target: 'spouse', primaryEmail: resolvedSignerEmail })
+    : ''
+  const spouseName = isMarriedJoint ? String(spouseSignerName || getSpouseSignerNameFromAnswers(answers) || '').trim() : ''
+  if (isMarriedJoint && !isValidEmailAddress(spouseEmail)) {
+    throw new Error('Spouse email is required for married filing jointly resolution documents.')
+  }
+
+  const sendDateLabel = formatMmDdYyyy(new Date())
+  const { clientFields: existingClientFormFields, spouseFields: existingSpouseFormFields } = buildBoldsignResolutionExistingFormFieldsFromAnswers(answers, {
+    sentDateLabel: sendDateLabel,
+  })
+
+  const sendResult = await boldsignFetch('v1/template/send', {
+    method: 'POST',
+    query: { templateId: resolutionTemplateId },
+    body: {
+      Title: 'TaxRefresh Resolution Documents',
+      Message: '',
+      ...(selectedBrandId ? { BrandId: selectedBrandId } : {}),
+      ...(hideDocumentId ? { HideDocumentId: true } : {}),
+      DisableEmails: disableEmails,
+      EnableEmbeddedSigning: true,
+      EnableSigningOrder: isMarriedJoint,
+      ...(isMarriedJoint
+        ? {
+            Roles: [
+              {
+                RoleIndex: 1,
+                SignerName: resolvedSignerName,
+                SignerEmail: resolvedSignerEmail,
+                SignerOrder: 1,
+                SignerType: 'Signer',
+                Locale: 'EN',
+                ExistingFormFields: existingClientFormFields,
+              },
+              {
+                RoleIndex: 2,
+                SignerName: spouseName || 'Spouse',
+                SignerEmail: spouseSignerEmailForBoldsign,
+                SignerOrder: 2,
+                SignerType: 'Signer',
+                Locale: 'EN',
+                ExistingFormFields: existingSpouseFormFields,
+              },
+            ],
+          }
+        : {
+            Roles: [
+              {
+                RoleIndex: 1,
+                SignerName: resolvedSignerName,
+                SignerEmail: resolvedSignerEmail,
+                SignerType: 'Signer',
+                Locale: 'EN',
+                ExistingFormFields: existingClientFormFields,
+              },
+            ],
+          }),
+    },
+  })
+
+  const documentId = String(sendResult?.documentId || '').trim()
+  if (!documentId) throw new Error('BoldSign did not return a documentId for the resolution document.')
+
+  if (persistDocument) {
+    const room = await ensureRoom(normalizedSessionCode)
+    room.state.answers[`${documentFieldPrefix}_document_id`] = documentId
+    room.state.answers[`${documentFieldPrefix}_file_name`] = 'TaxRefresh Resolution Documents.pdf'
+    room.state.answers[`${documentFieldPrefix}_sent_at`] = new Date().toISOString()
+    room.state.answers[`${documentFieldPrefix}_sender_email`] = String(onBehalfOf || '').trim()
+    if (isMarriedJoint) {
+      room.state.answers[`${documentFieldPrefix}_spouse_signer_email`] = spouseSignerEmailForBoldsign
+    }
+    room.state.updatedAt = Date.now()
+    try {
+      await dbUpsertSession({ code: normalizedSessionCode, state: room.state })
+    } catch {
+      // ignore; room state still updates in-memory
+    }
+  }
+
+  return { documentId, spouseSignerEmail: spouseSignerEmailForBoldsign }
 }
 
 async function createBoldsign8821SigningLink({
@@ -8251,22 +8488,28 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
 
       answers.onboarding_status = 'documents_ready_for_signature'
     } else {
-      if (!links.clientPortalLink) {
-        return res.status(400).json({ error: 'A public portal link is not available for this document yet.' })
+      const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+      const resolvedSpouseRecipientEmail = String(answers.spouse_email || spouseRecipientEmail || '').trim()
+      if (isMarriedJoint && !isValidEmailAddress(resolvedSpouseRecipientEmail)) {
+        return res.status(400).json({ error: 'Spouse email is required for married filing jointly resolution documents.' })
       }
-      await sendGhlEmailMessage({
-        contactId,
-        emailTo: resolvedRecipientEmail,
-        subject: 'TaxRefresh documents ready for review',
-        message: `Open your secure TaxRefresh portal to review your documents: ${links.clientPortalLink}`,
-        html: buildResolutionEmailHtml({ clientName, portalLink: links.clientPortalLink }),
+      answers.spouse_email = resolvedSpouseRecipientEmail || answers.spouse_email || ''
+      await createBoldsignResolutionSigningLink({
+        sessionCode: roomCode,
+        signerName: clientName,
+        signerEmail: resolvedRecipientEmail,
+        spouseSignerName: String(getSpouseSignerNameFromAnswers(answers) || '').trim(),
+        spouseSignerEmail: resolvedSpouseRecipientEmail,
+        onBehalfOf: String(req.adminUser?.email || '').trim(),
+        disableEmails: false,
+        persistDocument: true,
       })
       nextReceipts.push({ name: 'Resolution Documents', status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_resolution`,
         documentType: 'Resolution Documents',
         recipientEmail: resolvedRecipientEmail,
-        link: links.clientPortalLink,
+        link: '',
         sentAt,
         sentBy: String(req.adminUser?.email || '').trim(),
       })
@@ -8274,7 +8517,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         id: `doc_delivery_${Date.now().toString(36)}_resolution`,
         name: 'Resolution Documents',
         status: 'Sent',
-        method: 'Email',
+        method: 'BoldSign Email',
         sentAt,
         recipientEmail: resolvedRecipientEmail,
         sentBy: String(req.adminUser?.email || '').trim(),
@@ -8310,7 +8553,16 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
             { type: 'setAnswer', questionId: 'signed_8821_render_version', value: answers.signed_8821_render_version },
             { type: 'setAnswer', questionId: 'signed_8821_first_page_render_version', value: answers.signed_8821_first_page_render_version },
           ]
-        : []),
+        : documentType === 'Resolution Documents'
+          ? [
+              { type: 'setAnswer', questionId: 'spouse_email', value: answers.spouse_email || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_document_id', value: answers.boldsign_resolution_document_id || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_file_name', value: answers.boldsign_resolution_file_name || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_sent_at', value: answers.boldsign_resolution_sent_at || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_sender_email', value: answers.boldsign_resolution_sender_email || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_spouse_signer_email', value: answers.boldsign_resolution_spouse_signer_email || '' },
+            ]
+          : []),
     ])
 
     const refreshedItem = buildConsultationDetail({
