@@ -3187,6 +3187,7 @@ async function findSessionByBoldsignDocumentId(documentId = '') {
        from ti_sessions
        where state->'answers'->>'boldsign_8821_document_id' = $1
           or state->'answers'->>'boldsign_8821_spouse_document_id' = $1
+          or state->'answers'->>'boldsign_resolution_document_id' = $1
        order by updated_at desc
        limit 1`,
       [normalized],
@@ -3196,7 +3197,11 @@ async function findSessionByBoldsignDocumentId(documentId = '') {
   await ensureFallbackStoreLoaded()
   for (const entry of fallbackSessions.values()) {
     const answers = entry?.state?.answers || {}
-    if (String(answers.boldsign_8821_document_id || '').trim() === normalized || String(answers.boldsign_8821_spouse_document_id || '').trim() === normalized) {
+    if (
+      String(answers.boldsign_8821_document_id || '').trim() === normalized ||
+      String(answers.boldsign_8821_spouse_document_id || '').trim() === normalized ||
+      String(answers.boldsign_resolution_document_id || '').trim() === normalized
+    ) {
       return {
         session_code: entry.sessionCode,
         ghl_contact_id: entry.contactId,
@@ -3208,6 +3213,41 @@ async function findSessionByBoldsignDocumentId(documentId = '') {
     }
   }
   return null
+}
+
+function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '') {
+  const normalizedSignedAt = String(signedAt || '').trim() || new Date().toISOString()
+  const targetName = 'Resolution Documents'
+
+  const currentDeliveryLog = Array.isArray(answers?.document_delivery_log)
+    ? answers.document_delivery_log
+    : parseStoredObject(answers?.document_delivery_log, [])
+  if (Array.isArray(currentDeliveryLog)) {
+    answers.document_delivery_log = currentDeliveryLog.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (name !== targetName) return entry
+      return {
+        ...(entry || {}),
+        status: 'Signed',
+        signedAt: String(entry?.signedAt || '').trim() || normalizedSignedAt,
+      }
+    })
+  }
+
+  const currentReceipts = Array.isArray(answers?.document_receipts)
+    ? answers.document_receipts
+    : parseStoredObject(answers?.document_receipts, [])
+  if (Array.isArray(currentReceipts)) {
+    answers.document_receipts = currentReceipts.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (name !== targetName) return entry
+      return {
+        ...(entry || {}),
+        status: 'Signed',
+        sentAt: String(entry?.sentAt || '').trim() || normalizedSignedAt,
+      }
+    })
+  }
 }
 
 async function applyBoldsignWebhookEvent(eventPayload = {}) {
@@ -3223,6 +3263,70 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const roomCode = String(row.session_code || '').trim().toUpperCase()
   const room = await ensureRoom(roomCode)
   const answers = room.state.answers || {}
+  const resolutionDocumentId = String(answers.boldsign_resolution_document_id || '').trim()
+
+  // Resolution documents have a separate template + document id, so handle them explicitly.
+  if (resolutionDocumentId && resolutionDocumentId === documentId) {
+    const normalizedType = eventType.toLowerCase()
+    const sentAt = new Date().toISOString()
+    const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
+    const receiptName = 'Resolution Documents'
+
+    if (normalizedType.includes('verification')) {
+      return { handled: true, reason: 'verification', roomCode, eventType, documentId }
+    }
+
+    if (normalizedType.includes('sent') || normalizedType.includes('created')) {
+      if (!hasDocumentLifecycleEntry(answers, { name: receiptName, documentCode: '' })) {
+        const receiptEntry = {
+          id: `boldsign_${documentId}_${normalizedType}_resolution`,
+          name: receiptName,
+          documentCode: '',
+          status: 'Sent',
+          method: 'Experience',
+          sentAt,
+          recipientEmail: signerEmail,
+          sentBy: 'BoldSign',
+        }
+        answers.document_delivery_log = [receiptEntry, ...parseStoredObject(answers.document_delivery_log, [])]
+        answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
+          {
+            name: receiptName,
+            documentCode: '',
+            status: 'Sent',
+            method: 'Experience',
+            sentAt,
+            recipientEmail: signerEmail,
+            sentBy: 'BoldSign',
+          },
+        ])
+      }
+      answers.onboarding_status = String(answers.onboarding_status || '').trim() || 'documents_ready_for_signature'
+    }
+
+    if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
+      answers.boldsign_resolution_signed_at = answers.boldsign_resolution_signed_at || new Date().toISOString()
+      markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at)
+      room.state.updatedAt = Date.now()
+      try {
+        await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+      } catch {
+        // ignore; room state is still updated in memory
+      }
+      emitDashboardRecordsUpdated({ reason: 'boldsign_webhook_completed', roomCode, eventType, target: 'resolution', documentCode: '' })
+      return { handled: true, reason: 'completed', roomCode, eventType, target: 'resolution' }
+    }
+
+    room.state.updatedAt = Date.now()
+    try {
+      await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+    } catch {
+      // ignore; room state is still updated in memory
+    }
+    emitDashboardRecordsUpdated({ reason: 'boldsign_webhook', roomCode, eventType, target: 'resolution', documentCode: '' })
+    return { handled: true, reason: 'updated', roomCode, eventType, target: 'resolution' }
+  }
+
   const clientDocumentId = String(answers.boldsign_8821_document_id || '').trim()
   const spouseDocumentId = String(answers.boldsign_8821_spouse_document_id || '').trim()
   const matchedTarget = spouseDocumentId && spouseDocumentId === documentId ? 'spouse' : clientDocumentId && clientDocumentId === documentId ? 'client' : ''
