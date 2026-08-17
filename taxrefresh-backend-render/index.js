@@ -2298,6 +2298,9 @@ const ENROLLED_AGENT_ALLOWED_ANSWER_KEYS = new Set([
   'ea_case_status',
   'ea_due_date',
   'ea_priority',
+  'ea_handled_years',
+  'ea_wage_income_years',
+  'ea_account_transcript_years',
   'ea_resolution_recommendation',
   'ea_important_deadlines',
   'ea_tasks',
@@ -5271,6 +5274,15 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
+  const hasPaymentMethodOnFile = Boolean(
+    parseStoredPaymentMethods(answers.billing_payment_methods).length ||
+      (parseStoredObject(answers.billing_payment_method, null) && typeof parseStoredObject(answers.billing_payment_method, null) === 'object'),
+  )
+  const eaTranscriptsReadyForClient =
+    answers.ea_transcripts_ready_for_client === true ||
+    String(answers.ea_transcripts_ready_for_client || '')
+      .trim()
+      .toLowerCase() === 'true'
   const appointments = [
     ...parseStoredGhlCalendarEvents(answers.ghl_calendar_events).map((item) => normalizeGhlCalendarEvent(item)),
     ...parseStoredCalendlyAppointments(answers.calendly_appointments).map((item) => normalizeCalendlyAppointment(item)),
@@ -5311,6 +5323,8 @@ function buildConsultationSummary(record) {
     stateBalance,
     processedPaymentCount,
     hasProcessedPayment,
+    hasPaymentMethodOnFile,
+    eaTranscriptsReadyForClient,
     appointmentCount: appointments.length,
     nextAppointmentAt: appointments[0]?.startAt || '',
     appointments,
