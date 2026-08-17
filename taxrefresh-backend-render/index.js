@@ -5274,9 +5274,15 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
+  const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
+  const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
+  const billingPaymentMethod = parseStoredObject(answers.billing_payment_method, null)
+  const portalPaymentMethod = parseStoredObject(answers.client_portal_payment_method, null)
   const hasPaymentMethodOnFile = Boolean(
-    parseStoredPaymentMethods(answers.billing_payment_methods).length ||
-      (parseStoredObject(answers.billing_payment_method, null) && typeof parseStoredObject(answers.billing_payment_method, null) === 'object'),
+    billingPaymentMethods.length ||
+      portalPaymentMethods.length ||
+      (billingPaymentMethod && typeof billingPaymentMethod === 'object') ||
+      (portalPaymentMethod && typeof portalPaymentMethod === 'object'),
   )
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
