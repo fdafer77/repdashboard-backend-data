@@ -5287,6 +5287,13 @@ function buildConsultationSummary(record) {
       (billingPaymentMethod && typeof billingPaymentMethod === 'object') ||
       (portalPaymentMethod && typeof portalPaymentMethod === 'object'),
   )
+  const documentReceipts = Array.isArray(answers.document_receipts) ? answers.document_receipts : parseStoredObject(answers.document_receipts, [])
+  const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
+  const resolutionDocumentsSigned = [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])].some(
+    (entry) =>
+      String(entry?.name || '').trim() === 'Resolution Documents' &&
+      String(entry?.status || '').trim() === 'Signed',
+  )
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
     String(answers.ea_transcripts_ready_for_client || '')
@@ -5333,6 +5340,7 @@ function buildConsultationSummary(record) {
     processedPaymentCount,
     hasProcessedPayment,
     hasPaymentMethodOnFile,
+    resolutionDocumentsSigned,
     eaTranscriptsReadyForClient,
     appointmentCount: appointments.length,
     nextAppointmentAt: appointments[0]?.startAt || '',
