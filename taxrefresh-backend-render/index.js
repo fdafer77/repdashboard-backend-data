@@ -3441,6 +3441,7 @@ function buildResolutionEmailHtml({ clientName, portalLink }) {
 }
 
 const BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK = '91f2ebc9-830d-4c85-9349-63ba0dda3964'
+const BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE_FALLBACK = '2b83adc4-7ccd-459c-9ca0-596e9c7b2967'
 const RESOLUTION_EA_PROFILE = {
   name: 'Tax Refresh',
   address: '405 Rockefeller, Irvine, CA 92612',
@@ -3458,6 +3459,9 @@ function getBoldsignConfig() {
   const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || '').trim()
   const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || '').trim()
   const resolutionTemplateId = String(process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID || BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK).trim()
+  const resolutionTemplateIdSingle = String(
+    process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE || BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE_FALLBACK,
+  ).trim()
   const brandId = String(process.env.BOLDSIGN_BRAND_ID || '').trim()
   const brandIdMfj = String(process.env.BOLDSIGN_BRAND_ID_MFJ || '').trim()
   const brandIdSingle = String(process.env.BOLDSIGN_BRAND_ID_SINGLE || '').trim()
@@ -3471,6 +3475,7 @@ function getBoldsignConfig() {
     templateIdMfj,
     templateIdSingle,
     resolutionTemplateId,
+    resolutionTemplateIdSingle,
     brandId,
     brandIdMfj,
     brandIdSingle,
@@ -4023,11 +4028,13 @@ async function createBoldsignResolutionSigningLink({
   if (!resolvedSignerEmail) throw new Error('A client email is required before launching the resolution document.')
 
   const boldsignConfig = getBoldsignConfig()
-  const resolutionTemplateId = String(boldsignConfig.resolutionTemplateId || '').trim()
-  if (!resolutionTemplateId) throw new Error('The BoldSign resolution template is not configured yet.')
-
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
   const isSingleFiling = isSingleFilingAnswers(answers)
+  const resolutionTemplateId = isSingleFiling
+    ? String(boldsignConfig.resolutionTemplateIdSingle || boldsignConfig.resolutionTemplateId || '').trim()
+    : String(boldsignConfig.resolutionTemplateId || '').trim()
+  if (!resolutionTemplateId) throw new Error('The BoldSign resolution template is not configured yet.')
+
   const selectedBrandId = isMarriedJoint
     ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
     : isSingleFiling
