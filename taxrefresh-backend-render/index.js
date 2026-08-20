@@ -3819,6 +3819,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Client_Full_Name3: fullName,
     Client_Full_Name4: fullName,
     Client_Full_Name5: fullName,
+    Client_Full_Name6: fullName,
     Client_Email: String(context.email || '').trim(),
     Client_Phone_Number: String(context.phone || '').trim(),
     Client_Phone_Number2: String(context.phone || '').trim(),
@@ -3977,6 +3978,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Resolution_Cost2: resolutionCostLabel,
     Client_Full_Name3: fullName,
     Client_Full_Name5: fullName,
+    Client_Full_Name6: fullName,
   }
 
   const spouseFields = {
@@ -4025,9 +4027,12 @@ async function createBoldsignResolutionSigningLink({
   if (!resolutionTemplateId) throw new Error('The BoldSign resolution template is not configured yet.')
 
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const isSingleFiling = isSingleFilingAnswers(answers)
   const selectedBrandId = isMarriedJoint
     ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
-    : String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+    : isSingleFiling
+      ? String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+      : String(boldsignConfig.brandId || '').trim()
   const hideDocumentId = Boolean(boldsignConfig.hideDocumentId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
   const spouseSignerEmailForBoldsign = isMarriedJoint
@@ -4158,12 +4163,17 @@ async function createBoldsign8821SigningLink({
 
   const boldsignConfig = getBoldsignConfig()
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+  const isSingleFiling = isSingleFilingAnswers(answers)
   const selectedTemplateId = isMarriedJoint
     ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-    : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+    : isSingleFiling
+      ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+      : String(boldsignConfig.templateId || '').trim()
   const selectedBrandId = isMarriedJoint
     ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
-    : String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+    : isSingleFiling
+      ? String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
+      : String(boldsignConfig.brandId || '').trim()
   const hideDocumentId = Boolean(boldsignConfig.hideDocumentId)
   const isTemplateConfigured = Boolean(selectedTemplateId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
@@ -6640,6 +6650,11 @@ function isMarriedJointFilingAnswers(answers = {}) {
   return filingStatus === 'married_joint'
 }
 
+function isSingleFilingAnswers(answers = {}) {
+  const filingStatus = getNormalizedFilingStatus(answers)
+  return filingStatus === 'single'
+}
+
 function isForm8821FullySigned(answers = {}) {
   const form8821Status = String(answers.form8821_status || '').trim().toLowerCase()
   if (form8821Status !== 'completed') return false
@@ -8957,9 +8972,12 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
     const answers = roomState?.answers || {}
     const boldsignConfig = getBoldsignConfig()
     const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+    const isSingleFiling = isSingleFilingAnswers(answers)
     const selectedTemplateId = isMarriedJoint
       ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-      : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+      : isSingleFiling
+        ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+        : String(boldsignConfig.templateId || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
     if (
       target === 'spouse' &&
@@ -9080,9 +9098,12 @@ app.get('/api/session/:code/document-link', async (req, res) => {
 
     const boldsignConfig = getBoldsignConfig()
     const isMarriedJoint = isMarriedJointFilingAnswers(answers)
+    const isSingleFiling = isSingleFilingAnswers(answers)
     const selectedTemplateId = isMarriedJoint
       ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-      : String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+      : isSingleFiling
+        ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
+        : String(boldsignConfig.templateId || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
     if (
       target === 'spouse' &&
