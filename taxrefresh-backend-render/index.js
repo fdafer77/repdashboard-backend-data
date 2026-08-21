@@ -8346,6 +8346,87 @@ app.delete('/api/admin/consultations/:code/payment-methods/:paymentMethodId', as
   }
 })
 
+// Client-facing Stripe setup intent for saving a reusable card without sending raw card data to the Stripe API.
+// This is used by the R.E.D. experience payment method flow.
+app.post('/api/session/:code/stripe/setup-intent', async (req, res) => {
+  if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
+    const room = await ensureRoom(roomCode)
+    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    const requestedType = String(req.body?.paymentMethodType || 'card').trim().toLowerCase()
+    const paymentMethodType = requestedType === 'us_bank_account' || requestedType === 'ach' ? 'us_bank_account' : 'card'
+    const intent = await stripe.setupIntents.create({
+      customer: customerId,
+      usage: 'off_session',
+      payment_method_types: [paymentMethodType],
+      ...(paymentMethodType === 'us_bank_account'
+        ? {
+            payment_method_options: {
+              us_bank_account: {
+                verification_method: 'microdeposits',
+              },
+            },
+          }
+        : {}),
+      metadata: {
+        sessionCode: roomCode,
+        paymentMethodType,
+        source: 'client_red_payment_method',
+      },
+    })
+    return res.json({
+      ok: true,
+      publishableKey: STRIPE_PUBLISHABLE_KEY,
+      clientSecret: intent.client_secret,
+      customerId,
+      setupIntentId: intent.id,
+      paymentMethodType,
+    })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create Stripe setup intent' })
+  }
+})
+
+app.post('/api/session/:code/stripe/payment-methods', async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const paymentMethodId = String(req.body?.paymentMethodId || '').trim()
+    const setupIntentId = String(req.body?.setupIntentId || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
+    if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
+    const room = await ensureRoom(roomCode)
+    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+
+    if (setupIntentId) {
+      const setupIntent = await stripe.setupIntents.retrieve(setupIntentId)
+      if (setupIntent.status !== 'succeeded') return res.status(400).json({ error: 'Stripe setup has not completed yet.' })
+      if (String(setupIntent.customer || '') !== customerId) return res.status(400).json({ error: 'Stripe customer mismatch.' })
+    }
+
+    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    if (String(paymentMethod.customer || '') !== customerId) {
+      await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId })
+    }
+    const nextMethod = buildStripePaymentMethodRecord(paymentMethod, { customerId, setupIntentId })
+    const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods).filter(
+      (entry) => String(entry?.stripePaymentMethodId || '') !== paymentMethodId,
+    )
+    const nextMethods = [...existingMethods, nextMethod]
+    room.state.answers.billing_payment_methods = nextMethods
+    room.state.answers.billing_payment_method = nextMethod
+    await persistRoomState(roomCode, room, [
+      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
+      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
+    ])
+    return res.json({ ok: true, paymentMethod: nextMethod })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to attach Stripe payment method' })
+  }
+})
+
 app.post('/api/session/:code/stripe/link-card', async (req, res) => {
   if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
   try {
