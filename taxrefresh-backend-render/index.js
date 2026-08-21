@@ -4196,11 +4196,11 @@ async function createBoldsign8821SigningLink({
   const boldsignConfig = getBoldsignConfig()
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
   const isSingleFiling = isSingleFilingAnswers(answers)
+  // R.E.D packet: only two templates matter (MFJ vs non-MFJ).
+  // Treat anything not explicitly MFJ as the single template so we never fall back to a stale default template id.
   const selectedTemplateId = isMarriedJoint
-    ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-    : isSingleFiling
-      ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
-      : String(boldsignConfig.templateId || '').trim()
+    ? String(boldsignConfig.templateIdMfj || '').trim()
+    : String(boldsignConfig.templateIdSingle || '').trim()
   const selectedBrandId = isMarriedJoint
     ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
     : isSingleFiling
@@ -9014,10 +9014,8 @@ app.post('/api/boldsign/8821/recipient-view', async (req, res) => {
     const isMarriedJoint = isMarriedJointFilingAnswers(answers)
     const isSingleFiling = isSingleFilingAnswers(answers)
     const selectedTemplateId = isMarriedJoint
-      ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-      : isSingleFiling
-        ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
-        : String(boldsignConfig.templateId || '').trim()
+      ? String(boldsignConfig.templateIdMfj || '').trim()
+      : String(boldsignConfig.templateIdSingle || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
     if (
       target === 'spouse' &&
@@ -9140,10 +9138,8 @@ app.get('/api/session/:code/document-link', async (req, res) => {
     const isMarriedJoint = isMarriedJointFilingAnswers(answers)
     const isSingleFiling = isSingleFilingAnswers(answers)
     const selectedTemplateId = isMarriedJoint
-      ? String(boldsignConfig.templateIdMfj || boldsignConfig.templateId || '').trim()
-      : isSingleFiling
-        ? String(boldsignConfig.templateIdSingle || boldsignConfig.templateId || '').trim()
-        : String(boldsignConfig.templateId || '').trim()
+      ? String(boldsignConfig.templateIdMfj || '').trim()
+      : String(boldsignConfig.templateIdSingle || '').trim()
     const templateConfigured = Boolean(selectedTemplateId)
     if (
       target === 'spouse' &&
