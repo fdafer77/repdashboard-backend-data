@@ -78,6 +78,9 @@ const EXPERIAN_PERMISSIBLE_PURPOSE_TERMS = String(process.env.EXPERIAN_PERMISSIB
 const EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT = String(process.env.EXPERIAN_PERMISSIBLE_PURPOSE_ABBREVIATED_AMOUNT || '').trim()
 const EXPERIAN_RISK_MODEL_INDICATORS = String(process.env.EXPERIAN_RISK_MODEL_INDICATORS || '').trim()
 const EXPERIAN_RISK_MODEL_SCORE_PERCENTILE = String(process.env.EXPERIAN_RISK_MODEL_SCORE_PERCENTILE || '').trim()
+
+const BOLDSIGN_8821_TEMPLATE_ID_MFJ_FALLBACK = '36137e86-e99e-4bb6-8565-71516f0523d6'
+const BOLDSIGN_8821_TEMPLATE_ID_SINGLE_FALLBACK = 'fbc11c0d-8e8c-467c-8deb-bacd47d628e6'
 const EXPERIAN_SUMMARY_TYPES = String(process.env.EXPERIAN_SUMMARY_TYPES || '').trim()
 const EXPERIAN_OUTPUT_TYPE = String(process.env.EXPERIAN_OUTPUT_TYPE || '').trim()
 const EXPERIAN_OUTPUT_HEADING = String(process.env.EXPERIAN_OUTPUT_HEADING || '').trim()
@@ -3456,8 +3459,8 @@ function getBoldsignConfig() {
   const apiKey = String(process.env.BOLDSIGN_API_KEY || '').trim()
   const pdfPath = process.env.BOLDSIGN_8821_PDF_PATH?.trim() || new URL('./assets/f8821.pdf', import.meta.url)
   const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
-  const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || '').trim()
-  const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || '').trim()
+  const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || BOLDSIGN_8821_TEMPLATE_ID_MFJ_FALLBACK).trim()
+  const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || BOLDSIGN_8821_TEMPLATE_ID_SINGLE_FALLBACK).trim()
   const resolutionTemplateId = String(process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID || BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK).trim()
   const resolutionTemplateIdSingle = String(
     process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE || BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE_FALLBACK,
