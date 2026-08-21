@@ -684,11 +684,25 @@ function parseStoredTargetMap(value) {
 
 function getNormalizedFilingStatus(answers = {}) {
   const profilePayload = parseStoredObject(answers?.client_portal_financial_profile_payload, null)
-  const payloadValue =
-    profilePayload && typeof profilePayload === 'object' ? String(profilePayload.filing_status || profilePayload.filingStatus || '').trim().toLowerCase() : ''
-  if (payloadValue) return payloadValue
-  const direct = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim().toLowerCase()
-  return direct
+  const rawPayload =
+    profilePayload && typeof profilePayload === 'object'
+      ? String(profilePayload.filing_status || profilePayload.filingStatus || '').trim()
+      : ''
+  const rawDirect = String(getPrimaryAnswer(answers, ['filingStatus', 'filing_status']) || '').trim()
+  const raw = rawPayload || rawDirect
+  const normalized = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+
+  if (!normalized) return ''
+  if (['single', 'single_filer'].includes(normalized)) return 'single'
+  if (['mfj', 'married_filing_jointly', 'married_joint', 'married_filing_joint'].includes(normalized)) return 'married_joint'
+  if (['mfs', 'married_filing_separately', 'married_separate', 'married_filing_separate'].includes(normalized)) return 'married_separate'
+  if (['hoh', 'head_of_household', 'head_household'].includes(normalized)) return 'head_of_household'
+  if (['qualifying_widow', 'qualifying_widower', 'widow', 'widower', 'qwidow'].includes(normalized)) return 'qualifying_widow'
+
+  return normalized
 }
 
 function formatSsnLabel(value = '') {
