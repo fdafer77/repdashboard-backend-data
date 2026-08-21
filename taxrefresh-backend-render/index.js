@@ -3459,8 +3459,9 @@ function getBoldsignConfig() {
   const apiKey = String(process.env.BOLDSIGN_API_KEY || '').trim()
   const pdfPath = process.env.BOLDSIGN_8821_PDF_PATH?.trim() || new URL('./assets/f8821.pdf', import.meta.url)
   const templateId = String(process.env.BOLDSIGN_8821_TEMPLATE_ID || '').trim()
-  const templateIdMfj = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_MFJ || BOLDSIGN_8821_TEMPLATE_ID_MFJ_FALLBACK).trim()
-  const templateIdSingle = String(process.env.BOLDSIGN_8821_TEMPLATE_ID_SINGLE || BOLDSIGN_8821_TEMPLATE_ID_SINGLE_FALLBACK).trim()
+  // R.E.D packet templates are fixed by filing status (do not override via env).
+  const templateIdMfj = BOLDSIGN_8821_TEMPLATE_ID_MFJ_FALLBACK
+  const templateIdSingle = BOLDSIGN_8821_TEMPLATE_ID_SINGLE_FALLBACK
   const resolutionTemplateId = String(process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID || BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK).trim()
   const resolutionTemplateIdSingle = String(
     process.env.BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE || BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE_FALLBACK,
@@ -4103,7 +4104,15 @@ async function createBoldsignResolutionSigningLink({
     },
   })
 
-  const documentId = String(sendResult?.documentId || '').trim()
+  const documentId = String(
+    sendResult?.documentId ||
+      sendResult?.DocumentId ||
+      (Array.isArray(sendResult?.documentIds) ? sendResult.documentIds[0] : '') ||
+      sendResult?.data?.documentId ||
+      sendResult?.data?.id ||
+      sendResult?.id ||
+      '',
+  ).trim()
   if (!documentId) throw new Error('BoldSign did not return a documentId for the resolution document.')
 
   if (persistDocument) {
@@ -4284,7 +4293,15 @@ async function createBoldsign8821SigningLink({
           })
         })
 
-    documentId = String(sendResult?.documentId || '').trim()
+    documentId = String(
+      sendResult?.documentId ||
+        sendResult?.DocumentId ||
+        (Array.isArray(sendResult?.documentIds) ? sendResult.documentIds[0] : '') ||
+        sendResult?.data?.documentId ||
+        sendResult?.data?.id ||
+        sendResult?.id ||
+        '',
+    ).trim()
     logMemoryDiagnostics('createBoldsign8821SigningLink:after-document-create', {
       sessionCode: normalizedSessionCode,
       documentId,
