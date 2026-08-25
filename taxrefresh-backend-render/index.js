@@ -8550,6 +8550,23 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
     const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
     const isUsBankAccount = String(paymentMethod?.type || '').trim().toLowerCase() === 'us_bank_account'
+
+    const processedPaymentMethodLast4 = (() => {
+      if (!paymentMethod || typeof paymentMethod !== 'object') return ''
+      const type = String(paymentMethod.type || '').trim().toLowerCase()
+      if (type === 'card') return String(paymentMethod.card?.last4 || '').trim()
+      if (type === 'us_bank_account') return String(paymentMethod.us_bank_account?.last4 || '').trim()
+      return ''
+    })()
+
+    const processedPaymentMethodBrand = (() => {
+      if (!paymentMethod || typeof paymentMethod !== 'object') return ''
+      const type = String(paymentMethod.type || '').trim().toLowerCase()
+      if (type === 'card') return String(paymentMethod.card?.brand || '').trim()
+      if (type === 'us_bank_account') return String(paymentMethod.us_bank_account?.bank_name || 'ACH').trim()
+      return ''
+    })()
+
     const intent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency: 'usd',
@@ -8571,6 +8588,8 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       reason: '',
       stripePaymentIntentId: intent.id,
       processedAt: new Date().toISOString(),
+      processedPaymentMethodLast4,
+      processedPaymentMethodBrand,
     }
     room.state.answers.billing_schedule = rows
     await persistRoomState(roomCode, room, [{ type: 'setAnswer', questionId: 'billing_schedule', value: rows }])
@@ -8591,6 +8610,8 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
             failureReason: reason,
             processorReason: reason,
             reason,
+            processedPaymentMethodLast4: '',
+            processedPaymentMethodBrand: '',
           }
           room.state.answers.billing_schedule = rows
           await persistRoomState(roomCode, room, [{ type: 'setAnswer', questionId: 'billing_schedule', value: rows }])
