@@ -3460,8 +3460,9 @@ function buildResolutionEmailHtml({ clientName, portalLink }) {
 const BOLDSIGN_RESOLUTION_TEMPLATE_ID_FALLBACK = '91f2ebc9-830d-4c85-9349-63ba0dda3964'
 const BOLDSIGN_RESOLUTION_TEMPLATE_ID_SINGLE_FALLBACK = '2b83adc4-7ccd-459c-9ca0-596e9c7b2967'
 const RESOLUTION_EA_PROFILE = {
-  name: 'Tax Refresh',
-  address: '405 Rockefeller, Irvine, CA 92612',
+  // Used for Resolution (2848) BoldSign autofill.
+  name: 'Caprizio Fornaro',
+  address: '23652 Lexington Ct, Laguna Niguel, CA 92677',
   phone: '(949) 702-2723',
   fax: '(941)-340-2146',
   caf: '0317-33812',
@@ -3977,7 +3978,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Enrolled_Agent_CAF: cafValue,
     Enrolled_Agent_PTIN: RESOLUTION_EA_PROFILE.ptin,
     Enrolled_Agent_Phone: RESOLUTION_EA_PROFILE.phone,
-    Tax_Type: taxTypeLabel,
+    Tax_Type: 'Income',
     Tax_Form: taxFormLabel,
     Years_Owed: yearsOwedLabel,
     Client_Full_Name2: fullName,
