@@ -6914,6 +6914,31 @@ function buildStripePaymentMethodRecord(paymentMethod, { customerId = '', setupI
   }
 }
 
+function buildClientPortalPaymentMethodRecord(method) {
+  const holder = String(method?.cardholderName || method?.accountHolderName || '').trim()
+  const brand = String(method?.cardBrand || method?.cardType || method?.institutionName || method?.type || 'Card').trim() || 'Card'
+  const last4 = String(method?.last4 || method?.accountNumber || method?.cardNumber || '')
+    .replace(/\D/g, '')
+    .slice(-4)
+  const exp = String(method?.expiration || '').trim()
+  return { holder, brand, last4, exp }
+}
+
+async function persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod) {
+  const portalMethods = nextMethods.map(buildClientPortalPaymentMethodRecord).filter((entry) => entry && (entry.holder || entry.last4))
+  const portalMethod = portalMethods[portalMethods.length - 1] || null
+  room.state.answers.billing_payment_methods = nextMethods
+  room.state.answers.billing_payment_method = nextMethod
+  room.state.answers.client_portal_payment_methods = portalMethods
+  room.state.answers.client_portal_payment_method = portalMethod
+  await persistRoomState(roomCode, room, [
+    { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
+    { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
+    { type: 'setAnswer', questionId: 'client_portal_payment_methods', value: portalMethods },
+    { type: 'setAnswer', questionId: 'client_portal_payment_method', value: portalMethod },
+  ])
+}
+
 function normalizeRawCardDigits(value = '') {
   return String(value || '').replace(/\D/g, '')
 }
@@ -8431,12 +8456,7 @@ app.post('/api/session/:code/stripe/payment-methods', async (req, res) => {
       (entry) => String(entry?.stripePaymentMethodId || '') !== paymentMethodId,
     )
     const nextMethods = [...existingMethods, nextMethod]
-    room.state.answers.billing_payment_methods = nextMethods
-    room.state.answers.billing_payment_method = nextMethod
-    await persistRoomState(roomCode, room, [
-      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
-      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
-    ])
+    await persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod)
     return res.json({ ok: true, paymentMethod: nextMethod })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to attach Stripe payment method' })
@@ -8458,12 +8478,7 @@ app.post('/api/session/:code/stripe/link-card', async (req, res) => {
       (entry) => String(entry?.stripePaymentMethodId || '') !== nextMethod.stripePaymentMethodId,
     )
     const nextMethods = [...existingMethods, nextMethod]
-    room.state.answers.billing_payment_methods = nextMethods
-    room.state.answers.billing_payment_method = nextMethod
-    await persistRoomState(roomCode, room, [
-      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
-      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
-    ])
+    await persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod)
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentMethod: nextMethod })
   } catch (error) {
