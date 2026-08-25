@@ -5359,7 +5359,7 @@ function buildConsultationSummary(record) {
     (entry) =>
       String(entry?.name || '').trim() === 'Resolution Documents' &&
       String(entry?.status || '').trim() === 'Signed',
-  )
+  ) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
     String(answers.ea_transcripts_ready_for_client || '')
