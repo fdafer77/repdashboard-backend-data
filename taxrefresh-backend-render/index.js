@@ -3725,6 +3725,32 @@ async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
   }
 }
 
+async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = {}) {
+  const roomState = state || initialRoomState()
+  const answers = roomState.answers || {}
+  const documentId = String(answers.boldsign_resolution_document_id || '').trim()
+  if (!documentId) return false
+  if (String(answers.boldsign_resolution_signed_at || '').trim()) return false
+
+  try {
+    const properties = await getBoldsignDocumentProperties(documentId, {
+      onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
+    })
+    const status = String(properties?.status || '').trim().toLowerCase()
+    if (status !== 'completed') return false
+
+    answers.boldsign_resolution_signed_at = new Date().toISOString()
+    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at)
+    roomState.answers = answers
+    await persist(roomState)
+    emitDashboardRecordsUpdated({ reason: 'boldsign_reconciled_resolution_completed', roomCode, target: 'resolution' })
+    return true
+  } catch (error) {
+    console.error('Failed to reconcile BoldSign resolution status:', error)
+    return false
+  }
+}
+
 async function loadBoldsign8821PdfDataUri() {
   const { pdfPath } = getBoldsignConfig()
   const resolvedPath =
@@ -7538,6 +7564,14 @@ async function getConsultationRecordByCode(code) {
         await dbUpsertSession({ code: row.session_code, state: nextState })
       },
     })
+    await reconcileBoldsignResolutionStatus({
+      roomCode: row.session_code,
+      state: row.state,
+      persist: async (nextState) => {
+        row.state = nextState
+        await dbUpsertSession({ code: row.session_code, state: nextState })
+      },
+    })
     return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -7550,6 +7584,14 @@ async function getConsultationRecordByCode(code) {
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
   if (!room) return null
   await reconcileBoldsign8821Status({
+    roomCode: normalized,
+    state: room.state,
+    persist: async (nextState) => {
+      room.state = nextState
+      await dbUpsertSession({ code: normalized, state: nextState })
+    },
+  })
+  await reconcileBoldsignResolutionStatus({
     roomCode: normalized,
     state: room.state,
     persist: async (nextState) => {
