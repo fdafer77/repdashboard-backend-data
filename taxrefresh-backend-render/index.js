@@ -3244,9 +3244,10 @@ async function findSessionByBoldsignDocumentId(documentId = '') {
   return null
 }
 
-function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '') {
+function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '', documentCode = '') {
   const normalizedSignedAt = String(signedAt || '').trim() || new Date().toISOString()
   const targetName = 'Resolution Documents'
+  const normalizedDocumentCode = String(documentCode || '').trim()
 
   const currentDeliveryLog = Array.isArray(answers?.document_delivery_log)
     ? answers.document_delivery_log
@@ -3255,6 +3256,8 @@ function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '') {
     answers.document_delivery_log = currentDeliveryLog.map((entry) => {
       const name = String(entry?.name || '').trim()
       if (name !== targetName) return entry
+      const entryDocumentCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryDocumentCode && entryDocumentCode !== normalizedDocumentCode) return entry
       return {
         ...(entry || {}),
         status: 'Signed',
@@ -3270,6 +3273,8 @@ function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '') {
     answers.document_receipts = currentReceipts.map((entry) => {
       const name = String(entry?.name || '').trim()
       if (name !== targetName) return entry
+      const entryDocumentCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryDocumentCode && entryDocumentCode !== normalizedDocumentCode) return entry
       return {
         ...(entry || {}),
         status: 'Signed',
@@ -3306,11 +3311,11 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
     }
 
     if (normalizedType.includes('sent') || normalizedType.includes('created')) {
-      if (!hasDocumentLifecycleEntry(answers, { name: receiptName, documentCode: '' })) {
+      if (!hasDocumentLifecycleEntry(answers, { name: receiptName, documentCode: documentId })) {
         const receiptEntry = {
           id: `boldsign_${documentId}_${normalizedType}_resolution`,
           name: receiptName,
-          documentCode: '',
+          documentCode: documentId,
           status: 'Sent',
           method: 'Experience',
           sentAt,
@@ -3321,7 +3326,7 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
         answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, [
           {
             name: receiptName,
-            documentCode: '',
+            documentCode: documentId,
             status: 'Sent',
             method: 'Experience',
             sentAt,
@@ -3335,7 +3340,7 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
 
     if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
       answers.boldsign_resolution_signed_at = answers.boldsign_resolution_signed_at || new Date().toISOString()
-      markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at)
+      markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
       room.state.updatedAt = Date.now()
       try {
         await dbUpsertSession({
@@ -3740,7 +3745,7 @@ async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = 
     if (status !== 'completed') return false
 
     answers.boldsign_resolution_signed_at = new Date().toISOString()
-    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at)
+    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
     roomState.answers = answers
     await persist(roomState)
     emitDashboardRecordsUpdated({ reason: 'boldsign_reconciled_resolution_completed', roomCode, target: 'resolution' })
@@ -8892,6 +8897,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         return res.status(400).json({ error: 'Spouse email is required for married filing jointly resolution documents.' })
       }
       answers.spouse_email = resolvedSpouseRecipientEmail || answers.spouse_email || ''
+      answers.boldsign_resolution_signed_at = ''
       await createBoldsignResolutionSigningLink({
         sessionCode: roomCode,
         signerName: clientName,
@@ -8902,10 +8908,12 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         disableEmails: false,
         persistDocument: true,
       })
-      nextReceipts.push({ name: 'Resolution Documents', status: 'Sent' })
+      const resolutionDocumentCode = String(answers.boldsign_resolution_document_id || '').trim()
+      nextReceipts.push({ name: 'Resolution Documents', documentCode: resolutionDocumentCode, status: 'Sent' })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_resolution`,
         documentType: 'Resolution Documents',
+        documentCode: resolutionDocumentCode,
         recipientEmail: resolvedRecipientEmail,
         link: '',
         sentAt,
@@ -8914,6 +8922,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       deliveryEntries.push({
         id: `doc_delivery_${Date.now().toString(36)}_resolution`,
         name: 'Resolution Documents',
+        documentCode: resolutionDocumentCode,
         status: 'Sent',
         method: 'BoldSign Email',
         sentAt,
@@ -8957,6 +8966,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
               { type: 'setAnswer', questionId: 'boldsign_resolution_document_id', value: answers.boldsign_resolution_document_id || '' },
               { type: 'setAnswer', questionId: 'boldsign_resolution_file_name', value: answers.boldsign_resolution_file_name || '' },
               { type: 'setAnswer', questionId: 'boldsign_resolution_sent_at', value: answers.boldsign_resolution_sent_at || '' },
+              { type: 'setAnswer', questionId: 'boldsign_resolution_signed_at', value: answers.boldsign_resolution_signed_at || '' },
               { type: 'setAnswer', questionId: 'boldsign_resolution_sender_email', value: answers.boldsign_resolution_sender_email || '' },
               { type: 'setAnswer', questionId: 'boldsign_resolution_spouse_signer_email', value: answers.boldsign_resolution_spouse_signer_email || '' },
             ]
