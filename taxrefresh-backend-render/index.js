@@ -839,6 +839,12 @@ function getSaved8821FirstPageFilename(answers = {}) {
   return `${safeClientName}-signed-8821-page-1.pdf`
 }
 
+function getSavedResolutionFilename(answers = {}) {
+  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'client').trim()
+  const safeClientName = clientName.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'client'
+  return `${safeClientName}-signed-2848.pdf`
+}
+
 function getSigned8821DocumentRecord(answers = {}) {
   const eaDocuments = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   if (!Array.isArray(eaDocuments)) return null
@@ -8044,6 +8050,42 @@ app.get('/api/admin/consultations/:code/signed-8821-page-1', async (req, res) =>
     return res.send(payload.fileBuffer)
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 8821 page 1.' })
+  }
+})
+
+app.get('/api/admin/consultations/:code/signed-resolution', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const item = await getConsultationRecordByCode(req.params.code)
+    if (!item) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+
+    const answers = item.answers || {}
+    const documentId = String(answers.boldsign_resolution_document_id || '').trim()
+    if (!documentId) {
+      return res.status(404).json({ error: 'No signed Form 2848 document is available for this client yet.' })
+    }
+    if (!String(answers.boldsign_resolution_signed_at || '').trim()) {
+      return res.status(409).json({ error: 'Form 2848 is not fully signed yet.' })
+    }
+
+    const download = await boldsignDownloadDocument(documentId, {
+      onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
+    })
+    if (!download?.fileBuffer?.length) {
+      return res.status(404).json({ error: 'No signed Form 2848 document is available for this client yet.' })
+    }
+
+    const filenameRaw = String(answers.boldsign_resolution_file_name || '').trim()
+    const filename = filenameRaw ? (/\.pdf$/i.test(filenameRaw) ? filenameRaw : `${filenameRaw}.pdf`) : getSavedResolutionFilename(answers)
+    res.setHeader('Content-Type', download.contentType || 'application/pdf')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Disposition', `${String(req.query?.download || '') === '1' ? 'attachment' : 'inline'}; filename="${filename}"`)
+    return res.send(download.fileBuffer)
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 2848.' })
   }
 })
 
