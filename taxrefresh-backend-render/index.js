@@ -3332,7 +3332,12 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
       markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at)
       room.state.updatedAt = Date.now()
       try {
-        await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+        await dbUpsertSession({
+          code: roomCode,
+          contactId: room.contactId || null,
+          opportunityId: room.opportunityId || null,
+          state: room.state,
+        })
       } catch {
         // ignore; room state is still updated in memory
       }
@@ -3342,7 +3347,12 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
 
     room.state.updatedAt = Date.now()
     try {
-      await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+      await dbUpsertSession({
+        code: roomCode,
+        contactId: room.contactId || null,
+        opportunityId: room.opportunityId || null,
+        state: room.state,
+      })
     } catch {
       // ignore; room state is still updated in memory
     }
@@ -3437,7 +3447,12 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
 
   room.state.updatedAt = Date.now()
   try {
-    await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: room.state })
+    await dbUpsertSession({
+      code: roomCode,
+      contactId: room.contactId || null,
+      opportunityId: room.opportunityId || null,
+      state: room.state,
+    })
   } catch {
     // ignore; room state is still updated in memory
   }
