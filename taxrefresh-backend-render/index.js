@@ -3478,7 +3478,7 @@ const RESOLUTION_EA_PROFILE = {
   // Used for Resolution (2848) BoldSign autofill.
   name: 'Caprizio Fornaro',
   address: '23652 Lexington Ct, Laguna Niguel, CA 92677',
-  phone: '(949) 702-2723',
+  phone: '(949)-590-6731',
   fax: '(941)-340-2146',
   caf: '0317-33812',
   ptin: 'P03152236',
