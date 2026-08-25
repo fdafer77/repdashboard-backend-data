@@ -3994,7 +3994,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Enrolled_Agent_PTIN: RESOLUTION_EA_PROFILE.ptin,
     Enrolled_Agent_Phone: RESOLUTION_EA_PROFILE.phone,
     Tax_Type: 'Income',
-    Tax_Form: taxFormLabel,
+    Tax_Form: '1040',
     Years_Owed: '2025-2016',
     Client_Full_Name2: fullName,
     Client_Full_Name4: fullName,
