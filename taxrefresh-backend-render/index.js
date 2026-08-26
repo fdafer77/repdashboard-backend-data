@@ -6994,16 +6994,17 @@ function parseCardExpirationParts(value = '') {
   }
 }
 
-async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = '', cardNumber = '', expiration = '', cvv = '' } = {}) {
+async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = '', cardNumber = '', expiration = '', cvv = '', billingZip = '' } = {}) {
   if (!stripe) throw new Error('Stripe is not configured.')
   const digits = normalizeRawCardDigits(cardNumber)
   const cvc = normalizeRawCardDigits(cvv).slice(0, 4)
   const exp = parseCardExpirationParts(expiration)
+  const postalCode = normalizeRawCardDigits(billingZip).slice(0, 9)
   if (!digits || digits.length < 15) throw new Error('A valid card number is required.')
   if (!exp) throw new Error('A valid card expiration is required.')
   if (!cvc || cvc.length < 3) throw new Error('A valid card security code is required.')
   const customerId = await ensureStripeCustomerForRoom(roomCode, room)
-  const paymentMethod = await stripe.paymentMethods.create({
+  let paymentMethod = await stripe.paymentMethods.create({
     type: 'card',
     card: {
       number: digits,
@@ -7015,12 +7016,41 @@ async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = 
       name: String(cardholderName || '').trim() || undefined,
       email: String(room?.state?.answers?.email || '').trim() || undefined,
       phone: String(room?.state?.answers?.phone || '').trim() || undefined,
+      address: postalCode ? { postal_code: postalCode } : undefined,
     },
     metadata: {
       sessionCode: roomCode,
       source: 'legacy_saved_card',
     },
   })
+  const setupIntent = await stripe.setupIntents.create({
+    customer: customerId,
+    payment_method: paymentMethod.id,
+    confirm: true,
+    usage: 'off_session',
+    payment_method_types: ['card'],
+    payment_method_options: {
+      card: {
+        request_three_d_secure: 'automatic',
+      },
+    },
+    metadata: {
+      sessionCode: roomCode,
+      source: 'legacy_saved_card',
+    },
+  })
+  if (setupIntent.status === 'requires_action') {
+    throw new Error('This card requires additional verification before it can be saved. Please try a different card.')
+  }
+  if (setupIntent.status !== 'succeeded') {
+    const setupMessage = String(setupIntent?.last_setup_error?.message || '').trim()
+    throw new Error(setupMessage || 'Stripe could not verify this card. Please double-check the details and try again.')
+  }
+  paymentMethod = await stripe.paymentMethods.retrieve(paymentMethod.id)
+  const cvcCheck = String(paymentMethod?.card?.checks?.cvc_check || '').trim().toLowerCase()
+  const zipCheck = String(paymentMethod?.card?.checks?.address_postal_code_check || '').trim().toLowerCase()
+  if (cvcCheck === 'fail') throw new Error('Stripe could not verify the security code on this card.')
+  if (postalCode && zipCheck === 'fail') throw new Error('Stripe could not verify the billing ZIP code for this card.')
   if (String(paymentMethod.customer || '') !== customerId) {
     await stripe.paymentMethods.attach(paymentMethod.id, { customer: customerId })
   }
@@ -7036,7 +7066,8 @@ async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = 
   return {
     customerId,
     paymentMethod,
-    nextMethod: buildStripePaymentMethodRecord(paymentMethod, { customerId }),
+    setupIntent,
+    nextMethod: buildStripePaymentMethodRecord(paymentMethod, { customerId, setupIntentId: setupIntent.id }),
   }
 }
 
@@ -8563,7 +8594,8 @@ app.post('/api/session/:code/stripe/link-card', async (req, res) => {
     const cardNumber = String(req.body?.cardNumber || '').trim()
     const expiration = String(req.body?.expiration || '').trim()
     const cvv = String(req.body?.cvv || '').trim()
-    const { nextMethod } = await createStripeLinkedCardForRoom(roomCode, room, { cardholderName, cardNumber, expiration, cvv })
+    const billingZip = String(req.body?.billingZip || room.state.answers.payment_billing_zip || room.state.answers._ui_pay_billingZip || '').trim()
+    const { nextMethod } = await createStripeLinkedCardForRoom(roomCode, room, { cardholderName, cardNumber, expiration, cvv, billingZip })
     const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods).filter(
       (entry) => String(entry?.stripePaymentMethodId || '') !== nextMethod.stripePaymentMethodId,
     )
