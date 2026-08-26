@@ -8639,15 +8639,53 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Stripe is not configured.' })
   try {
     const roomCode = String(req.params.code || '').trim()
+    const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
     const scheduleIndex = Number(req.body?.scheduleIndex)
     const paymentMethodId = String(req.body?.paymentMethodId || '').trim()
+    const scheduledDate = String(req.body?.scheduledDate || '').trim()
+    const scheduledAmount = Number(req.body?.scheduledAmount)
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     if (!Number.isInteger(scheduleIndex) || scheduleIndex < 0) return res.status(400).json({ error: 'A valid scheduleIndex is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
-    const schedule = Array.isArray(room.state.answers.billing_schedule) ? room.state.answers.billing_schedule : []
+    const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
+    const parseScheduleValue = (value) => {
+      if (Array.isArray(value)) return value
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value)
+          return Array.isArray(parsed) ? parsed : []
+        } catch {
+          return []
+        }
+      }
+      return []
+    }
+    const schedule = (() => {
+      const scoped = parseScheduleValue(room.state.answers[scheduleFieldKey])
+      if (scoped.length) return scoped
+      if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule)
+      return []
+    })()
     const rows = Array.isArray(schedule) ? schedule.map((row) => ({ ...(row || {}) })) : []
-    const targetRow = rows[scheduleIndex]
+    let targetRow = rows[scheduleIndex]
+    let targetScheduleIndex = scheduleIndex
+    if (
+      (!targetRow || (scheduledDate && String(targetRow?.date || '').trim() !== scheduledDate) || (Number.isFinite(scheduledAmount) && Number(targetRow?.amount || 0) !== scheduledAmount)) &&
+      (scheduledDate || Number.isFinite(scheduledAmount))
+    ) {
+      const matchedIndex = rows.findIndex((row) => {
+        const rowDate = String(row?.date || '').trim()
+        const rowAmount = Number(row?.amount || 0)
+        const dateMatches = scheduledDate ? rowDate === scheduledDate : true
+        const amountMatches = Number.isFinite(scheduledAmount) ? rowAmount === scheduledAmount : true
+        return dateMatches && amountMatches
+      })
+      if (matchedIndex >= 0) {
+        targetScheduleIndex = matchedIndex
+        targetRow = rows[matchedIndex]
+      }
+    }
     if (!targetRow) return res.status(404).json({ error: 'Billing schedule row not found' })
     const amount = Number(targetRow.amount || 0)
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'The scheduled amount is invalid.' })
@@ -8680,11 +8718,12 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       off_session: !isUsBankAccount,
       metadata: {
         sessionCode: roomCode,
-        scheduleIndex: String(scheduleIndex),
+        scheduleIndex: String(targetScheduleIndex),
+        billingMode,
         amount: String(amount),
       },
     })
-    rows[scheduleIndex] = {
+    rows[targetScheduleIndex] = {
       ...targetRow,
       status: intent.status === 'succeeded' ? 'Processed' : intent.status === 'processing' ? 'Processing' : 'Processed',
       failureReason: '',
@@ -8695,17 +8734,41 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       processedPaymentMethodLast4,
       processedPaymentMethodBrand,
     }
-    room.state.answers.billing_schedule = rows
-    await persistRoomState(roomCode, room, [{ type: 'setAnswer', questionId: 'billing_schedule', value: rows }])
+    room.state.answers[scheduleFieldKey] = rows
+    const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: rows }]
+    if (billingMode === 'investigation') {
+      room.state.answers.billing_schedule = rows
+      persistPatches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: rows })
+    }
+    await persistRoomState(roomCode, room, persistPatches)
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentIntentId: intent.id, status: intent.status })
   } catch (error) {
     const roomCode = String(req.params.code || '').trim()
+    const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
     const scheduleIndex = Number(req.body?.scheduleIndex)
     if (roomCode && Number.isInteger(scheduleIndex) && scheduleIndex >= 0) {
       try {
         const room = await ensureRoom(roomCode)
-        const rows = Array.isArray(room.state.answers.billing_schedule) ? room.state.answers.billing_schedule.map((row) => ({ ...(row || {}) })) : []
+        const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
+        const parseScheduleValue = (value) => {
+          if (Array.isArray(value)) return value
+          if (typeof value === 'string' && value.trim()) {
+            try {
+              const parsed = JSON.parse(value)
+              return Array.isArray(parsed) ? parsed : []
+            } catch {
+              return []
+            }
+          }
+          return []
+        }
+        const rows = (() => {
+          const scoped = parseScheduleValue(room.state.answers[scheduleFieldKey]).map((row) => ({ ...(row || {}) }))
+          if (scoped.length) return scoped
+          if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule).map((row) => ({ ...(row || {}) }))
+          return []
+        })()
         if (rows[scheduleIndex]) {
           const reason = getStripePaymentFailureReason(error)
           rows[scheduleIndex] = {
@@ -8717,8 +8780,13 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
             processedPaymentMethodLast4: '',
             processedPaymentMethodBrand: '',
           }
-          room.state.answers.billing_schedule = rows
-          await persistRoomState(roomCode, room, [{ type: 'setAnswer', questionId: 'billing_schedule', value: rows }])
+          room.state.answers[scheduleFieldKey] = rows
+          const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: rows }]
+          if (billingMode === 'investigation') {
+            room.state.answers.billing_schedule = rows
+            persistPatches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: rows })
+          }
+          await persistRoomState(roomCode, room, persistPatches)
         }
       } catch {
         // ignore persistence errors during failure handling
