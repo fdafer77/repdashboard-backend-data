@@ -5454,6 +5454,7 @@ function buildConsultationSummary(record) {
     readyForEnrolledAgent: String(getPrimaryAnswer(answers, ['ready_for_enrolled_agent']) || ''),
     leadType: String(getPrimaryAnswer(answers, ['leadType', 'lead_type']) || ''),
     isTrainingLead: String(getPrimaryAnswer(answers, ['isTrainingLead', 'is_training_lead']) || ''),
+    cancellationRequestStatus: String(getPrimaryAnswer(answers, ['cancellation_request_status']) || ''),
     answerCount: Object.keys(answers).filter((key) => !key.startsWith('_ui_')).length,
   }
 }
@@ -8648,6 +8649,10 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     if (!Number.isInteger(scheduleIndex) || scheduleIndex < 0) return res.status(400).json({ error: 'A valid scheduleIndex is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
+    const cancellationStatus = String(room?.state?.answers?.cancellation_request_status || '').trim().toLowerCase()
+    if (cancellationStatus.includes('cancel')) {
+      return res.status(409).json({ error: 'This record is marked as requesting cancellation. Payments are disabled.' })
+    }
     const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
     const parseScheduleValue = (value) => {
       if (Array.isArray(value)) return value
@@ -9965,49 +9970,60 @@ function buildConsultationAnalytics(items = [], account = null) {
   const topOpportunities = analyticsItems
     .map((item) => {
       const answers = item?.answers || {}
+      const cancellationStatus = String(getPrimaryAnswer(answers, ['cancellation_request_status']) || '')
+        .trim()
+        .toLowerCase()
+      const isCancellationRequested = cancellationStatus.includes('cancel')
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
       let processedRevenue = 0
       let pendingRevenue = 0
       let failedRevenue = 0
-      scheduleRows.forEach((row, rowIndex) => {
-        const amount = toNumberValue(row?.amount)
-        const tone = getBillingStatusTone(row)
-        const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
-        const monthKey = normalizedDate.slice(0, 7)
-        const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : 'Pending'
-        const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
-        const paymentScheduleEntry = {
-          id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
-          sessionCode: String(item.sessionCode || '').trim(),
-          clientName: String(item.clientName || 'Unknown client').trim() || 'Unknown client',
-          pipelineName: String(item.pipelineName || 'No pipeline').trim() || 'No pipeline',
-          stageName: String(item.stageName || '').trim(),
-          scheduledDate: normalizedDate,
-          amount,
-          statusTone: tone,
-          statusLabel,
-          failureReason,
-          updatedAt: String(item.updatedAt || '').trim(),
-        }
-        paymentSchedules.push(paymentScheduleEntry)
-        if (tone === 'processed') {
-          processedRevenue += amount
-          processedRevenueTotal += amount
-          if (monthKey) {
-            const existing = monthlyRevenue.get(monthKey) || { month: monthKey, label: formatMonthLabel(monthKey), revenue: 0, processedCount: 0 }
-            existing.revenue += amount
-            existing.processedCount += 1
-            monthlyRevenue.set(monthKey, existing)
+      if (!isCancellationRequested) {
+        scheduleRows.forEach((row, rowIndex) => {
+          const amount = toNumberValue(row?.amount)
+          const tone = getBillingStatusTone(row)
+          const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
+          const monthKey = normalizedDate.slice(0, 7)
+          const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : 'Pending'
+          const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
+          const paymentScheduleEntry = {
+            id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
+            sessionCode: String(item.sessionCode || '').trim(),
+            clientName: String(item.clientName || 'Unknown client').trim() || 'Unknown client',
+            pipelineName: String(item.pipelineName || 'No pipeline').trim() || 'No pipeline',
+            stageName: String(item.stageName || '').trim(),
+            scheduledDate: normalizedDate,
+            amount,
+            statusTone: tone,
+            statusLabel,
+            failureReason,
+            updatedAt: String(item.updatedAt || '').trim(),
           }
-        } else if (tone === 'failed') {
-          failedRevenue += amount
-          failedRevenueTotal += amount
-          failedPayments.push(paymentScheduleEntry)
-        } else {
-          pendingRevenue += amount
-          pendingRevenueTotal += amount
-        }
-      })
+          paymentSchedules.push(paymentScheduleEntry)
+          if (tone === 'processed') {
+            processedRevenue += amount
+            processedRevenueTotal += amount
+            if (monthKey) {
+              const existing = monthlyRevenue.get(monthKey) || {
+                month: monthKey,
+                label: formatMonthLabel(monthKey),
+                revenue: 0,
+                processedCount: 0,
+              }
+              existing.revenue += amount
+              existing.processedCount += 1
+              monthlyRevenue.set(monthKey, existing)
+            }
+          } else if (tone === 'failed') {
+            failedRevenue += amount
+            failedRevenueTotal += amount
+            failedPayments.push(paymentScheduleEntry)
+          } else {
+            pendingRevenue += amount
+            pendingRevenueTotal += amount
+          }
+        })
+      }
 
       const eaTasks = parseStoredObject(answers?.ea_tasks, [])
       const eaDocuments = parseStoredObject(answers?.ea_documents, [])
