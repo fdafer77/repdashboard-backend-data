@@ -4053,7 +4053,6 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Resolution_Cost2: resolutionCostLabel,
     Client_Full_Name3: fullName,
     Client_Full_Name5: fullName,
-    Client_Full_Name6: fullName,
   }
 
   const spouseFields = {
