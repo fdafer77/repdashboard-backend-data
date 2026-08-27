@@ -2283,6 +2283,35 @@ function isPortalAuthorizedForAnswers(answers = {}) {
   return isForm8821FullySigned(answers)
 }
 
+function hasSignedResolutionDocuments(answers = {}) {
+  const documentReceipts = Array.isArray(answers.document_receipts) ? answers.document_receipts : parseStoredObject(answers.document_receipts, [])
+  const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
+  return [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])].some(
+    (entry) =>
+      String(entry?.name || '').trim() === 'Resolution Documents' &&
+      String(entry?.status || '').trim().toLowerCase() === 'signed',
+  ) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
+}
+
+function hasSignedPendingRevenueDocuments(answers = {}) {
+  const onboardingStatus = String(answers?.onboarding_status || '').trim().toLowerCase()
+  if (onboardingStatus === 'documents_signed') return true
+  return hasSignedResolutionDocuments(answers)
+}
+
+function hasStoredPaymentMethodOnFile(answers = {}) {
+  const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
+  const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
+  const billingPaymentMethod = parseStoredObject(answers.billing_payment_method, null)
+  const portalPaymentMethod = parseStoredObject(answers.client_portal_payment_method, null)
+  return Boolean(
+    billingPaymentMethods.length ||
+      portalPaymentMethods.length ||
+      (billingPaymentMethod && typeof billingPaymentMethod === 'object' && !Array.isArray(billingPaymentMethod)) ||
+      (portalPaymentMethod && typeof portalPaymentMethod === 'object' && !Array.isArray(portalPaymentMethod)),
+  )
+}
+
 function formatMonthLabel(monthKey = '') {
   if (!/^\d{4}-\d{2}$/.test(monthKey)) return monthKey
   const [year, month] = monthKey.split('-')
@@ -5420,13 +5449,7 @@ function buildConsultationSummary(record) {
       (billingPaymentMethod && typeof billingPaymentMethod === 'object') ||
       (portalPaymentMethod && typeof portalPaymentMethod === 'object'),
   )
-  const documentReceipts = Array.isArray(answers.document_receipts) ? answers.document_receipts : parseStoredObject(answers.document_receipts, [])
-  const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
-  const resolutionDocumentsSigned = [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])].some(
-    (entry) =>
-      String(entry?.name || '').trim() === 'Resolution Documents' &&
-      String(entry?.status || '').trim() === 'Signed',
-  ) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
+  const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
     String(answers.ea_transcripts_ready_for_client || '')
@@ -10036,6 +10059,7 @@ function buildConsultationAnalytics(items = [], account = null) {
         .trim()
         .toLowerCase()
       const isCancellationRequested = cancellationStatus.includes('cancel')
+      const pendingRevenueEligible = hasSignedPendingRevenueDocuments(answers) && hasStoredPaymentMethodOnFile(answers)
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
       let processedRevenue = 0
       let pendingRevenue = 0
@@ -10044,6 +10068,7 @@ function buildConsultationAnalytics(items = [], account = null) {
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
+          if (tone === 'pending' && !pendingRevenueEligible) return
           const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : 'Pending'
