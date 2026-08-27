@@ -2213,19 +2213,36 @@ function getBillingScheduleRowsFromAnswers(answers = {}) {
         failureReason: String(row?.failureReason || row?.processorReason || row?.reason || ''),
       }))
       .filter((row) => row && (row.date || row.amount))
+  const mergeUniqueRows = (...groups) => {
+    const seen = new Set()
+    return groups
+      .flat()
+      .filter((row) => {
+        const key = [
+          String(row?.date || '').trim(),
+          String(row?.amount || '').trim(),
+          String(row?.status || '').trim().toLowerCase(),
+          String(row?.failureReason || '').trim().toLowerCase(),
+        ].join('|')
+        if (!key.replace(/\|/g, '')) return false
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+  }
 
   const investigationSchedule = parseStoredObject(answers?.investigation_billing_schedule, [])
   const resolutionSchedule = parseStoredObject(answers?.resolution_billing_schedule, [])
-  const scopedSchedules = [
-    ...(Array.isArray(investigationSchedule) ? investigationSchedule : []),
-    ...(Array.isArray(resolutionSchedule) ? resolutionSchedule : []),
-  ]
-
-  if (scopedSchedules.length) {
-    return normalizeRows(scopedSchedules)
+  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
+  const mergedSchedules = mergeUniqueRows(
+    normalizeRows(Array.isArray(investigationSchedule) ? investigationSchedule : []),
+    normalizeRows(Array.isArray(resolutionSchedule) ? resolutionSchedule : []),
+    normalizeRows(Array.isArray(directSchedule) ? directSchedule : []),
+  )
+  if (mergedSchedules.length) {
+    return mergedSchedules
   }
 
-  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
   if (Array.isArray(directSchedule) && directSchedule.length) {
     return normalizeRows(directSchedule)
   }
