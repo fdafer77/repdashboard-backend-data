@@ -4033,7 +4033,6 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Tax_Type: 'Income',
     Tax_Form: '1040',
     Years_Owed: '2025-2016',
-    Years_Owed2: '2025-2016',
     Client_Full_Name2: fullName,
     Client_Full_Name4: fullName,
     Client_Last_Name: String(context.lastName || '').trim(),
