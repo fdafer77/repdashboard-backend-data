@@ -2203,9 +2203,8 @@ function normalizeBillingDateValue(value) {
 }
 
 function getBillingScheduleRowsFromAnswers(answers = {}) {
-  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
-  if (Array.isArray(directSchedule) && directSchedule.length) {
-    return directSchedule
+  const normalizeRows = (rows = []) =>
+    rows
       .map((row) => ({
         ...row,
         date: normalizeBillingDateValue(row?.date),
@@ -2214,6 +2213,21 @@ function getBillingScheduleRowsFromAnswers(answers = {}) {
         failureReason: String(row?.failureReason || row?.processorReason || row?.reason || ''),
       }))
       .filter((row) => row && (row.date || row.amount))
+
+  const investigationSchedule = parseStoredObject(answers?.investigation_billing_schedule, [])
+  const resolutionSchedule = parseStoredObject(answers?.resolution_billing_schedule, [])
+  const scopedSchedules = [
+    ...(Array.isArray(investigationSchedule) ? investigationSchedule : []),
+    ...(Array.isArray(resolutionSchedule) ? resolutionSchedule : []),
+  ]
+
+  if (scopedSchedules.length) {
+    return normalizeRows(scopedSchedules)
+  }
+
+  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
+  if (Array.isArray(directSchedule) && directSchedule.length) {
+    return normalizeRows(directSchedule)
   }
 
   return parseStoredObject(answers?.client_portal_pending_payments, [])
