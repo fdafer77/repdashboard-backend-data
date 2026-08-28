@@ -4049,8 +4049,12 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Tax_Agency: String(context.taxAgencyLabel || '').trim(),
     Years_Owed: String(context.unfiledYearsLabel || '').trim(),
     Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
-    Years_filed: '2016-2026',
-    Years_Filed2: '2016-2026',
+    ...(!isMarriedJoint
+      ? {
+          Years_filed: '2016-2026',
+          Years_Filed2: '2016-2026',
+        }
+      : {}),
     Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
 
     // Payment (masked)
