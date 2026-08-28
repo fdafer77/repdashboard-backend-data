@@ -4010,6 +4010,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
 
   const effectiveInvoiceAmount = Number(context.effectiveInvoiceAmount || 0)
   const discountActive = effectiveInvoiceAmount === 375
+  const redYearsOwedAutofill = '2016-2026'
 
   const clientFields = {
     // Client identity
@@ -4047,7 +4048,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     // Tax/plan
     Tax_Type: String(context.taxTypeLabel || '').trim(),
     Tax_Agency: String(context.taxAgencyLabel || '').trim(),
-    Years_Owed: String(context.unfiledYearsLabel || '').trim(),
+    Years_Owed: redYearsOwedAutofill,
     Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
     Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
 
@@ -4092,7 +4093,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_SSN2: isMarriedJoint ? String(context.spouseSsn || '').trim() : '',
     Spouse_Phone_Number2: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
     Spouse_full_name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
-    Spouse_Years_Owed: isMarriedJoint ? String(context.unfiledYearsLabel || '').trim() : '',
+    Spouse_Years_Owed: isMarriedJoint ? redYearsOwedAutofill : '',
   }
 
   return {
