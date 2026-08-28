@@ -4049,12 +4049,6 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Tax_Agency: String(context.taxAgencyLabel || '').trim(),
     Years_Owed: String(context.unfiledYearsLabel || '').trim(),
     Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
-    ...(!isMarriedJoint
-      ? {
-          Years_filed: '2016-2026',
-          Years_Filed2: '2016-2026',
-        }
-      : {}),
     Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
 
     // Payment (masked)
@@ -4165,8 +4159,6 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Tax_Type: 'Income',
     Tax_Form: '1040',
     Years_Owed: '2025-2016',
-    Years_filed: '2016-2026',
-    Years_Filed2: '2016-2026',
     Client_Full_Name2: fullName,
     Client_Full_Name4: fullName,
     Client_Last_Name: String(context.lastName || '').trim(),
@@ -4200,8 +4192,6 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Spouse_DOB: spouseDob,
     Spouse_Full_Name3: spouseFullName,
     Spouse_Full_Name4: spouseFullName,
-    Years_filed: isMarriedJoint ? '2016-2026' : '',
-    Years_Filed2: isMarriedJoint ? '2016-2026' : '',
   }
 
   return {
