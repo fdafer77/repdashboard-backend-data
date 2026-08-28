@@ -3344,6 +3344,59 @@ function markSignedResolutionDeliveryEntries(answers = {}, signedAt = '', docume
   }
 }
 
+function getLatestIsoTimestamp(previous = '', next = '') {
+  const prevRaw = String(previous || '').trim()
+  const nextRaw = String(next || '').trim()
+  if (!prevRaw) return nextRaw
+  if (!nextRaw) return prevRaw
+  const prevTime = new Date(prevRaw).getTime()
+  const nextTime = new Date(nextRaw).getTime()
+  if (!Number.isFinite(prevTime)) return nextRaw
+  if (!Number.isFinite(nextTime)) return prevRaw
+  return nextTime >= prevTime ? nextRaw : prevRaw
+}
+
+function markViewedDeliveryEntries(answers = {}, openedAt = '', targetName = '', documentCode = '') {
+  const normalizedOpenedAt = String(openedAt || '').trim() || new Date().toISOString()
+  const normalizedTargetName = String(targetName || '').trim()
+  const normalizedDocumentCode = String(documentCode || '').trim()
+  if (!normalizedTargetName) return
+
+  const currentDeliveryLog = Array.isArray(answers?.document_delivery_log)
+    ? answers.document_delivery_log
+    : parseStoredObject(answers?.document_delivery_log, [])
+  if (Array.isArray(currentDeliveryLog)) {
+    answers.document_delivery_log = currentDeliveryLog.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (name !== normalizedTargetName) return entry
+      const entryDocumentCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryDocumentCode && entryDocumentCode !== normalizedDocumentCode) return entry
+      const existingOpenedAt = String(entry?.openedAt || entry?.opened_at || '').trim()
+      return {
+        ...(entry || {}),
+        openedAt: getLatestIsoTimestamp(existingOpenedAt, normalizedOpenedAt),
+      }
+    })
+  }
+
+  const currentReceipts = Array.isArray(answers?.document_receipts)
+    ? answers.document_receipts
+    : parseStoredObject(answers?.document_receipts, [])
+  if (Array.isArray(currentReceipts)) {
+    answers.document_receipts = currentReceipts.map((entry) => {
+      const name = String(entry?.name || '').trim()
+      if (name !== normalizedTargetName) return entry
+      const entryDocumentCode = String(entry?.documentCode || '').trim()
+      if (normalizedDocumentCode && entryDocumentCode && entryDocumentCode !== normalizedDocumentCode) return entry
+      const existingOpenedAt = String(entry?.openedAt || entry?.opened_at || '').trim()
+      return {
+        ...(entry || {}),
+        openedAt: getLatestIsoTimestamp(existingOpenedAt, normalizedOpenedAt),
+      }
+    })
+  }
+}
+
 async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const eventType = String(eventPayload?.eventType || eventPayload?.event_type || '').trim()
   const data = eventPayload?.data && typeof eventPayload.data === 'object' ? eventPayload.data : {}
@@ -3363,6 +3416,7 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   if (resolutionDocumentId && resolutionDocumentId === documentId) {
     const normalizedType = eventType.toLowerCase()
     const sentAt = new Date().toISOString()
+    const openedAt = sentAt
     const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
     const receiptName = 'Resolution Documents'
 
@@ -3396,6 +3450,11 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
         ])
       }
       answers.onboarding_status = String(answers.onboarding_status || '').trim() || 'documents_ready_for_signature'
+    }
+
+    if (normalizedType.includes('viewed') || normalizedType.includes('opened')) {
+      answers.boldsign_resolution_viewed_at = getLatestIsoTimestamp(String(answers.boldsign_resolution_viewed_at || '').trim(), openedAt)
+      markViewedDeliveryEntries(answers, openedAt, receiptName, documentId)
     }
 
     if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
@@ -3437,6 +3496,7 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
   const activeDocumentCode = String(answers.active_8821_document_code || answers.current_8821_document_code || '').trim()
   const resolvedDocumentCode = activeDocumentCode || createDocumentInstanceCode('red')
   const sentAt = new Date().toISOString()
+  const openedAt = sentAt
   const normalizedType = eventType.toLowerCase()
   const signerEmail = String(data?.signer?.emailAddress || data?.signer?.email || document?.signerEmail || '').trim().toLowerCase()
   const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
@@ -3500,6 +3560,12 @@ async function applyBoldsignWebhookEvent(eventPayload = {}) {
       answers.form8821_status = answers.form8821_status || 'launching'
     }
     answers.onboarding_status = String(answers.onboarding_status || '').trim() || 'documents_ready_for_signature'
+  }
+
+  if (normalizedType.includes('viewed') || normalizedType.includes('opened')) {
+    const viewKey = target === 'spouse' ? 'boldsign_8821_spouse_viewed_at' : 'boldsign_8821_viewed_at'
+    answers[viewKey] = getLatestIsoTimestamp(String(answers?.[viewKey] || '').trim(), openedAt)
+    markViewedDeliveryEntries(answers, openedAt, receiptName, resolvedDocumentCode)
   }
 
   if (normalizedType.includes('signed') || normalizedType.includes('completed')) {
@@ -3983,6 +4049,8 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Tax_Agency: String(context.taxAgencyLabel || '').trim(),
     Years_Owed: String(context.unfiledYearsLabel || '').trim(),
     Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
+    Years_filed: '2016-2026',
+    Years_Filed2: '2016-2026',
     Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
 
     // Payment (masked)
@@ -4027,6 +4095,8 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Spouse_Phone_Number2: isMarriedJoint ? String(context.spousePhone || '').trim() : '',
     Spouse_full_name: isMarriedJoint ? String(context.spouseFullName || '').trim() : '',
     Spouse_Years_Owed: isMarriedJoint ? String(context.unfiledYearsLabel || '').trim() : '',
+    Years_filed: isMarriedJoint ? '2016-2026' : '',
+    Years_Filed2: isMarriedJoint ? '2016-2026' : '',
   }
 
   return {
@@ -4093,6 +4163,8 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Tax_Type: 'Income',
     Tax_Form: '1040',
     Years_Owed: '2025-2016',
+    Years_filed: '2016-2026',
+    Years_Filed2: '2016-2026',
     Client_Full_Name2: fullName,
     Client_Full_Name4: fullName,
     Client_Last_Name: String(context.lastName || '').trim(),
@@ -4126,6 +4198,8 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Spouse_DOB: spouseDob,
     Spouse_Full_Name3: spouseFullName,
     Spouse_Full_Name4: spouseFullName,
+    Years_filed: isMarriedJoint ? '2016-2026' : '',
+    Years_Filed2: isMarriedJoint ? '2016-2026' : '',
   }
 
   return {
@@ -5462,6 +5536,27 @@ function buildConsultationSummary(record) {
   ]
     .filter((item) => item.startAt)
     .sort((a, b) => String(a.startAt || '').localeCompare(String(b.startAt || '')))
+
+  const rawDeliveryLog = parseStoredObject(answers.document_delivery_log, [])
+  const rawReceipts = parseStoredObject(answers.document_receipts, [])
+  const receiptPool = [
+    ...(Array.isArray(rawDeliveryLog) ? rawDeliveryLog : []),
+    ...(Array.isArray(rawReceipts) ? rawReceipts : []),
+  ]
+  const redDocumentViewedAt = receiptPool
+    .filter((entry) => {
+      const name = String(entry?.name || '').trim()
+      return name === '8821 Document' || name === '8821 Spouse' || name === 'R.E.D Document'
+    })
+    .map((entry) => String(entry?.openedAt || entry?.opened_at || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || ''
+  const resolutionDocumentsViewedAt = receiptPool
+    .filter((entry) => String(entry?.name || '').trim() === 'Resolution Documents')
+    .map((entry) => String(entry?.openedAt || entry?.opened_at || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || ''
+
   return {
     sessionCode: String(record?.sessionCode || ''),
     contactId: String(record?.contactId || ''),
@@ -5498,6 +5593,8 @@ function buildConsultationSummary(record) {
     hasPaymentMethodOnFile,
     resolutionDocumentsSigned,
     eaTranscriptsReadyForClient,
+    redDocumentViewedAt,
+    resolutionDocumentsViewedAt,
     appointmentCount: appointments.length,
     nextAppointmentAt: appointments[0]?.startAt || '',
     appointments,
