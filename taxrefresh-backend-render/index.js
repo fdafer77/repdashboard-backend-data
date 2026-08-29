@@ -8468,27 +8468,50 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
 
     const room = await ensureRoom(roomCode)
+    const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
+    const invoiceAmountFieldKey = billingMode === 'resolution' ? 'resolution_billing_invoice_amount' : 'investigation_billing_invoice_amount'
+    const invoiceCreatedAtFieldKey = billingMode === 'resolution' ? 'resolution_billing_invoice_created_at' : 'investigation_billing_invoice_created_at'
+    const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
     const invoiceAmount = req.body?.invoiceAmount
     const invoiceCreatedAt = req.body?.invoiceCreatedAt
     const schedule = Array.isArray(req.body?.schedule) ? req.body.schedule : []
 
-    room.state.answers.billing_invoice_amount = invoiceAmount === null || invoiceAmount === undefined ? '' : invoiceAmount
-    room.state.answers.billing_invoice_created_at = invoiceCreatedAt === null || invoiceCreatedAt === undefined ? '' : invoiceCreatedAt
-    room.state.answers.billing_schedule = schedule
+    room.state.answers[invoiceAmountFieldKey] = invoiceAmount === null || invoiceAmount === undefined ? '' : invoiceAmount
+    room.state.answers[invoiceCreatedAtFieldKey] = invoiceCreatedAt === null || invoiceCreatedAt === undefined ? '' : invoiceCreatedAt
+    room.state.answers[scheduleFieldKey] = schedule
+    if (billingMode === 'investigation') {
+      room.state.answers.billing_invoice_amount = room.state.answers[invoiceAmountFieldKey]
+      room.state.answers.billing_invoice_created_at = room.state.answers[invoiceCreatedAtFieldKey]
+      room.state.answers.billing_schedule = schedule
+    }
     room.state.updatedAt = Date.now()
 
     io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: 'billing_invoice_amount', value: room.state.answers.billing_invoice_amount },
+      patch: { type: 'setAnswer', questionId: invoiceAmountFieldKey, value: room.state.answers[invoiceAmountFieldKey] },
       updatedAt: room.state.updatedAt,
     })
     io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: 'billing_invoice_created_at', value: room.state.answers.billing_invoice_created_at },
+      patch: { type: 'setAnswer', questionId: invoiceCreatedAtFieldKey, value: room.state.answers[invoiceCreatedAtFieldKey] },
       updatedAt: room.state.updatedAt,
     })
     io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: 'billing_schedule', value: room.state.answers.billing_schedule },
+      patch: { type: 'setAnswer', questionId: scheduleFieldKey, value: room.state.answers[scheduleFieldKey] },
       updatedAt: room.state.updatedAt,
     })
+    if (billingMode === 'investigation') {
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'billing_invoice_amount', value: room.state.answers.billing_invoice_amount },
+        updatedAt: room.state.updatedAt,
+      })
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'billing_invoice_created_at', value: room.state.answers.billing_invoice_created_at },
+        updatedAt: room.state.updatedAt,
+      })
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'billing_schedule', value: room.state.answers.billing_schedule },
+        updatedAt: room.state.updatedAt,
+      })
+    }
     io.to(roomCode).emit('room_state', room.state)
 
     try {
