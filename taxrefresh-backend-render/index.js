@@ -5377,9 +5377,17 @@ async function syncSingleGhlProspectToDashboard({ contactId = '', opportunityId 
   let contact = null
   let pipelineNameById = new Map()
   let stageNameById = new Map()
+  const payloadContact = webhookPayload?.contact || {}
+  const payloadOpportunity = webhookPayload?.opportunity || {}
+  const hasPayloadContactSnapshot = Boolean(
+    payloadContact && typeof payloadContact === 'object' && Object.keys(payloadContact).length > 0,
+  )
+  const hasPayloadOpportunitySnapshot = Boolean(
+    payloadOpportunity && typeof payloadOpportunity === 'object' && Object.keys(payloadOpportunity).length > 0,
+  )
 
   if (hasDirectGhlConfig()) {
-    if (resolvedOpportunityId) {
+    if (resolvedOpportunityId && !hasPayloadOpportunitySnapshot) {
       try {
         const pipelineMaps = await fetchGhlPipelinesWithMaps()
         pipelineNameById = pipelineMaps.pipelineNameById
@@ -5390,7 +5398,7 @@ async function syncSingleGhlProspectToDashboard({ contactId = '', opportunityId 
         console.error('Failed to fetch GHL opportunity from webhook sync:', error)
       }
     }
-    if (resolvedContactId) {
+    if (resolvedContactId && !hasPayloadContactSnapshot) {
       try {
         contact = await fetchGhlContactById(resolvedContactId)
       } catch (error) {
@@ -5399,8 +5407,6 @@ async function syncSingleGhlProspectToDashboard({ contactId = '', opportunityId 
     }
   }
 
-  const payloadContact = webhookPayload?.contact || {}
-  const payloadOpportunity = webhookPayload?.opportunity || {}
   const normalizedContact = contact || payloadContact || {}
   const normalizedOpportunity = opportunity || payloadOpportunity || {}
 
@@ -5429,6 +5435,18 @@ async function syncSingleGhlProspectToDashboard({ contactId = '', opportunityId 
     contactId: room.contactId,
     opportunityId: room.opportunityId || '',
   }
+}
+
+function buildDashboardRecordUpdatePayload({ code = '', room = null, contactId = '', opportunityId = '' } = {}) {
+  if (!code || !room?.state) return null
+  return buildConsultationSummary({
+    sessionCode: code,
+    contactId: contactId || room.contactId || '',
+    opportunityId: opportunityId || room.opportunityId || '',
+    state: room.state,
+    createdAt: new Date(room.state.updatedAt || Date.now()).toISOString(),
+    updatedAt: new Date(room.state.updatedAt || Date.now()).toISOString(),
+  })
 }
 
 async function syncAllGhlOpportunitiesToDashboard() {
@@ -7746,7 +7764,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
   if (pool) {
     const tokens = getConsultationSearchTokens(search)
     const hasSearch = tokens.length > 0
-    const searchQueryLimit = hasSearch ? Math.min(5000, Math.max(normalizedLimit * 5, 2000)) : normalizedLimit
+    const searchQueryLimit = hasSearch ? Math.min(1200, Math.max(normalizedLimit * 4, 400)) : normalizedLimit
     const params = []
     let whereClause = ''
     if (hasSearch) {
@@ -10122,6 +10140,12 @@ app.post('/webhooks/ghl', (req, res) => {
         contactId,
         opportunityId: room.opportunityId || '',
         opportunityName: String(room.state?.answers?.ghl_opportunity_name || ''),
+        item: buildDashboardRecordUpdatePayload({
+          code,
+          room,
+          contactId,
+          opportunityId: room.opportunityId || '',
+        }),
       })
       return res.json({ ok: true, contactId, opportunityId: room.opportunityId || '', code, conversationId })
     }
@@ -10141,6 +10165,12 @@ app.post('/webhooks/ghl', (req, res) => {
       contactId,
       opportunityId: room.opportunityId || '',
       opportunityName: String(room.state?.answers?.ghl_opportunity_name || ''),
+      item: buildDashboardRecordUpdatePayload({
+        code,
+        room,
+        contactId,
+        opportunityId: room.opportunityId || '',
+      }),
     })
     void syncSessionToGhl({ roomCode: code, room, reason: 'session_provisioned', force: true }).catch((error) => {
       console.error('GHL session provision sync failed:', error)
