@@ -7028,6 +7028,69 @@ function consultationMatchesSearch(summary, search = '') {
   })
 }
 
+function getConsultationSearchRank(summary, rawQuery = '') {
+  const normalizedQuery = String(rawQuery || '').trim().toLowerCase()
+  if (!normalizedQuery) return 0
+
+  const tokens = getConsultationSearchTokens(normalizedQuery)
+  const normalizedDigits = normalizeConsultationSearchDigits(normalizedQuery)
+  const name = String(summary.clientName || '').trim().toLowerCase()
+  const email = String(summary.email || '').trim().toLowerCase()
+  const phone = String(summary.phone || '').trim().toLowerCase()
+  const sessionCode = String(summary.sessionCode || '').trim().toLowerCase()
+  const opportunityName = String(summary.opportunityName || '').trim().toLowerCase()
+  const opportunityId = String(summary.opportunityId || '').trim().toLowerCase()
+  const contactId = String(summary.contactId || '').trim().toLowerCase()
+  const ownerName = String(summary.claimedByName || summary.assignedTo || '').trim().toLowerCase()
+  const textFields = [name, email, phone, sessionCode, opportunityName, opportunityId, contactId, ownerName].filter(Boolean)
+  const digitFields = [phone, sessionCode, opportunityId, contactId].map(normalizeConsultationSearchDigits).filter(Boolean)
+
+  const matchesAllTokens =
+    tokens.length === 0 ||
+    tokens.every((token) => {
+      const tokenDigits = normalizeConsultationSearchDigits(token)
+      return textFields.some((value) => value.includes(token)) || (!!tokenDigits && digitFields.some((value) => value.includes(tokenDigits)))
+    })
+
+  if (!matchesAllTokens) return 0
+
+  let score = 0
+  if (name.startsWith(normalizedQuery)) score = Math.max(score, 160)
+  if (tokens.length > 1 && tokens.every((token) => name.includes(token))) score = Math.max(score, 150)
+  if (email.startsWith(normalizedQuery)) score = Math.max(score, 150)
+  if (opportunityName.startsWith(normalizedQuery)) score = Math.max(score, 145)
+  if (sessionCode.startsWith(normalizedQuery)) score = Math.max(score, 140)
+  if (contactId.startsWith(normalizedQuery) || opportunityId.startsWith(normalizedQuery)) score = Math.max(score, 135)
+  if (name.includes(normalizedQuery)) score = Math.max(score, 130)
+  if (normalizedDigits) {
+    if (digitFields.some((value) => value.startsWith(normalizedDigits))) score = Math.max(score, 125)
+    else if (digitFields.some((value) => value.includes(normalizedDigits))) score = Math.max(score, 95)
+  }
+  if (email.includes(normalizedQuery)) score = Math.max(score, 120)
+  if (opportunityName.includes(normalizedQuery)) score = Math.max(score, 115)
+  if (ownerName.includes(normalizedQuery)) score = Math.max(score, 105)
+  if (sessionCode.includes(normalizedQuery) || contactId.includes(normalizedQuery) || opportunityId.includes(normalizedQuery)) {
+    score = Math.max(score, 100)
+  }
+
+  score += tokens.reduce((total, token) => {
+    const tokenDigits = normalizeConsultationSearchDigits(token)
+    if (name.startsWith(token) || email.startsWith(token) || opportunityName.startsWith(token)) return total + 12
+    if (textFields.some((value) => value.includes(token))) return total + 7
+    if (tokenDigits && digitFields.some((value) => value.includes(tokenDigits))) return total + 7
+    return total
+  }, 0)
+
+  return score
+}
+
+function getConsultationUpdatedAtValue(summary) {
+  const raw = summary?.updatedAt
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  const parsed = Date.parse(String(raw || ''))
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 function initialRoomState() {
   return { step: 0, route: '/session', answers: {}, updatedAt: Date.now() }
 }
@@ -7679,10 +7742,11 @@ function getAnswerSsnLast4(answers = {}) {
 }
 
 async function listConsultationRecords({ search = '', limit = 100 } = {}) {
-  const normalizedLimit = Math.max(1, Math.min(1000, Number(limit) || 100))
+  const normalizedLimit = Math.max(1, Math.min(5000, Number(limit) || 100))
   if (pool) {
     const tokens = getConsultationSearchTokens(search)
     const hasSearch = tokens.length > 0
+    const searchQueryLimit = hasSearch ? Math.min(5000, Math.max(normalizedLimit * 5, 2000)) : normalizedLimit
     const params = []
     let whereClause = ''
     if (hasSearch) {
@@ -7712,7 +7776,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
       })
       whereClause = `where ${tokenClauses.join('\n          and ')}`
     }
-    params.push(normalizedLimit)
+    params.push(searchQueryLimit)
     const query = hasSearch
       ? `
         select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
@@ -7728,7 +7792,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         limit $1
       `
     const res = await pool.query(query, params)
-    return res.rows.map((row) =>
+    const items = res.rows.map((row) =>
       buildConsultationSummary({
         sessionCode: row.session_code,
         contactId: row.ghl_contact_id,
@@ -7738,6 +7802,15 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         updatedAt: row.updated_at,
       }),
     )
+    if (!hasSearch) return items
+    return items
+      .sort(
+        (a, b) =>
+          getConsultationSearchRank(b, search) - getConsultationSearchRank(a, search) ||
+          getConsultationUpdatedAtValue(b) - getConsultationUpdatedAtValue(a) ||
+          String(a.clientName || '').localeCompare(String(b.clientName || '')),
+      )
+      .slice(0, normalizedLimit)
   }
 
   const persistedRows = await fallbackListSessions()
@@ -7771,7 +7844,12 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
 
   return Array.from(persistedByCode.values())
     .filter((entry) => consultationMatchesSearch(entry, search))
-    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+    .sort(
+      (a, b) =>
+        getConsultationSearchRank(b, search) - getConsultationSearchRank(a, search) ||
+        getConsultationUpdatedAtValue(b) - getConsultationUpdatedAtValue(a) ||
+        String(a.clientName || '').localeCompare(String(b.clientName || '')),
+    )
     .slice(0, normalizedLimit)
 }
 
