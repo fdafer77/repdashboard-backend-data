@@ -10332,6 +10332,7 @@ function buildConsultationAnalytics(items = [], account = null) {
   let failedRevenueTotal = 0
   let openTasks = 0
   let documentsUploaded = 0
+  const todayKey = normalizeBillingDateValue(new Date().toISOString())
 
   const topOpportunities = analyticsItems
     .map((item) => {
@@ -10352,7 +10353,8 @@ function buildConsultationAnalytics(items = [], account = null) {
           if (tone === 'pending' && !pendingRevenueEligible) return
           const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
-          const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : 'Pending'
+          const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
+          const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
           const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
           const paymentScheduleEntry = {
             id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
@@ -10362,7 +10364,7 @@ function buildConsultationAnalytics(items = [], account = null) {
             stageName: String(item.stageName || '').trim(),
             scheduledDate: normalizedDate,
             amount,
-            statusTone: tone,
+            statusTone: isPastDuePending ? 'past_due' : tone,
             statusLabel,
             failureReason,
             updatedAt: String(item.updatedAt || '').trim(),
@@ -10386,7 +10388,7 @@ function buildConsultationAnalytics(items = [], account = null) {
             failedRevenue += amount
             failedRevenueTotal += amount
             failedPayments.push(paymentScheduleEntry)
-          } else {
+          } else if (!isPastDuePending) {
             pendingRevenue += amount
             pendingRevenueTotal += amount
           }
