@@ -2299,6 +2299,20 @@ function hasSignedPendingRevenueDocuments(answers = {}) {
   return hasSignedResolutionDocuments(answers)
 }
 
+function hasAnySignedInvestigationDocuments(answers = {}) {
+  if (isForm8821FullySigned(answers)) return true
+  if (hasPersistedSigned8821Record(answers)) return true
+  const documentDeliveryLog = Array.isArray(answers?.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers?.document_delivery_log, [])
+  const documentReceipts = Array.isArray(answers?.document_receipts) ? answers.document_receipts : parseStoredObject(answers?.document_receipts, [])
+  const entries = [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])]
+  return entries.some((entry) => {
+    const name = String(entry?.name || '').trim()
+    if (name !== '8821 Document' && name !== '8821 Spouse' && name !== 'R.E.D Document') return false
+    const status = String(entry?.status || '').trim().toLowerCase()
+    return status === 'signed' || Boolean(String(entry?.signedAt || entry?.signed_at || '').trim())
+  })
+}
+
 function hasStoredPaymentMethodOnFile(answers = {}) {
   const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
   const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
@@ -5535,6 +5549,7 @@ function buildConsultationSummary(record) {
       (portalPaymentMethod && typeof portalPaymentMethod === 'object'),
   )
   const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
+  const investigationDocumentsSigned = hasAnySignedInvestigationDocuments(answers)
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
     String(answers.ea_transcripts_ready_for_client || '')
@@ -5602,6 +5617,7 @@ function buildConsultationSummary(record) {
     processedPaymentCount,
     hasProcessedPayment,
     hasPaymentMethodOnFile,
+    investigationDocumentsSigned,
     resolutionDocumentsSigned,
     eaTranscriptsReadyForClient,
     redDocumentViewedAt,
