@@ -6987,21 +6987,45 @@ async function persistSmsThreadForRoom({ roomCode, room, entries = [], conversat
   return mergedThread
 }
 
+function normalizeConsultationSearchDigits(value = '') {
+  return String(value || '').replace(/\D+/g, '')
+}
+
+function getConsultationSearchTokens(search = '') {
+  return String(search || '')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+}
+
 function consultationMatchesSearch(summary, search = '') {
-  if (!search) return true
-  const haystack = [
+  const tokens = getConsultationSearchTokens(search)
+  if (tokens.length === 0) return true
+
+  const textFields = [
     summary.clientName,
     summary.email,
     summary.phone,
     summary.sessionCode,
     summary.contactId,
     summary.opportunityId,
+    summary.opportunityName,
+    summary.claimedByName,
+    summary.assignedTo,
     summary.onboardingStatus,
     summary.form8821Status,
   ]
-    .join(' ')
-    .toLowerCase()
-  return haystack.includes(search.toLowerCase())
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean)
+  const digitFields = [summary.phone, summary.sessionCode, summary.contactId, summary.opportunityId]
+    .map((value) => normalizeConsultationSearchDigits(value))
+    .filter(Boolean)
+
+  return tokens.every((token) => {
+    const digitToken = normalizeConsultationSearchDigits(token)
+    return textFields.some((value) => value.includes(token)) || (!!digitToken && digitFields.some((value) => value.includes(digitToken)))
+  })
 }
 
 function initialRoomState() {
@@ -7657,25 +7681,45 @@ function getAnswerSsnLast4(answers = {}) {
 async function listConsultationRecords({ search = '', limit = 100 } = {}) {
   const normalizedLimit = Math.max(1, Math.min(1000, Number(limit) || 100))
   if (pool) {
-    const like = `%${String(search || '').trim()}%`
-    const hasSearch = Boolean(String(search || '').trim())
-    const params = hasSearch ? [like, normalizedLimit] : [normalizedLimit]
+    const tokens = getConsultationSearchTokens(search)
+    const hasSearch = tokens.length > 0
+    const params = []
+    let whereClause = ''
+    if (hasSearch) {
+      const tokenClauses = tokens.map((token) => {
+        const likeParamIndex = params.push(`%${token}%`)
+        const digitToken = normalizeConsultationSearchDigits(token)
+        const digitParamIndex = digitToken ? params.push(`%${digitToken}%`) : 0
+        return `(
+          coalesce(state->'answers'->>'name', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'full_name', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'email', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'email_address', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'phone', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'phone_number', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'ghl_opportunity_name', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'claimed_by_name', '') ilike $${likeParamIndex}
+          or coalesce(state->'answers'->>'ghl_assigned_to', '') ilike $${likeParamIndex}
+          or session_code ilike $${likeParamIndex}
+          or coalesce(ghl_contact_id, '') ilike $${likeParamIndex}
+          or coalesce(ghl_opportunity_id, '') ilike $${likeParamIndex}
+          ${digitParamIndex ? `or regexp_replace(coalesce(state->'answers'->>'phone', ''), '\\D', '', 'g') ilike $${digitParamIndex}
+          or regexp_replace(coalesce(state->'answers'->>'phone_number', ''), '\\D', '', 'g') ilike $${digitParamIndex}
+          or regexp_replace(coalesce(session_code, ''), '\\D', '', 'g') ilike $${digitParamIndex}
+          or regexp_replace(coalesce(ghl_contact_id, ''), '\\D', '', 'g') ilike $${digitParamIndex}
+          or regexp_replace(coalesce(ghl_opportunity_id, ''), '\\D', '', 'g') ilike $${digitParamIndex}` : ''}
+        )`
+      })
+      whereClause = `where ${tokenClauses.join('\n          and ')}`
+    }
+    params.push(normalizedLimit)
     const query = hasSearch
       ? `
         select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
         from ti_sessions
-        where
-          coalesce(state->'answers'->>'name', '') ilike $1
-          or coalesce(state->'answers'->>'full_name', '') ilike $1
-          or coalesce(state->'answers'->>'email', '') ilike $1
-          or coalesce(state->'answers'->>'email_address', '') ilike $1
-          or coalesce(state->'answers'->>'phone', '') ilike $1
-          or coalesce(state->'answers'->>'phone_number', '') ilike $1
-          or session_code ilike $1
-          or coalesce(ghl_contact_id, '') ilike $1
-          or coalesce(ghl_opportunity_id, '') ilike $1
+        ${whereClause}
         order by updated_at desc
-        limit $2
+        limit $${params.length}
       `
       : `
         select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
