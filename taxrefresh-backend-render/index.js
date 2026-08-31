@@ -6299,6 +6299,22 @@ function buildSoftCreditSnapshot(answers = {}) {
   }
 }
 
+function getReadableSoftCreditFailureMessage(error) {
+  const raw = error instanceof Error ? String(error.message || '').trim() : String(error || '').trim()
+  if (!raw) return 'Soft credit check failed.'
+  const normalized = raw.toLowerCase()
+  if (
+    normalized.includes('client network socket disconnected') ||
+    normalized.includes('secure tls connection') ||
+    normalized.includes('fetch failed') ||
+    normalized.includes('failed to fetch') ||
+    normalized.includes('networkerror')
+  ) {
+    return 'The soft credit provider could not be reached. Please retry shortly.'
+  }
+  return raw
+}
+
 function appendSoftCreditHistoryEntry(answers = {}, entry = {}) {
   const existing = parseSoftCreditHistory(answers.soft_credit_check_history)
   answers.soft_credit_check_history = [
@@ -6920,7 +6936,7 @@ async function runSoftCreditCheckForRoom({
   } catch (error) {
     answers.soft_credit_check_status = 'failed'
     answers.soft_credit_check_completed_at = new Date().toISOString()
-    answers.soft_credit_check_error = error instanceof Error ? error.message : 'Soft credit check failed.'
+    answers.soft_credit_check_error = getReadableSoftCreditFailureMessage(error)
     answers.soft_credit_check_error_code = String(error?.status || 'soft_pull_failed')
     appendSoftCreditHistoryEntry(answers, {
       status: 'failed',
