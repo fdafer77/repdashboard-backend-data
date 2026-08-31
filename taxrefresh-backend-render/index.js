@@ -2267,7 +2267,6 @@ function getBillingInvoiceAmountFromAnswers(answers = {}, mode = 'investigation'
   const genericStored = toNumberValue(answers?.billing_invoice_amount)
   const resolutionSignals = hasResolutionBillingSignalsFromAnswers(answers)
   if (mode === 'resolution') {
-    if (genericStored > 0 && resolutionSignals) return genericStored
     const derivedResolutionTotal =
       toNumberValue(answers?.invoiceIrsResolutionAmount) +
       toNumberValue(answers?.invoiceTaxPrepAmount) +
