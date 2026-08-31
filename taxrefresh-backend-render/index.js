@@ -3840,17 +3840,33 @@ async function getBoldsignDocumentProperties(documentId, { onBehalfOf } = {}) {
   })
 }
 
+const BOLDSIGN_RECONCILE_CACHE_MS = 5 * 60 * 1000
+
+function hasFreshBoldsignReconcileCheck(value = '') {
+  const normalized = String(value || '').trim()
+  if (!normalized) return false
+  const timestamp = new Date(normalized).getTime()
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return false
+  return Date.now() - timestamp < BOLDSIGN_RECONCILE_CACHE_MS
+}
+
 async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
   const documentId = String(answers.boldsign_8821_document_id || '').trim()
   if (!documentId) return false
   if (isForm8821FullySigned(answers)) return false
+  if (hasFreshBoldsignReconcileCheck(answers.boldsign_8821_last_checked_at)) return false
 
   try {
     const properties = await getBoldsignDocumentProperties(documentId)
+    answers.boldsign_8821_last_checked_at = new Date().toISOString()
     const status = String(properties?.status || '').trim().toLowerCase()
-    if (status !== 'completed') return false
+    if (status !== 'completed') {
+      roomState.answers = answers
+      await persist(roomState)
+      return false
+    }
 
     answers.form8821_status = 'completed'
     if (isMarriedJointFilingAnswers(answers)) {
@@ -3876,13 +3892,19 @@ async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = 
   const documentId = String(answers.boldsign_resolution_document_id || '').trim()
   if (!documentId) return false
   if (String(answers.boldsign_resolution_signed_at || '').trim()) return false
+  if (hasFreshBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at)) return false
 
   try {
     const properties = await getBoldsignDocumentProperties(documentId, {
       onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
     })
+    answers.boldsign_resolution_last_checked_at = new Date().toISOString()
     const status = String(properties?.status || '').trim().toLowerCase()
-    if (status !== 'completed') return false
+    if (status !== 'completed') {
+      roomState.answers = answers
+      await persist(roomState)
+      return false
+    }
 
     answers.boldsign_resolution_signed_at = new Date().toISOString()
     markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
