@@ -2468,7 +2468,10 @@ function getBillingRowMatchKey(row = {}) {
 
 function getBillingRowPersistenceKey(row = {}) {
   const tone = getBillingStatusTone(row)
-  const normalizedDate = normalizeBillingDateValue(row?.date || '')
+  // Persisted rows sometimes lack an explicit `date` but have `processedAt` (or `processed_at`).
+  // Use the processed timestamp as a stable fallback so schedule edits don't orphan processed rows
+  // and wipe Stripe evidence on save.
+  const normalizedDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
   const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
   if (!normalizedDate && normalizedAmount === '0.00') return ''
   return `${tone}|${normalizedDate}|${normalizedAmount}`
@@ -2513,6 +2516,11 @@ function sanitizeBillingScheduleRowsForPersistence(nextRows = [], existingRows =
 
       const tone = getBillingStatusTone(row)
       if (tone !== 'pending') {
+        // Only clear "processed" metadata when the row has no real Stripe evidence.
+        // This prevents stale metadata carry-over, but also avoids deleting legitimate
+        // processed rows when schedules are edited/resaved.
+        const hasEvidence = hasBillingProcessingEvidence(row)
+        if (hasEvidence) return row
         return {
           ...row,
           status: '',
@@ -9452,6 +9460,171 @@ app.post('/api/admin/consultations/:code/stripe/sync-payment-methods', async (re
     return res.json({ ok: true, item, paymentMethods: merged })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync Stripe payment methods' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+
+    const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
+    const invoiceAmountFieldKey = billingMode === 'resolution' ? 'resolution_billing_invoice_amount' : 'investigation_billing_invoice_amount'
+    const invoiceCreatedAtFieldKey = billingMode === 'resolution'
+      ? 'resolution_billing_invoice_created_at'
+      : 'investigation_billing_invoice_created_at'
+    const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
+
+    const room = await ensureRoom(roomCode)
+
+    // Prefer the persisted customer id so we don't accidentally create a new customer (which would have no history).
+    let customerId = String(room?.state?.answers?.stripe_customer_id || '').trim()
+    if (!customerId) {
+      const email = String(room?.state?.answers?.email || '').trim()
+      if (email) {
+        const candidates = await stripe.customers.list({ email, limit: 10 })
+        const match =
+          candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim() === roomCode) ||
+          candidates.data[0]
+        customerId = String(match?.id || '').trim()
+        if (customerId) {
+          await persistStripeCustomerIdForRoom(roomCode, room, customerId)
+        }
+      }
+    }
+    if (!customerId) {
+      return res.status(400).json({
+        error: 'No Stripe customer is linked to this consultation, so billing history cannot be restored.',
+      })
+    }
+
+    const intents = await stripe.paymentIntents.list({
+      customer: customerId,
+      limit: 100,
+      expand: ['data.payment_method'],
+    })
+
+    const candidates = intents.data
+      .filter((intent) => intent && (intent.status === 'succeeded' || intent.status === 'requires_capture'))
+      .map((intent) => {
+        const received = Number(intent.amount_received || intent.amount || 0)
+        const amount = received ? received / 100 : 0
+        const processedAt = new Date(Number(intent.created || 0) * 1000).toISOString()
+        const normalizedDate = normalizeBillingDateValue(processedAt)
+        const paymentMethod = intent.payment_method
+        const paymentMethodId = typeof paymentMethod === 'string' ? paymentMethod : String(paymentMethod?.id || '')
+        let brand = ''
+        let last4 = ''
+        let methodType = ''
+        if (paymentMethod && typeof paymentMethod === 'object') {
+          methodType = String(paymentMethod?.type || '').trim()
+          if (paymentMethod.type === 'card') {
+            brand = String(paymentMethod?.card?.brand || '').trim()
+            last4 = String(paymentMethod?.card?.last4 || '').trim()
+          } else if (paymentMethod.type === 'us_bank_account') {
+            brand = 'bank'
+            last4 = String(paymentMethod?.us_bank_account?.last4 || '').trim()
+          }
+        } else if (Array.isArray(intent.payment_method_types) && intent.payment_method_types.length) {
+          methodType = String(intent.payment_method_types[0] || '').trim()
+        }
+        return {
+          date: normalizedDate,
+          amount,
+          status: 'processed',
+          stripePaymentIntentId: String(intent.id || '').trim(),
+          processedAt,
+          processedStripeCustomerId: customerId,
+          processedStripePaymentMethodId: String(paymentMethodId || '').trim(),
+          processedPaymentMethodBrand: brand,
+          processedPaymentMethodLast4: last4,
+          processedPaymentMethodType: methodType,
+        }
+      })
+      .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
+
+    const parseScheduleValue = (value) => {
+      if (Array.isArray(value)) return value
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value)
+          return Array.isArray(parsed) ? parsed : []
+        } catch {
+          return []
+        }
+      }
+      return []
+    }
+
+    const existingSchedule = (() => {
+      const scoped = parseScheduleValue(room.state.answers[scheduleFieldKey])
+      if (scoped.length) return scoped
+      if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule)
+      return []
+    })()
+
+    const normalizedExisting = normalizeBillingScheduleRows(existingSchedule)
+    const existingByKey = new Map()
+    const existingIntentIds = new Set(
+      normalizedExisting.map((row) => getBillingStripePaymentIntentIdValue(row)).filter(Boolean),
+    )
+    normalizedExisting.forEach((row) => {
+      const key = getBillingRowMatchKey(row)
+      if (!key) return
+      const bucket = existingByKey.get(key)
+      if (bucket) bucket.push(row)
+      else existingByKey.set(key, [row])
+    })
+
+    const merged = [...normalizedExisting]
+    candidates.forEach((candidate) => {
+      const intentId = getBillingStripePaymentIntentIdValue(candidate)
+      if (intentId && existingIntentIds.has(intentId)) return
+      const key = getBillingRowMatchKey(candidate)
+      if (!key) return
+      const bucket = existingByKey.get(key)
+      const match = Array.isArray(bucket) && bucket.length ? bucket[0] : null
+      if (match) {
+        if (hasBillingProcessingEvidence(match)) return
+        Object.assign(match, candidate)
+        existingIntentIds.add(intentId)
+        return
+      }
+      merged.push(candidate)
+      existingIntentIds.add(intentId)
+    })
+
+    const nextSchedule = sanitizeBillingScheduleRowsForPersistence(merged, existingSchedule)
+
+    room.state.answers[scheduleFieldKey] = nextSchedule
+    // Keep generic investigation fields aligned for older records.
+    if (billingMode === 'investigation') {
+      room.state.answers.billing_schedule = nextSchedule
+      room.state.answers.billing_invoice_amount = room.state.answers[invoiceAmountFieldKey]
+      room.state.answers.billing_invoice_created_at = room.state.answers[invoiceCreatedAtFieldKey]
+    }
+    room.state.updatedAt = Date.now()
+
+    io.to(roomCode).emit('room_patch', {
+      patch: { type: 'setAnswer', questionId: scheduleFieldKey, value: room.state.answers[scheduleFieldKey] },
+      updatedAt: room.state.updatedAt,
+    })
+    if (billingMode === 'investigation') {
+      io.to(roomCode).emit('room_patch', {
+        patch: { type: 'setAnswer', questionId: 'billing_schedule', value: room.state.answers.billing_schedule },
+        updatedAt: room.state.updatedAt,
+      })
+    }
+    io.to(roomCode).emit('room_state', room.state)
+
+    await dbUpsertSession({ code: roomCode, state: room.state })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, restoredCount: candidates.length })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to restore billing history' })
   }
 })
 
