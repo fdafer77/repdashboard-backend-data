@@ -2202,52 +2202,38 @@ function normalizeBillingDateValue(value) {
   return parsed.toISOString().slice(0, 10)
 }
 
-function getBillingScheduleRowsFromAnswers(answers = {}) {
-  const normalizeRows = (rows = []) =>
-    rows
-      .map((row) => ({
-        ...row,
-        date: normalizeBillingDateValue(row?.date),
-        amount: String(row?.amount ?? ''),
-        status: String(row?.status || ''),
-        failureReason: String(row?.failureReason || row?.processorReason || row?.reason || ''),
-      }))
-      .filter((row) => row && (row.date || row.amount))
-  const mergeUniqueRows = (...groups) => {
-    const seen = new Set()
-    return groups
-      .flat()
-      .filter((row) => {
-        const key = [
-          String(row?.date || '').trim(),
-          String(row?.amount || '').trim(),
-          String(row?.status || '').trim().toLowerCase(),
-          String(row?.failureReason || '').trim().toLowerCase(),
-        ].join('|')
-        if (!key.replace(/\|/g, '')) return false
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
-  }
+function normalizeBillingScheduleRows(rows = []) {
+  return rows
+    .map((row) => ({
+      ...row,
+      date: normalizeBillingDateValue(row?.date),
+      amount: String(row?.amount ?? ''),
+      status: String(row?.status || ''),
+      failureReason: String(row?.failureReason || row?.processorReason || row?.reason || ''),
+    }))
+    .filter((row) => row && (row.date || row.amount))
+}
 
-  const investigationSchedule = parseStoredObject(answers?.investigation_billing_schedule, [])
-  const resolutionSchedule = parseStoredObject(answers?.resolution_billing_schedule, [])
-  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
-  const mergedSchedules = mergeUniqueRows(
-    normalizeRows(Array.isArray(investigationSchedule) ? investigationSchedule : []),
-    normalizeRows(Array.isArray(resolutionSchedule) ? resolutionSchedule : []),
-    normalizeRows(Array.isArray(directSchedule) ? directSchedule : []),
-  )
-  if (mergedSchedules.length) {
-    return mergedSchedules
-  }
+function mergeUniqueBillingScheduleRows(...groups) {
+  const seen = new Set()
+  return groups
+    .flat()
+    .filter((row) => {
+      const key = [
+        String(row?.date || '').trim(),
+        String(row?.amount || '').trim(),
+        String(row?.status || '').trim().toLowerCase(),
+        String(row?.failureReason || '').trim().toLowerCase(),
+      ].join('|')
+      if (!key.replace(/\|/g, '')) return false
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
 
-  if (Array.isArray(directSchedule) && directSchedule.length) {
-    return normalizeRows(directSchedule)
-  }
-
-  return parseStoredObject(answers?.client_portal_pending_payments, [])
+function mapClientPortalPendingPaymentsToBillingRows(value = []) {
+  return parseStoredObject(value, [])
     .map((row) => ({
       date: normalizeBillingDateValue(row?.isoDate || row?.date || ''),
       amount: String(row?.amount ?? ''),
@@ -2255,6 +2241,85 @@ function getBillingScheduleRowsFromAnswers(answers = {}) {
       failureReason: String(row?.failureReason || ''),
     }))
     .filter((row) => row && (row.date || row.amount))
+}
+
+function hasResolutionBillingSignalsFromAnswers(answers = {}) {
+  const resolutionSchedule = parseStoredObject(answers?.resolution_billing_schedule, [])
+  const resolutionInvoiceAmount = toNumberValue(answers?.resolution_billing_invoice_amount)
+  const invoiceTaxPrepYears = String(answers?.invoiceTaxPrepYears || '').match(/\b(19|20)\d{2}\b/g) || []
+  return (
+    resolutionInvoiceAmount > 0 ||
+    resolutionSchedule.length > 0 ||
+    toNumberValue(answers?.invoiceIrsResolutionAmount) > 0 ||
+    toNumberValue(answers?.invoiceTaxPrepAmount) > 0 ||
+    toNumberValue(answers?.invoiceStateResolutionAmount) > 0 ||
+    String(answers?.invoiceServiceIrsResolution || '').trim().toLowerCase() === 'yes' ||
+    String(answers?.invoiceServiceTaxPrep || '').trim().toLowerCase() === 'yes' ||
+    String(answers?.invoiceServiceStateResolution || '').trim().toLowerCase() === 'yes' ||
+    invoiceTaxPrepYears.length > 0
+  )
+}
+
+function getBillingInvoiceAmountFromAnswers(answers = {}, mode = 'investigation') {
+  const invoiceFieldKey = mode === 'resolution' ? 'resolution_billing_invoice_amount' : 'investigation_billing_invoice_amount'
+  const bucketStored = toNumberValue(answers?.[invoiceFieldKey])
+  if (bucketStored > 0) return bucketStored
+  const genericStored = toNumberValue(answers?.billing_invoice_amount)
+  const resolutionSignals = hasResolutionBillingSignalsFromAnswers(answers)
+  if (mode === 'resolution') {
+    if (genericStored > 0 && resolutionSignals) return genericStored
+    const derivedResolutionTotal =
+      toNumberValue(answers?.invoiceIrsResolutionAmount) +
+      toNumberValue(answers?.invoiceTaxPrepAmount) +
+      toNumberValue(answers?.invoiceStateResolutionAmount)
+    if (derivedResolutionTotal > 0) return derivedResolutionTotal
+    return 0
+  }
+  if (genericStored > 0 && !resolutionSignals) return genericStored
+  const clientPortalTotal = parseStoredObject(answers?.client_portal_pending_payments, []).reduce(
+    (sum, item) => sum + toNumberValue(item?.amount),
+    0,
+  )
+  if (clientPortalTotal > 0 && !resolutionSignals) return clientPortalTotal
+  const override = toNumberValue(answers?.planPriceOverride)
+  if (override > 0 && !resolutionSignals) return override
+  return 0
+}
+
+function getScopedBillingScheduleRowsFromAnswers(answers = {}, mode = 'investigation') {
+  const scheduleFieldKey = mode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
+  const scopedSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.[scheduleFieldKey], []))
+  if (scopedSchedule.length) return scopedSchedule
+
+  const resolutionSignals = hasResolutionBillingSignalsFromAnswers(answers)
+  const genericSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.billing_schedule, []))
+  if (mode === 'resolution') {
+    if (genericSchedule.length && resolutionSignals) return genericSchedule
+    return []
+  }
+  if (genericSchedule.length && !resolutionSignals) return genericSchedule
+  if (resolutionSignals) return []
+  return mapClientPortalPendingPaymentsToBillingRows(answers?.client_portal_pending_payments)
+}
+
+function getBillingScheduleRowsFromAnswers(answers = {}) {
+  const investigationSchedule = parseStoredObject(answers?.investigation_billing_schedule, [])
+  const resolutionSchedule = parseStoredObject(answers?.resolution_billing_schedule, [])
+  const directSchedule = parseStoredObject(answers?.billing_schedule, [])
+  const mergedSchedules = mergeUniqueBillingScheduleRows(
+    normalizeBillingScheduleRows(Array.isArray(investigationSchedule) ? investigationSchedule : []),
+    normalizeBillingScheduleRows(Array.isArray(resolutionSchedule) ? resolutionSchedule : []),
+    normalizeBillingScheduleRows(Array.isArray(directSchedule) ? directSchedule : []),
+  )
+  if (mergedSchedules.length) {
+    return mergedSchedules
+  }
+
+  if (Array.isArray(directSchedule) && directSchedule.length) {
+    return normalizeBillingScheduleRows(directSchedule)
+  }
+
+  return mapClientPortalPendingPaymentsToBillingRows(answers?.client_portal_pending_payments)
 }
 
 function getBillingStatusTone(row = {}) {
@@ -5595,6 +5660,27 @@ function buildConsultationSummary(record) {
     getOutstandingBillingRows(billingSchedule).sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
   const nextBillingDate = String(nextOutstandingBillingRow?.date || '').trim()
   const nextBillingTimingTone = getBillingTimingTone(nextBillingDate)
+  const resolutionBillingActive = hasResolutionBillingSignalsFromAnswers(answers)
+  const resolutionBillingSchedule = getScopedBillingScheduleRowsFromAnswers(answers, 'resolution')
+  const resolutionBillingInvoiceAmount = getBillingInvoiceAmountFromAnswers(answers, 'resolution')
+  const resolutionOutstandingBillingRows = getOutstandingBillingRows(resolutionBillingSchedule).sort((a, b) =>
+    String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')),
+  )
+  const nextResolutionBillingRow = resolutionOutstandingBillingRows[0] || null
+  const resolutionNextPaymentDate = String(nextResolutionBillingRow?.date || '').trim()
+  const resolutionNextPaymentAmount = toNumberValue(nextResolutionBillingRow?.amount)
+  const resolutionProcessedAmount = resolutionBillingSchedule
+    .filter((row) => getBillingStatusTone(row) === 'processed')
+    .reduce((sum, row) => sum + toNumberValue(row?.amount), 0)
+  const resolutionBillingPaidInFull = Boolean(
+    resolutionBillingActive &&
+      (resolutionBillingInvoiceAmount > 0
+        ? resolutionProcessedAmount >= resolutionBillingInvoiceAmount && resolutionOutstandingBillingRows.length === 0
+        : resolutionBillingSchedule.length > 0 &&
+            resolutionBillingSchedule.some((row) => getBillingStatusTone(row) === 'processed') &&
+            resolutionOutstandingBillingRows.length === 0),
+  )
+  const resolutionNextPaymentTimingTone = resolutionBillingPaidInFull ? 'paid_in_full' : getBillingTimingTone(resolutionNextPaymentDate)
   const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
   const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
   const billingPaymentMethod = parseStoredObject(answers.billing_payment_method, null)
@@ -5675,6 +5761,12 @@ function buildConsultationSummary(record) {
     hasProcessedPayment,
     nextBillingDate,
     nextBillingTimingTone,
+    resolutionBillingActive,
+    resolutionBillingInvoiceAmount,
+    resolutionNextPaymentDate,
+    resolutionNextPaymentAmount,
+    resolutionNextPaymentTimingTone,
+    resolutionBillingPaidInFull,
     hasPaymentMethodOnFile,
     investigationDocumentsSigned,
     resolutionDocumentsSigned,
