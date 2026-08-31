@@ -129,6 +129,38 @@ const CLIENT_PORTAL_SMS_CODE_LENGTH = Math.max(4, Math.min(8, Number(process.env
 const CLIENT_PORTAL_SMS_CODE_TTL_MS = Math.max(60_000, Number(process.env.CLIENT_PORTAL_SMS_CODE_TTL_MS || 10 * 60_000) || 10 * 60_000)
 const CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS = Math.max(15_000, Number(process.env.CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS || 45_000) || 45_000)
 const CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS = Math.max(3, Math.min(10, Number(process.env.CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS || 5) || 5))
+const SESSION_PERSIST_DEBOUNCE_MS = Math.max(100, Number(process.env.SESSION_PERSIST_DEBOUNCE_MS || 250) || 250)
+const DASHBOARD_ANALYTICS_CACHE_TTL_MS = Math.max(2000, Number(process.env.DASHBOARD_ANALYTICS_CACHE_TTL_MS || 10_000) || 10_000)
+const pendingSessionPersists = new Map()
+const dashboardAnalyticsCache = new Map()
+
+function invalidateDashboardAnalyticsCache() {
+  dashboardAnalyticsCache.clear()
+}
+
+function getDashboardAnalyticsCacheKey(account = null) {
+  const designatedPosition = String(account?.designatedPosition || '').trim().toLowerCase()
+  const email = String(account?.email || '').trim().toLowerCase()
+  return designatedPosition === 'enrolled agent' ? `ea:${email}` : 'admin:all'
+}
+
+function getCachedDashboardAnalytics(cacheKey = '') {
+  const normalizedKey = String(cacheKey || '')
+  const cached = dashboardAnalyticsCache.get(normalizedKey)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    dashboardAnalyticsCache.delete(normalizedKey)
+    return null
+  }
+  return cached.analytics || null
+}
+
+function setCachedDashboardAnalytics(cacheKey = '', analytics = null) {
+  dashboardAnalyticsCache.set(String(cacheKey || ''), {
+    analytics,
+    expiresAt: Date.now() + DASHBOARD_ANALYTICS_CACHE_TTL_MS,
+  })
+}
 
 function serializeCrashError(error) {
   if (error instanceof Error) {
@@ -297,6 +329,7 @@ async function fallbackUpsertSession({ code, contactId = null, opportunityId = n
     updatedAt,
   })
   await scheduleFallbackPersist()
+  invalidateDashboardAnalyticsCache()
 }
 
 async function fallbackDeleteSession(code) {
@@ -305,7 +338,10 @@ async function fallbackDeleteSession(code) {
   for (const candidate of getCodeVariants(code)) {
     if (fallbackSessions.delete(candidate)) deleted = true
   }
-  if (deleted) await scheduleFallbackPersist()
+  if (deleted) {
+    await scheduleFallbackPersist()
+    invalidateDashboardAnalyticsCache()
+  }
   return deleted
 }
 
@@ -7738,7 +7774,49 @@ async function persistRoomState(roomCode, room, patches = []) {
     })
   })
   if (patches.length) io.to(roomCode).emit('room_state', room.state)
-  await dbUpsertSession({ code: roomCode, state: room.state })
+  await schedulePersistRoomState(roomCode, room)
+}
+
+function schedulePersistRoomState(roomCode, room) {
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) return Promise.resolve()
+  const existing = pendingSessionPersists.get(normalizedRoomCode)
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.timer = setTimeout(async () => {
+      pendingSessionPersists.delete(normalizedRoomCode)
+      try {
+        await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
+        existing.resolve()
+      } catch (error) {
+        existing.reject(error)
+      }
+    }, SESSION_PERSIST_DEBOUNCE_MS)
+    return existing.promise
+  }
+
+  let resolvePromise = () => {}
+  let rejectPromise = () => {}
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve
+    rejectPromise = reject
+  })
+  const entry = {
+    timer: setTimeout(async () => {
+      pendingSessionPersists.delete(normalizedRoomCode)
+      try {
+        await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
+        resolvePromise()
+      } catch (error) {
+        rejectPromise(error)
+      }
+    }, SESSION_PERSIST_DEBOUNCE_MS),
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+  }
+  pendingSessionPersists.set(normalizedRoomCode, entry)
+  return promise
 }
 
 async function ensureStripeCustomerForRoom(roomCode, room) {
@@ -7804,6 +7882,7 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
     `,
       [resolvedCode, contactId, opportunityId, state],
     )
+    invalidateDashboardAnalyticsCache()
   } catch (error) {
     console.error('dbUpsertSession failed, falling back to file store:', {
       code: String(code || '').trim(),
@@ -7819,6 +7898,7 @@ async function dbDeleteSession(code) {
     const existing = await dbGetSession(code)
     if (!existing?.session_code) return false
     await pool.query('delete from ti_sessions where session_code=$1', [existing.session_code])
+    invalidateDashboardAnalyticsCache()
     return true
   } catch (error) {
     console.error('dbDeleteSession failed, falling back to file store:', {
@@ -8450,8 +8530,12 @@ app.get('/api/admin/consultations', async (req, res) => {
 app.get('/api/admin/consultations/analytics', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
+    const cacheKey = getDashboardAnalyticsCacheKey(req.adminUser || null)
+    const cachedAnalytics = getCachedDashboardAnalytics(cacheKey)
+    if (cachedAnalytics) return res.json({ analytics: cachedAnalytics })
     const items = await listAllConsultationDetails()
     const analytics = buildConsultationAnalytics(items, req.adminUser || null)
+    setCachedDashboardAnalytics(cacheKey, analytics)
     return res.json({ analytics })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load dashboard analytics' })

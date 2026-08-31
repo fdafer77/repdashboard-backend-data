@@ -50,4 +50,5 @@ export async function ensureSchema(pool) {
   await pool.query(`alter table ti_sessions add column if not exists ghl_opportunity_id text;`)
   await pool.query(`create index if not exists ti_sessions_ghl_contact_id_idx on ti_sessions(ghl_contact_id);`)
   await pool.query(`create index if not exists ti_sessions_ghl_opportunity_id_idx on ti_sessions(ghl_opportunity_id);`)
+  await pool.query(`create index if not exists ti_sessions_updated_at_idx on ti_sessions(updated_at desc);`)
 }
