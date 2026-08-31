@@ -2352,7 +2352,19 @@ function getBillingScheduleRowsFromAnswers(answers = {}) {
 
 function getBillingStatusTone(row = {}) {
   const rawStatus = String(row?.status || '').trim().toLowerCase()
-  if (['processed', 'paid', 'succeeded', 'successful', 'complete', 'completed'].includes(rawStatus)) return 'processed'
+  if (['processed', 'paid', 'succeeded', 'successful', 'complete', 'completed'].includes(rawStatus)) {
+    const normalizedDate = normalizeBillingDateValue(row?.date || '')
+    const hasProcessingEvidence = Boolean(
+      String(row?.processedAt || '').trim() ||
+        String(row?.stripePaymentIntentId || '').trim() ||
+        String(row?.processedStripePaymentMethodId || '').trim() ||
+        String(row?.processedPaymentMethodLast4 || '').trim() ||
+        String(row?.processedPaymentMethodBrand || '').trim(),
+    )
+    const isFutureScheduleWithoutEvidence = Boolean(normalizedDate && normalizedDate > getTodayBillingDateValue() && !hasProcessingEvidence)
+    if (isFutureScheduleWithoutEvidence) return 'pending'
+    return 'processed'
+  }
   if (['failed', 'declined', 'rejected', 'error'].includes(rawStatus)) return 'failed'
   return 'pending'
 }
