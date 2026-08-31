@@ -7403,6 +7403,15 @@ async function ensureStripeCustomerForRoom(roomCode, room) {
   return customer.id
 }
 
+async function persistStripeCustomerIdForRoom(roomCode, room, customerId = '') {
+  const normalizedCustomerId = String(customerId || '').trim()
+  if (!normalizedCustomerId) return ''
+  if (String(room?.state?.answers?.stripe_customer_id || '').trim() === normalizedCustomerId) return normalizedCustomerId
+  room.state.answers.stripe_customer_id = normalizedCustomerId
+  await persistRoomState(roomCode, room, [{ type: 'setAnswer', questionId: 'stripe_customer_id', value: normalizedCustomerId }])
+  return normalizedCustomerId
+}
+
 async function dbGetSession(code) {
   if (!pool) return fallbackGetSession(code)
   for (const candidate of getCodeVariants(code)) {
@@ -8803,27 +8812,35 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
-    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    let customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    let setupIntentCustomerId = ''
     if (setupIntentId) {
       const setupIntent = await stripe.setupIntents.retrieve(setupIntentId)
       if (setupIntent.status !== 'succeeded') return res.status(400).json({ error: 'Stripe setup has not completed yet.' })
-      if (String(setupIntent.customer || '') !== customerId) return res.status(400).json({ error: 'Stripe customer mismatch.' })
+      setupIntentCustomerId = String(setupIntent.customer || '').trim()
+      if (setupIntentCustomerId && setupIntentCustomerId !== customerId) {
+        customerId = await persistStripeCustomerIdForRoom(roomCode, room, setupIntentCustomerId)
+      }
     }
-    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
-    if (String(paymentMethod.customer || '') !== customerId) {
+    let paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    const paymentMethodCustomerId = String(paymentMethod.customer || '').trim()
+    if (paymentMethodCustomerId && paymentMethodCustomerId !== customerId) {
+      if (setupIntentCustomerId && paymentMethodCustomerId === setupIntentCustomerId) {
+        customerId = await persistStripeCustomerIdForRoom(roomCode, room, paymentMethodCustomerId)
+      } else {
+        return res.status(400).json({ error: 'This payment method is linked to a different Stripe customer. Please try adding it again.' })
+      }
+    }
+    if (String(paymentMethod.customer || '').trim() !== customerId) {
       await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId })
+      paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
     }
     const nextMethod = buildStripePaymentMethodRecord(paymentMethod, { customerId, setupIntentId })
     const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods).filter(
       (entry) => String(entry?.stripePaymentMethodId || '') !== paymentMethodId,
     )
     const nextMethods = [...existingMethods, nextMethod]
-    room.state.answers.billing_payment_methods = nextMethods
-    room.state.answers.billing_payment_method = nextMethod
-    await persistRoomState(roomCode, room, [
-      { type: 'setAnswer', questionId: 'billing_payment_methods', value: nextMethods },
-      { type: 'setAnswer', questionId: 'billing_payment_method', value: nextMethod },
-    ])
+    await persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod)
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentMethod: nextMethod })
   } catch (error) {
@@ -8950,17 +8967,30 @@ app.post('/api/session/:code/stripe/payment-methods', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
-    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    let customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    let setupIntentCustomerId = ''
 
     if (setupIntentId) {
       const setupIntent = await stripe.setupIntents.retrieve(setupIntentId)
       if (setupIntent.status !== 'succeeded') return res.status(400).json({ error: 'Stripe setup has not completed yet.' })
-      if (String(setupIntent.customer || '') !== customerId) return res.status(400).json({ error: 'Stripe customer mismatch.' })
+      setupIntentCustomerId = String(setupIntent.customer || '').trim()
+      if (setupIntentCustomerId && setupIntentCustomerId !== customerId) {
+        customerId = await persistStripeCustomerIdForRoom(roomCode, room, setupIntentCustomerId)
+      }
     }
 
-    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
-    if (String(paymentMethod.customer || '') !== customerId) {
+    let paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    const paymentMethodCustomerId = String(paymentMethod.customer || '').trim()
+    if (paymentMethodCustomerId && paymentMethodCustomerId !== customerId) {
+      if (setupIntentCustomerId && paymentMethodCustomerId === setupIntentCustomerId) {
+        customerId = await persistStripeCustomerIdForRoom(roomCode, room, paymentMethodCustomerId)
+      } else {
+        return res.status(400).json({ error: 'This payment method is linked to a different Stripe customer. Please try adding it again.' })
+      }
+    }
+    if (String(paymentMethod.customer || '').trim() !== customerId) {
       await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId })
+      paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
     }
     const nextMethod = buildStripePaymentMethodRecord(paymentMethod, { customerId, setupIntentId })
     const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods).filter(
