@@ -2578,6 +2578,140 @@ function isTrainingLeadItem(item = {}) {
   return /\btest\b|\btraining\b/.test(searchable)
 }
 
+const AUTO_STRIPE_BILLING_RESTORE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, persist } = {}) {
+  if (!stripe) return
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) return
+  if (!state || typeof state !== 'object') return
+  if (typeof persist !== 'function') return
+
+  const nextState = state
+  const answers = nextState?.answers || {}
+
+  const lastAttemptRaw = String(answers._auto_stripe_billing_restore_attempted_at || '').trim()
+  if (lastAttemptRaw) {
+    const lastAttemptMs = new Date(lastAttemptRaw).getTime()
+    if (!Number.isNaN(lastAttemptMs) && Date.now() - lastAttemptMs < AUTO_STRIPE_BILLING_RESTORE_MIN_INTERVAL_MS) {
+      return
+    }
+  }
+
+  const existingScheduleRows = getBillingScheduleRowsFromAnswers(answers)
+  const hasExistingEvidence = existingScheduleRows.some((row) => hasBillingProcessingEvidence(row))
+  if (hasExistingEvidence) return
+
+  let customerId = String(answers.stripe_customer_id || '').trim()
+  const email = String(answers.email || '').trim()
+
+  if (!customerId && email) {
+    const candidates = await stripe.customers.list({ email, limit: 10 })
+    const match =
+      candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim() === normalizedRoomCode) ||
+      candidates.data[0]
+    customerId = String(match?.id || '').trim()
+    if (customerId) {
+      answers.stripe_customer_id = customerId
+    }
+  }
+
+  // Nothing to restore (no linked customer).
+  if (!customerId) {
+    answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
+    await persist(nextState)
+    return
+  }
+
+  const intents = await stripe.paymentIntents.list({
+    customer: customerId,
+    limit: 100,
+    expand: ['data.payment_method'],
+  })
+
+  const candidates = intents.data
+    .filter((intent) => intent && (intent.status === 'succeeded' || intent.status === 'requires_capture'))
+    .map((intent) => {
+      const received = Number(intent.amount_received || intent.amount || 0)
+      const amount = received ? received / 100 : 0
+      const processedAt = new Date(Number(intent.created || 0) * 1000).toISOString()
+      const normalizedDate = normalizeBillingDateValue(processedAt)
+      const paymentMethod = intent.payment_method
+      const paymentMethodId = typeof paymentMethod === 'string' ? paymentMethod : String(paymentMethod?.id || '')
+      let brand = ''
+      let last4 = ''
+      let methodType = ''
+      if (paymentMethod && typeof paymentMethod === 'object') {
+        methodType = String(paymentMethod?.type || '').trim()
+        if (paymentMethod.type === 'card') {
+          brand = String(paymentMethod?.card?.brand || '').trim()
+          last4 = String(paymentMethod?.card?.last4 || '').trim()
+        } else if (paymentMethod.type === 'us_bank_account') {
+          brand = 'bank'
+          last4 = String(paymentMethod?.us_bank_account?.last4 || '').trim()
+        }
+      } else if (Array.isArray(intent.payment_method_types) && intent.payment_method_types.length) {
+        methodType = String(intent.payment_method_types[0] || '').trim()
+      }
+      return {
+        date: normalizedDate,
+        amount,
+        status: 'processed',
+        stripePaymentIntentId: String(intent.id || '').trim(),
+        processedAt,
+        processedStripeCustomerId: customerId,
+        processedStripePaymentMethodId: String(paymentMethodId || '').trim(),
+        processedPaymentMethodBrand: brand,
+        processedPaymentMethodLast4: last4,
+        processedPaymentMethodType: methodType,
+      }
+    })
+    .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
+
+  if (!candidates.length) {
+    answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
+    await persist(nextState)
+    return
+  }
+
+  const existingDirectSchedule = normalizeBillingScheduleRows(parseStoredObject(answers.billing_schedule, []))
+  const existingIntentIds = new Set(existingDirectSchedule.map((row) => getBillingStripePaymentIntentIdValue(row)).filter(Boolean))
+  const existingByKey = new Map()
+  existingDirectSchedule.forEach((row) => {
+    const key = getBillingRowMatchKey(row)
+    if (!key) return
+    const bucket = existingByKey.get(key)
+    if (bucket) bucket.push(row)
+    else existingByKey.set(key, [row])
+  })
+
+  const merged = [...existingDirectSchedule]
+  candidates.forEach((candidate) => {
+    const intentId = getBillingStripePaymentIntentIdValue(candidate)
+    if (intentId && existingIntentIds.has(intentId)) return
+    const key = getBillingRowMatchKey(candidate)
+    if (!key) return
+    const bucket = existingByKey.get(key)
+    const match = Array.isArray(bucket) && bucket.length ? bucket[0] : null
+    if (match) {
+      if (hasBillingProcessingEvidence(match)) return
+      Object.assign(match, candidate)
+      existingIntentIds.add(intentId)
+      return
+    }
+    merged.push(candidate)
+    existingIntentIds.add(intentId)
+  })
+
+  const nextSchedule = sanitizeBillingScheduleRowsForPersistence(merged, existingDirectSchedule)
+  answers.billing_schedule = nextSchedule
+  answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
+  answers._auto_stripe_billing_restore_at = new Date().toISOString()
+  nextState.answers = answers
+
+  await persist(nextState)
+}
+
 function getLifecycleLabel(item = {}) {
   if (isTrainingLeadItem(item)) return 'Test Lead'
   if (Boolean(item.hasProcessedPayment)) return 'Active Client'
@@ -8526,6 +8660,14 @@ async function getConsultationRecordByCode(code) {
         await dbUpsertSession({ code: row.session_code, state: nextState })
       },
     })
+    await autoRestoreStripeBillingEvidenceIfMissing({
+      roomCode: row.session_code,
+      state: row.state,
+      persist: async (nextState) => {
+        row.state = nextState
+        await dbUpsertSession({ code: row.session_code, state: nextState })
+      },
+    })
     return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -8546,6 +8688,14 @@ async function getConsultationRecordByCode(code) {
     },
   })
   await reconcileBoldsignResolutionStatus({
+    roomCode: normalized,
+    state: room.state,
+    persist: async (nextState) => {
+      room.state = nextState
+      await dbUpsertSession({ code: normalized, state: nextState })
+    },
+  })
+  await autoRestoreStripeBillingEvidenceIfMissing({
     roomCode: normalized,
     state: room.state,
     persist: async (nextState) => {
