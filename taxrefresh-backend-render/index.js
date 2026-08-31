@@ -406,9 +406,6 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// Background repair: rebuild missing Stripe billing evidence gradually without any manual UI action.
-startStripeBillingRestoreWorker()
-
 function parseGoogleAddressComponents(components = []) {
   const list = Array.isArray(components) ? components : []
   const findPart = (type, mode = 'long_name') =>
@@ -2581,7 +2578,9 @@ function isTrainingLeadItem(item = {}) {
   return /\btest\b|\btraining\b/.test(searchable)
 }
 
-const AUTO_STRIPE_BILLING_RESTORE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000
+// If Stripe restore fails due to missing metadata/temporary Stripe search availability,
+// we want to retry reasonably soon without hammering Stripe.
+const AUTO_STRIPE_BILLING_RESTORE_MIN_INTERVAL_MS = 10 * 60 * 1000
 
 async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, persist } = {}) {
   if (!stripe) return
@@ -2800,8 +2799,8 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   await persist(nextState)
 }
 
-const STRIPE_BILLING_RESTORE_QUEUE_MAX = 200
-const STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS = 2500
+const STRIPE_BILLING_RESTORE_QUEUE_MAX = 2000
+const STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS = 1000
 const stripeBillingRestoreQueue = new Set()
 let stripeBillingRestoreWorkerStarted = false
 
@@ -2817,39 +2816,42 @@ function startStripeBillingRestoreWorker() {
   stripeBillingRestoreWorkerStarted = true
   setInterval(async () => {
     if (!stripe) return
-    const iterator = stripeBillingRestoreQueue.values().next()
-    if (iterator.done) return
-    const nextCode = iterator.value
-    stripeBillingRestoreQueue.delete(nextCode)
-    try {
-      const row = await dbGetSession(nextCode)
-      if (row?.state) {
-        await autoRestoreStripeBillingEvidenceIfMissing({
-          roomCode: row.session_code,
-          state: row.state,
-          persist: async (nextState) => {
-            row.state = nextState
-            await dbUpsertSession({ code: row.session_code, state: nextState })
-          },
+    for (let i = 0; i < 3; i += 1) {
+      const iterator = stripeBillingRestoreQueue.values().next()
+      if (iterator.done) return
+      const nextCode = iterator.value
+      stripeBillingRestoreQueue.delete(nextCode)
+      try {
+        const row = await dbGetSession(nextCode)
+        if (row?.state) {
+          await autoRestoreStripeBillingEvidenceIfMissing({
+            roomCode: row.session_code,
+            state: row.state,
+            persist: async (nextState) => {
+              row.state = nextState
+              await dbUpsertSession({ code: row.session_code, state: nextState })
+            },
+          })
+          continue
+        }
+        const room =
+          rooms.get(nextCode) || rooms.get(String(nextCode).toUpperCase()) || rooms.get(String(nextCode).toLowerCase())
+        if (room?.state) {
+          await autoRestoreStripeBillingEvidenceIfMissing({
+            roomCode: nextCode,
+            state: room.state,
+            persist: async (nextState) => {
+              room.state = nextState
+              await dbUpsertSession({ code: nextCode, state: nextState })
+            },
+          })
+        }
+      } catch (error) {
+        console.error('stripe billing auto-restore worker failed:', {
+          code: String(nextCode || '').trim(),
+          message: error instanceof Error ? error.message : String(error || ''),
         })
-        return
       }
-      const room = rooms.get(nextCode) || rooms.get(String(nextCode).toUpperCase()) || rooms.get(String(nextCode).toLowerCase())
-      if (room?.state) {
-        await autoRestoreStripeBillingEvidenceIfMissing({
-          roomCode: nextCode,
-          state: room.state,
-          persist: async (nextState) => {
-            room.state = nextState
-            await dbUpsertSession({ code: nextCode, state: nextState })
-          },
-        })
-      }
-    } catch (error) {
-      console.error('stripe billing auto-restore worker failed:', {
-        code: String(nextCode || '').trim(),
-        message: error instanceof Error ? error.message : String(error || ''),
-      })
     }
   }, STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS)
 }
@@ -12215,4 +12217,11 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Server listening on http://localhost:${PORT}`)
+
+  // Background repair: rebuild missing Stripe billing evidence gradually without any manual UI action.
+  try {
+    startStripeBillingRestoreWorker()
+  } catch (error) {
+    console.error('Failed to start Stripe billing restore worker:', error)
+  }
 })
