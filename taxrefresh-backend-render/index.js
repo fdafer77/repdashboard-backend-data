@@ -2364,6 +2364,79 @@ function getBillingRowMatchKey(row = {}) {
   return `${normalizedDate}|${normalizedAmount}`
 }
 
+function getBillingRowPersistenceKey(row = {}) {
+  const tone = getBillingStatusTone(row)
+  const normalizedDate = normalizeBillingDateValue(row?.date || '')
+  const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+  if (!normalizedDate && normalizedAmount === '0.00') return ''
+  return `${tone}|${normalizedDate}|${normalizedAmount}`
+}
+
+function sanitizeBillingScheduleRowsForPersistence(nextRows = [], existingRows = []) {
+  const existingBuckets = new Map()
+  ;(Array.isArray(existingRows) ? existingRows : []).forEach((row) => {
+    const key = getBillingRowPersistenceKey(row)
+    if (!key) return
+    const bucket = existingBuckets.get(key)
+    if (bucket) {
+      bucket.push(row)
+      return
+    }
+    existingBuckets.set(key, [row])
+  })
+
+  return (Array.isArray(nextRows) ? nextRows : [])
+    .map((row) => ({
+      ...(row || {}),
+      date: normalizeBillingDateValue(row?.date || ''),
+      amount: String(row?.amount ?? '').trim(),
+      status: String(row?.status || '').trim(),
+      failureReason: String(row?.failureReason || '').trim(),
+      processorReason: String(row?.processorReason || '').trim(),
+      reason: String(row?.reason || '').trim(),
+    }))
+    .filter((row) => row.date || row.amount)
+    .map((row) => {
+      const key = getBillingRowPersistenceKey(row)
+      const matchBucket = key ? existingBuckets.get(key) : null
+      const existingMatch = Array.isArray(matchBucket) && matchBucket.length ? matchBucket.shift() : null
+      if (existingMatch) {
+        return {
+          ...existingMatch,
+          ...row,
+          date: row.date,
+          amount: row.amount,
+        }
+      }
+
+      const tone = getBillingStatusTone(row)
+      if (tone !== 'pending') {
+        return {
+          ...row,
+          status: '',
+          failureReason: '',
+          processorReason: '',
+          reason: '',
+          stripePaymentIntentId: '',
+          processedAt: '',
+          processedPaymentMethodLast4: '',
+          processedPaymentMethodBrand: '',
+          processedStripePaymentMethodId: '',
+          processedStripeCustomerId: '',
+          processedPaymentMethodType: '',
+        }
+      }
+
+      return {
+        ...row,
+        status: '',
+        failureReason: '',
+        processorReason: '',
+        reason: '',
+      }
+    })
+}
+
 function getOutstandingBillingRows(rows = []) {
   const processedKeys = new Set(
     rows
@@ -8978,7 +9051,26 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
     const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
     const invoiceAmount = req.body?.invoiceAmount
     const invoiceCreatedAt = req.body?.invoiceCreatedAt
-    const schedule = Array.isArray(req.body?.schedule) ? req.body.schedule : []
+    const incomingSchedule = Array.isArray(req.body?.schedule) ? req.body.schedule : []
+    const parseScheduleValue = (value) => {
+      if (Array.isArray(value)) return value
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value)
+          return Array.isArray(parsed) ? parsed : []
+        } catch {
+          return []
+        }
+      }
+      return []
+    }
+    const existingSchedule = (() => {
+      const scoped = parseScheduleValue(room.state.answers[scheduleFieldKey])
+      if (scoped.length) return scoped
+      if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule)
+      return []
+    })()
+    const schedule = sanitizeBillingScheduleRowsForPersistence(incomingSchedule, existingSchedule)
 
     room.state.answers[invoiceAmountFieldKey] = invoiceAmount === null || invoiceAmount === undefined ? '' : invoiceAmount
     room.state.answers[invoiceCreatedAtFieldKey] = invoiceCreatedAt === null || invoiceCreatedAt === undefined ? '' : invoiceCreatedAt
