@@ -2941,6 +2941,133 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   await persist(nextState)
 }
 
+// Payment methods can get out of sync when a Stripe customer id is missing or when state was edited.
+// If we can resolve the Stripe customer, we should re-populate the stored payment method list so the dashboard
+// does not show "No payment method" when Stripe actually has one.
+const AUTO_STRIPE_PAYMENT_METHOD_SYNC_MIN_INTERVAL_MS = 10 * 60 * 1000
+
+async function autoSyncStripePaymentMethodsIfMissing({ roomCode, state, persist } = {}) {
+  if (!stripe) return
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) return
+  if (!state || typeof state !== 'object') return
+  if (typeof persist !== 'function') return
+
+  const nextState = state
+  const answers = nextState?.answers || {}
+
+  const lastAttemptRaw = String(answers._auto_stripe_payment_method_sync_attempted_at || '').trim()
+  if (lastAttemptRaw) {
+    const lastAttemptMs = new Date(lastAttemptRaw).getTime()
+    if (!Number.isNaN(lastAttemptMs) && Date.now() - lastAttemptMs < AUTO_STRIPE_PAYMENT_METHOD_SYNC_MIN_INTERVAL_MS) {
+      return
+    }
+  }
+
+  const existingMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
+  const existingDirect = parseStoredObject(answers.billing_payment_method, null)
+  const hasExistingStripeMethod =
+    existingMethods.some((entry) => String(entry?.stripePaymentMethodId || '').trim()) ||
+    Boolean(String(existingDirect?.stripePaymentMethodId || '').trim())
+  if (hasExistingStripeMethod) return
+
+  let customerId = String(answers.stripe_customer_id || '').trim()
+  const email = String(answers.email || '').trim()
+  const safeSessionCode = normalizedRoomCode.replace(/[^a-zA-Z0-9_-]/g, '')
+
+  if (!customerId && safeSessionCode && typeof stripe?.customers?.search === 'function') {
+    try {
+      const search = await stripe.customers.search({
+        query: `metadata['sessionCode']:'${safeSessionCode}'`,
+        limit: 1,
+      })
+      customerId = String(search?.data?.[0]?.id || '').trim()
+      if (customerId) answers.stripe_customer_id = customerId
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!customerId && email) {
+    try {
+      const candidates = await stripe.customers.list({ email, limit: 10 })
+      const match =
+        candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim() === normalizedRoomCode) ||
+        candidates.data[0]
+      customerId = String(match?.id || '').trim()
+      if (customerId) answers.stripe_customer_id = customerId
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!customerId) {
+    answers._auto_stripe_payment_method_sync_attempted_at = new Date().toISOString()
+    nextState.answers = sanitizeSensitiveBillingAnswers(answers)
+    await persist(nextState)
+    return
+  }
+
+  let nextStripeMethods = []
+  try {
+    const cardMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 100 })
+    cardMethods.data.forEach((method) => {
+      const record = buildStripePaymentMethodRecord(method, { customerId, setupIntentId: '' })
+      if (record?.stripePaymentMethodId) nextStripeMethods.push(record)
+    })
+    const bankMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'us_bank_account', limit: 100 })
+    bankMethods.data.forEach((method) => {
+      const record = buildStripePaymentMethodRecord(method, { customerId, setupIntentId: '' })
+      if (record?.stripePaymentMethodId) nextStripeMethods.push(record)
+    })
+  } catch (error) {
+    answers._auto_stripe_payment_method_sync_attempted_at = new Date().toISOString()
+    nextState.answers = sanitizeSensitiveBillingAnswers(answers)
+    await persist(nextState)
+    return
+  }
+
+  if (!nextStripeMethods.length) {
+    answers._auto_stripe_payment_method_sync_attempted_at = new Date().toISOString()
+    nextState.answers = sanitizeSensitiveBillingAnswers(answers)
+    await persist(nextState)
+    return
+  }
+
+  // Keep any existing stored methods that are not Stripe-linked (legacy) first.
+  const merged = []
+  existingMethods.forEach((entry) => {
+    if (!String(entry?.stripePaymentMethodId || '').trim()) merged.push(entry)
+  })
+  nextStripeMethods.forEach((entry) => merged.push(entry))
+
+  const portalMethods = merged.map(buildClientPortalPaymentMethodRecord).filter((entry) => entry && (entry.holder || entry.last4))
+  const portalMethod = portalMethods[portalMethods.length - 1] || null
+  const nextMethod = merged.findLast((entry) => String(entry?.stripePaymentMethodId || '').trim()) || merged[merged.length - 1]
+
+  answers.billing_payment_methods = merged
+  answers.billing_payment_method = nextMethod
+  answers.client_portal_payment_methods = portalMethods
+  answers.client_portal_payment_method = portalMethod
+  answers._auto_stripe_payment_method_sync_attempted_at = new Date().toISOString()
+  answers._auto_stripe_payment_method_sync_at = new Date().toISOString()
+
+  nextState.answers = sanitizeSensitiveBillingAnswers(answers)
+  await persist(nextState)
+
+  void dbInsertBillingAudit({
+    sessionCode: normalizedRoomCode,
+    eventType: 'stripe_payment_methods_synced_auto',
+    billingMode: '',
+    actorEmail: '',
+    payload: {
+      stripeCustomerId: customerId,
+      count: merged.length,
+      at: new Date().toISOString(),
+    },
+  })
+}
+
 const STRIPE_BILLING_RESTORE_QUEUE_MAX = 2000
 const STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS = 1000
 const stripeBillingRestoreQueue = new Set()
@@ -8090,7 +8217,6 @@ function buildStripePaymentMethodRecord(paymentMethod, { customerId = '', setupI
   if (type === 'us_bank_account') {
     const last4 = String(paymentMethod?.us_bank_account?.last4 || '').trim()
     const bankName = String(paymentMethod?.us_bank_account?.bank_name || '').trim()
-    const routingNumber = String(paymentMethod?.us_bank_account?.routing_number || '').trim()
     const accountTypeRaw = String(paymentMethod?.us_bank_account?.account_type || '').trim()
     const bankAccountType = accountTypeRaw ? accountTypeRaw.charAt(0).toUpperCase() + accountTypeRaw.slice(1) : ''
     const labelParts = [bankName || 'ACH', bankAccountType ? `${bankAccountType.toLowerCase()} account` : 'account', last4 ? `ending in ${last4}` : '']
@@ -8109,8 +8235,6 @@ function buildStripePaymentMethodRecord(paymentMethod, { customerId = '', setupI
       institutionName: bankName,
       bankAccountType,
       accountHolderName: String(paymentMethod?.billing_details?.name || '').trim(),
-      routingNumber,
-      accountNumber: last4,
       last4,
       addedAt: new Date().toISOString(),
     }
@@ -8959,6 +9083,14 @@ async function getConsultationRecordByCode(code) {
         await dbUpsertSession({ code: row.session_code, state: nextState })
       },
     })
+    await autoSyncStripePaymentMethodsIfMissing({
+      roomCode: row.session_code,
+      state: row.state,
+      persist: async (nextState) => {
+        row.state = nextState
+        await dbUpsertSession({ code: row.session_code, state: nextState })
+      },
+    })
     return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -8987,6 +9119,14 @@ async function getConsultationRecordByCode(code) {
     },
   })
   await autoRestoreStripeBillingEvidenceIfMissing({
+    roomCode: normalized,
+    state: room.state,
+    persist: async (nextState) => {
+      room.state = nextState
+      await dbUpsertSession({ code: normalized, state: nextState })
+    },
+  })
+  await autoSyncStripePaymentMethodsIfMissing({
     roomCode: normalized,
     state: room.state,
     persist: async (nextState) => {
