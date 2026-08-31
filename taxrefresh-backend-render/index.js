@@ -10637,7 +10637,6 @@ function buildConsultationAnalytics(items = [], account = null) {
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
-          if (tone === 'pending' && !pendingRevenueEligible) return
           const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
@@ -10675,7 +10674,7 @@ function buildConsultationAnalytics(items = [], account = null) {
             failedRevenue += amount
             failedRevenueTotal += amount
             failedPayments.push(paymentScheduleEntry)
-          } else if (!isPastDuePending) {
+          } else if (!isPastDuePending && pendingRevenueEligible) {
             pendingRevenue += amount
             pendingRevenueTotal += amount
           }
