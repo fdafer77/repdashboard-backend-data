@@ -5684,6 +5684,14 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
+  const investigationBillingSchedule = getScopedBillingScheduleRowsFromAnswers(answers, 'investigation')
+  const investigationBillingInvoiceAmount = getBillingInvoiceAmountFromAnswers(answers, 'investigation')
+  const investigationProcessedAmount = investigationBillingSchedule
+    .filter((row) => getBillingStatusTone(row) === 'processed')
+    .reduce((sum, row) => sum + toNumberValue(row?.amount), 0)
+  const investigationBillingPaidInFull = Boolean(
+    investigationBillingInvoiceAmount > 0 && investigationProcessedAmount >= investigationBillingInvoiceAmount,
+  )
   const nextOutstandingBillingRow =
     getOutstandingBillingRows(billingSchedule).sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
   const nextBillingDate = String(nextOutstandingBillingRow?.date || '').trim()
@@ -5797,6 +5805,9 @@ function buildConsultationSummary(record) {
     stateBalance,
     processedPaymentCount,
     hasProcessedPayment,
+    investigationBillingInvoiceAmount,
+    investigationProcessedAmount,
+    investigationBillingPaidInFull,
     nextBillingDate,
     nextBillingTimingTone,
     resolutionBillingActive,
