@@ -2410,11 +2410,20 @@ function isPortalAuthorizedForAnswers(answers = {}) {
 function hasSignedResolutionDocuments(answers = {}) {
   const documentReceipts = Array.isArray(answers.document_receipts) ? answers.document_receipts : parseStoredObject(answers.document_receipts, [])
   const documentDeliveryLog = Array.isArray(answers.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers.document_delivery_log, [])
-  return [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])].some(
-    (entry) =>
-      String(entry?.name || '').trim() === 'Resolution Documents' &&
-      String(entry?.status || '').trim().toLowerCase() === 'signed',
-  ) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
+  const pool = [...(Array.isArray(documentReceipts) ? documentReceipts : []), ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])]
+  return (
+    pool.some((entry) => {
+      const normalizedName = String(entry?.name || '').trim().toLowerCase()
+      const isResolutionDoc =
+        normalizedName === 'resolution documents' ||
+        normalizedName.includes('resolution documents') ||
+        normalizedName.includes('resolution document')
+      if (!isResolutionDoc) return false
+      const status = String(entry?.status || '').trim().toLowerCase()
+      if (status === 'signed') return true
+      return Boolean(String(entry?.signedAt || entry?.signed_at || '').trim())
+    }) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
+  )
 }
 
 function hasSignedPendingRevenueDocuments(answers = {}) {
@@ -10628,7 +10637,8 @@ function buildConsultationAnalytics(items = [], account = null) {
         .trim()
         .toLowerCase()
       const isCancellationRequested = cancellationStatus.includes('cancel')
-      const pendingRevenueEligible = hasSignedPendingRevenueDocuments(answers) && hasStoredPaymentMethodOnFile(answers)
+      const docsSignedEligible = hasSignedPendingRevenueDocuments(answers)
+      const pendingRevenueEligible = docsSignedEligible && hasStoredPaymentMethodOnFile(answers)
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
       let processedRevenue = 0
       let pendingRevenue = 0
@@ -10637,6 +10647,7 @@ function buildConsultationAnalytics(items = [], account = null) {
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
+          if (tone === 'pending' && !docsSignedEligible) return
           const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
