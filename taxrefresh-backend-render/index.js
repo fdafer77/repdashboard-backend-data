@@ -2264,6 +2264,15 @@ function getBillingStatusTone(row = {}) {
   return 'pending'
 }
 
+function getBillingTimingTone(value = '') {
+  const normalized = normalizeBillingDateValue(value)
+  if (!normalized) return ''
+  const today = normalizeBillingDateValue(new Date().toISOString())
+  if (!today) return ''
+  if (normalized === today) return 'today'
+  return normalized > today ? 'upcoming' : 'past'
+}
+
 function isTrainingLeadItem(item = {}) {
   if (String(item.leadType || '').trim().toLowerCase() === 'training') return true
   if (String(item.isTrainingLead || '').trim().toLowerCase() === 'true') return true
@@ -5560,6 +5569,12 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
+  const nextPendingBillingRow =
+    billingSchedule
+      .filter((row) => getBillingStatusTone(row) === 'pending')
+      .sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
+  const nextBillingDate = String(nextPendingBillingRow?.date || '').trim()
+  const nextBillingTimingTone = getBillingTimingTone(nextBillingDate)
   const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
   const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
   const billingPaymentMethod = parseStoredObject(answers.billing_payment_method, null)
@@ -5638,6 +5653,8 @@ function buildConsultationSummary(record) {
     stateBalance,
     processedPaymentCount,
     hasProcessedPayment,
+    nextBillingDate,
+    nextBillingTimingTone,
     hasPaymentMethodOnFile,
     investigationDocumentsSigned,
     resolutionDocumentsSigned,
