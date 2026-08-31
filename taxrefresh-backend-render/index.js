@@ -138,6 +138,110 @@ function invalidateDashboardAnalyticsCache() {
   dashboardAnalyticsCache.clear()
 }
 
+function safeJsonClone(value) {
+  try {
+    return value ? JSON.parse(JSON.stringify(value)) : value
+  } catch {
+    return value
+  }
+}
+
+function normalizeDigits(value = '') {
+  return String(value || '').replace(/\D/g, '')
+}
+
+function sanitizePaymentMethodRecord(method = {}) {
+  if (!method || typeof method !== 'object') return method
+  const next = { ...method }
+
+  // NEVER persist CVV or full PAN/account numbers (PCI / sensitive).
+  delete next.cvv
+  delete next.securityCode
+  delete next.cvc
+  delete next.routingNumber
+  delete next.routing_number
+
+  const cardDigits = normalizeDigits(next.cardNumber || next.card_number || '')
+  if (cardDigits) {
+    next.last4 = cardDigits.slice(-4)
+  }
+  delete next.cardNumber
+  delete next.card_number
+
+  const accountDigits = normalizeDigits(next.accountNumber || next.account_number || '')
+  if (accountDigits) {
+    next.last4 = next.last4 || accountDigits.slice(-4)
+  }
+  delete next.accountNumber
+  delete next.account_number
+
+  // Rebuild label if needed.
+  if (next.last4 && !String(next.label || '').trim()) {
+    const type = String(next.cardType || next.type || 'Card').trim()
+    next.label = `${type} ending in ${next.last4}`
+  }
+
+  return next
+}
+
+function sanitizePaymentMethodList(value) {
+  const list = Array.isArray(value) ? value : parseStoredObject(value, [])
+  if (!Array.isArray(list)) return []
+  return list.map((entry) => sanitizePaymentMethodRecord(entry))
+}
+
+function sanitizeSensitiveBillingAnswers(answers = {}) {
+  if (!answers || typeof answers !== 'object') return answers
+
+  // Remove UI-only raw entry fields if they ever get into answers.
+  delete answers._ui_pay_cardNumber
+  delete answers._ui_pay_cvv
+  delete answers._ui_pay_expiry
+
+  // Legacy raw card fields (should never persist).
+  const rawCardDigits = normalizeDigits(answers.payment_card_number || '')
+  if (rawCardDigits && !answers.payment_card_last4) answers.payment_card_last4 = rawCardDigits.slice(-4)
+  delete answers.payment_card_number
+  delete answers.payment_card_cvv
+
+  // Payment method objects / arrays (billing + portal).
+  if (answers.billing_payment_method) {
+    const next = sanitizePaymentMethodRecord(parseStoredObject(answers.billing_payment_method, null))
+    answers.billing_payment_method = next
+  }
+  if (answers.client_portal_payment_method) {
+    const next = sanitizePaymentMethodRecord(parseStoredObject(answers.client_portal_payment_method, null))
+    answers.client_portal_payment_method = next
+  }
+  if (answers.billing_payment_methods) {
+    answers.billing_payment_methods = sanitizePaymentMethodList(answers.billing_payment_methods)
+  }
+  if (answers.client_portal_payment_methods) {
+    answers.client_portal_payment_methods = sanitizePaymentMethodList(answers.client_portal_payment_methods)
+  }
+
+  return answers
+}
+
+async function dbInsertBillingAudit({ sessionCode, eventType, billingMode = '', actorEmail = '', payload = {} } = {}) {
+  if (!pool) return
+  const normalizedCode = String(sessionCode || '').trim()
+  const normalizedEvent = String(eventType || '').trim()
+  if (!normalizedCode || !normalizedEvent) return
+  try {
+    await pool.query(
+      `insert into ti_billing_audit(session_code, event_type, billing_mode, actor_email, payload) values ($1, $2, $3, $4, $5)`,
+      [normalizedCode, normalizedEvent, String(billingMode || '').trim() || null, String(actorEmail || '').trim() || null, payload || {}],
+    )
+  } catch (error) {
+    console.error('billing audit insert failed:', {
+      sessionCode: normalizedCode,
+      eventType: normalizedEvent,
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+  }
+}
+
 function getDashboardAnalyticsCacheKey(account = null) {
   const designatedPosition = String(account?.designatedPosition || '').trim().toLowerCase()
   const email = String(account?.email || '').trim().toLowerCase()
@@ -8145,6 +8249,11 @@ async function createStripeLinkedCardForRoom(roomCode, room, { cardholderName = 
 
 async function persistRoomState(roomCode, room, patches = []) {
   room.state.updatedAt = Date.now()
+  // Sanitize sensitive billing/payment fields immediately so they are never broadcasted or persisted.
+  // (Do not store CVV/PAN in memory, sockets, or database.)
+  if (room?.state?.answers && typeof room.state.answers === 'object') {
+    room.state.answers = sanitizeSensitiveBillingAnswers(room.state.answers)
+  }
   patches.forEach((patch) => {
     io.to(roomCode).emit('room_patch', {
       patch,
@@ -9649,6 +9758,24 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
       return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to persist billing adjustments' })
     }
 
+    // Immutable audit trail of billing edits (so invoice dates/amounts/schedules can be recovered).
+    void dbInsertBillingAudit({
+      sessionCode: roomCode,
+      eventType: 'billing_updated',
+      billingMode,
+      actorEmail: String(req.adminUser?.email || ''),
+      payload: {
+        billingMode,
+        invoiceAmountFieldKey,
+        invoiceCreatedAtFieldKey,
+        scheduleFieldKey,
+        invoiceAmount,
+        invoiceCreatedAt,
+        scheduleLength: Array.isArray(schedule) ? schedule.length : 0,
+        at: new Date().toISOString(),
+      },
+    })
+
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item })
   } catch (error) {
@@ -9737,6 +9864,18 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
     )
     const nextMethods = [...existingMethods, nextMethod]
     await persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod)
+    void dbInsertBillingAudit({
+      sessionCode: roomCode,
+      eventType: 'stripe_payment_method_attached',
+      billingMode: '',
+      actorEmail: String(req.adminUser?.email || ''),
+      payload: {
+        stripeCustomerId: customerId,
+        stripePaymentMethodId: paymentMethodId,
+        setupIntentId,
+        at: new Date().toISOString(),
+      },
+    })
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentMethod: nextMethod })
   } catch (error) {
@@ -10313,6 +10452,22 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       persistPatches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: rows })
     }
     await persistRoomState(roomCode, room, persistPatches)
+    void dbInsertBillingAudit({
+      sessionCode: roomCode,
+      eventType: 'payment_processed',
+      billingMode,
+      actorEmail: String(req.adminUser?.email || ''),
+      payload: {
+        billingMode,
+        scheduleIndex: targetScheduleIndex,
+        amount,
+        paymentMethodId,
+        stripeCustomerId: customerId,
+        stripePaymentIntentId: intent.id,
+        status: intent.status,
+        processedAt: rows[targetScheduleIndex]?.processedAt || new Date().toISOString(),
+      },
+    })
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentIntentId: intent.id, status: intent.status })
   } catch (error) {

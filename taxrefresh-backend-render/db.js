@@ -51,4 +51,19 @@ export async function ensureSchema(pool) {
   await pool.query(`create index if not exists ti_sessions_ghl_contact_id_idx on ti_sessions(ghl_contact_id);`)
   await pool.query(`create index if not exists ti_sessions_ghl_opportunity_id_idx on ti_sessions(ghl_opportunity_id);`)
   await pool.query(`create index if not exists ti_sessions_updated_at_idx on ti_sessions(updated_at desc);`)
+
+  // Immutable audit log for billing and payment changes (forensics + recovery).
+  await pool.query(`
+    create table if not exists ti_billing_audit (
+      id bigserial primary key,
+      session_code text not null,
+      event_type text not null,
+      billing_mode text,
+      actor_email text,
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now()
+    );
+  `)
+  await pool.query(`create index if not exists ti_billing_audit_session_code_idx on ti_billing_audit(session_code);`)
+  await pool.query(`create index if not exists ti_billing_audit_created_at_idx on ti_billing_audit(created_at desc);`)
 }
