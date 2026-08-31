@@ -5771,6 +5771,14 @@ function buildConsultationSummary(record) {
     .map((entry) => String(entry?.openedAt || entry?.opened_at || '').trim())
     .filter(Boolean)
     .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || ''
+  const resolutionSignedAt =
+    String(answers.boldsign_resolution_signed_at || '').trim() ||
+    receiptPool
+      .filter((entry) => String(entry?.name || '').trim() === 'Resolution Documents')
+      .map((entry) => String(entry?.signedAt || entry?.signed_at || '').trim())
+      .filter(Boolean)
+      .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ||
+    ''
 
   return {
     sessionCode: String(record?.sessionCode || ''),
@@ -5819,6 +5827,7 @@ function buildConsultationSummary(record) {
     hasPaymentMethodOnFile,
     investigationDocumentsSigned,
     resolutionDocumentsSigned,
+    resolutionSignedAt,
     eaTranscriptsReadyForClient,
     redDocumentViewedAt,
     resolutionDocumentsViewedAt,
