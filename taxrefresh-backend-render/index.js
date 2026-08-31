@@ -2673,7 +2673,7 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
     intentData = intents.data
   }
 
-  const candidates = (Array.isArray(intentData) ? intentData : [])
+  let candidates = (Array.isArray(intentData) ? intentData : [])
     .filter((intent) => intent && (intent.status === 'succeeded' || intent.status === 'requires_capture'))
     .map((intent) => {
       const received = Number(intent.amount_received || intent.amount || 0)
@@ -2713,6 +2713,44 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
       }
     })
     .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
+
+  // If PaymentIntents didn't produce candidates, fall back to Charges.
+  // Some legacy payments might not be represented as retrievable PaymentIntents (or may lack the metadata search path),
+  // but charges will still exist and often reference a payment_intent.
+  if (!candidates.length && customerId) {
+    try {
+      const charges = await stripe.charges.list({
+        customer: customerId,
+        limit: 100,
+      })
+      const chargeCandidates = (Array.isArray(charges?.data) ? charges.data : [])
+        .filter((charge) => charge && charge.status === 'succeeded' && !charge.disputed)
+        .map((charge) => {
+          const net = Math.max(0, Number(charge.amount || 0) - Number(charge.amount_refunded || 0))
+          const amount = net ? net / 100 : 0
+          const processedAt = new Date(Number(charge.created || 0) * 1000).toISOString()
+          const normalizedDate = normalizeBillingDateValue(processedAt)
+          const intentOrChargeId = String(charge.payment_intent || charge.id || '').trim()
+          return {
+            date: normalizedDate,
+            amount,
+            status: 'processed',
+            stripePaymentIntentId: intentOrChargeId,
+            processedAt,
+            processedStripeCustomerId: customerId,
+            processedStripePaymentMethodId: String(charge.payment_method || '').trim(),
+            processedPaymentMethodBrand: '',
+            processedPaymentMethodLast4: '',
+            processedPaymentMethodType: '',
+            _billingMode: '',
+          }
+        })
+        .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
+      if (chargeCandidates.length) candidates = chargeCandidates
+    } catch {
+      // ignore charge restore errors
+    }
+  }
 
   if (!candidates.length) {
     answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
