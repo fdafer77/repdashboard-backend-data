@@ -5025,6 +5025,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
     Years_Owed: redYearsOwedAutofill,
     Years_Owed_Unfiled: String(context.unfiledYearsLabel || '').trim(),
     Estimated_Tax_Liability: String(context.estimatedLiabilityLabel || '').trim(),
+    Specific_Tax_Matters: 'Record of Account transcripts,\nWage and income transcripts',
 
     // Payment (masked)
     Card_Type: isCard ? String(context.paymentCardTypeLabel || '').trim() : '',
