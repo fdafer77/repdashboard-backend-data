@@ -9045,6 +9045,57 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
   }
 })
 
+app.post('/api/admin/consultations/:code/stripe/sync-payment-methods', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured.' })
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+
+    const room = await ensureRoom(roomCode)
+    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
+
+    const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods)
+    const existingById = new Map(existingMethods.map((entry) => [String(entry?.stripePaymentMethodId || '').trim(), entry]))
+
+    const nextStripeMethods = []
+    const cardMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 100 })
+    cardMethods.data.forEach((method) => {
+      const record = buildStripePaymentMethodRecord(method, { customerId, setupIntentId: '' })
+      if (record?.stripePaymentMethodId) nextStripeMethods.push(record)
+    })
+
+    const bankMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'us_bank_account', limit: 100 })
+    bankMethods.data.forEach((method) => {
+      const record = buildStripePaymentMethodRecord(method, { customerId, setupIntentId: '' })
+      if (record?.stripePaymentMethodId) nextStripeMethods.push(record)
+    })
+
+    const merged = []
+    // Keep any existing stored methods that are not Stripe-linked (legacy) first.
+    existingMethods.forEach((entry) => {
+      if (!String(entry?.stripePaymentMethodId || '').trim()) merged.push(entry)
+    })
+    // Then merge Stripe-linked methods from Stripe, preserving any stored metadata where possible.
+    nextStripeMethods.forEach((entry) => {
+      const id = String(entry?.stripePaymentMethodId || '').trim()
+      if (!id) return
+      const existing = existingById.get(id)
+      merged.push(existing && typeof existing === 'object' ? { ...entry, ...existing } : entry)
+    })
+
+    if (!merged.length) return res.json({ ok: true, item: await getConsultationRecordByCode(roomCode), paymentMethods: [] })
+
+    const nextMethod = merged.findLast((entry) => String(entry?.stripePaymentMethodId || '').trim()) || merged[merged.length - 1]
+    await persistRoomPaymentMethodAnswers(roomCode, room, merged, nextMethod)
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, paymentMethods: merged })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync Stripe payment methods' })
+  }
+})
+
 app.post('/api/admin/consultations/:code/stripe/link-stored-card', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
@@ -9387,6 +9438,9 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       processedAt: new Date().toISOString(),
       processedPaymentMethodLast4,
       processedPaymentMethodBrand,
+      processedStripePaymentMethodId: paymentMethodId,
+      processedStripeCustomerId: customerId,
+      processedPaymentMethodType: String(paymentMethod?.type || '').trim(),
     }
     room.state.answers[scheduleFieldKey] = rows
     const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: rows }]
