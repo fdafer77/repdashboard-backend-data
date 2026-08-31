@@ -406,6 +406,9 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+// Background repair: rebuild missing Stripe billing evidence gradually without any manual UI action.
+startStripeBillingRestoreWorker()
+
 function parseGoogleAddressComponents(components = []) {
   const list = Array.isArray(components) ? components : []
   const findPart = (type, mode = 'long_name') =>
@@ -2795,6 +2798,60 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   nextState.answers = answers
 
   await persist(nextState)
+}
+
+const STRIPE_BILLING_RESTORE_QUEUE_MAX = 200
+const STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS = 2500
+const stripeBillingRestoreQueue = new Set()
+let stripeBillingRestoreWorkerStarted = false
+
+function queueStripeBillingRestore(roomCode = '') {
+  const normalized = String(roomCode || '').trim()
+  if (!normalized) return
+  if (stripeBillingRestoreQueue.size >= STRIPE_BILLING_RESTORE_QUEUE_MAX) return
+  stripeBillingRestoreQueue.add(normalized)
+}
+
+function startStripeBillingRestoreWorker() {
+  if (stripeBillingRestoreWorkerStarted) return
+  stripeBillingRestoreWorkerStarted = true
+  setInterval(async () => {
+    if (!stripe) return
+    const iterator = stripeBillingRestoreQueue.values().next()
+    if (iterator.done) return
+    const nextCode = iterator.value
+    stripeBillingRestoreQueue.delete(nextCode)
+    try {
+      const row = await dbGetSession(nextCode)
+      if (row?.state) {
+        await autoRestoreStripeBillingEvidenceIfMissing({
+          roomCode: row.session_code,
+          state: row.state,
+          persist: async (nextState) => {
+            row.state = nextState
+            await dbUpsertSession({ code: row.session_code, state: nextState })
+          },
+        })
+        return
+      }
+      const room = rooms.get(nextCode) || rooms.get(String(nextCode).toUpperCase()) || rooms.get(String(nextCode).toLowerCase())
+      if (room?.state) {
+        await autoRestoreStripeBillingEvidenceIfMissing({
+          roomCode: nextCode,
+          state: room.state,
+          persist: async (nextState) => {
+            room.state = nextState
+            await dbUpsertSession({ code: nextCode, state: nextState })
+          },
+        })
+      }
+    } catch (error) {
+      console.error('stripe billing auto-restore worker failed:', {
+        code: String(nextCode || '').trim(),
+        message: error instanceof Error ? error.message : String(error || ''),
+      })
+    }
+  }, STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS)
 }
 
 function getLifecycleLabel(item = {}) {
@@ -11469,6 +11526,14 @@ function buildConsultationAnalytics(items = [], account = null) {
       const docsSignedEligible = hasSignedPendingRevenueDocuments(answers)
       const pendingRevenueEligible = docsSignedEligible && hasStoredPaymentMethodOnFile(answers)
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
+      if (!isCancellationRequested) {
+        const hasAnyStripeSignal =
+          Boolean(String(answers?.stripe_customer_id || '').trim()) || Boolean(String(answers?.email || '').trim())
+        const hasEvidence = scheduleRows.some((row) => hasBillingProcessingEvidence(row))
+        if (!hasEvidence && hasAnyStripeSignal) {
+          queueStripeBillingRestore(String(item.sessionCode || '').trim())
+        }
+      }
       let processedRevenue = 0
       let pendingRevenue = 0
       let failedRevenue = 0
