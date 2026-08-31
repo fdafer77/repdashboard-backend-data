@@ -2429,7 +2429,8 @@ function hasSignedResolutionDocuments(answers = {}) {
 function hasSignedPendingRevenueDocuments(answers = {}) {
   const onboardingStatus = String(answers?.onboarding_status || '').trim().toLowerCase()
   if (onboardingStatus === 'documents_signed') return true
-  return hasSignedResolutionDocuments(answers)
+  // For scheduled investigation revenue, "docs signed" means the investigation (R.E.D / 8821) docs are signed.
+  return hasAnySignedInvestigationDocuments(answers)
 }
 
 function hasAnySignedInvestigationDocuments(answers = {}) {
