@@ -7770,39 +7770,63 @@ async function persistStripeCustomerIdForRoom(roomCode, room, customerId = '') {
 
 async function dbGetSession(code) {
   if (!pool) return fallbackGetSession(code)
-  for (const candidate of getCodeVariants(code)) {
-    const res = await pool.query('select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at from ti_sessions where session_code=$1', [
-      candidate,
-    ])
-    if (res.rows[0]) return res.rows[0]
+  try {
+    for (const candidate of getCodeVariants(code)) {
+      const res = await pool.query('select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at from ti_sessions where session_code=$1', [
+        candidate,
+      ])
+      if (res.rows[0]) return res.rows[0]
+    }
+    return null
+  } catch (error) {
+    console.error('dbGetSession failed, falling back to file store:', {
+      code: String(code || '').trim(),
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    return fallbackGetSession(code)
   }
-  return null
 }
 
 async function dbUpsertSession({ code, contactId = null, opportunityId = null, state }) {
   if (!pool) return fallbackUpsertSession({ code, contactId, opportunityId, state })
-  const existing = await dbGetSession(code)
-  const resolvedCode = String(existing?.session_code || code)
-  await pool.query(
-    `
-    insert into ti_sessions(session_code, ghl_contact_id, ghl_opportunity_id, state)
-    values ($1, $2, $3, $4)
-    on conflict (session_code) do update
-      set ghl_contact_id = coalesce(excluded.ghl_contact_id, ti_sessions.ghl_contact_id),
-          ghl_opportunity_id = coalesce(excluded.ghl_opportunity_id, ti_sessions.ghl_opportunity_id),
-          state = excluded.state,
-          updated_at = now()
-  `,
-    [resolvedCode, contactId, opportunityId, state],
-  )
+  try {
+    const existing = await dbGetSession(code)
+    const resolvedCode = String(existing?.session_code || code)
+    await pool.query(
+      `
+      insert into ti_sessions(session_code, ghl_contact_id, ghl_opportunity_id, state)
+      values ($1, $2, $3, $4)
+      on conflict (session_code) do update
+        set ghl_contact_id = coalesce(excluded.ghl_contact_id, ti_sessions.ghl_contact_id),
+            ghl_opportunity_id = coalesce(excluded.ghl_opportunity_id, ti_sessions.ghl_opportunity_id),
+            state = excluded.state,
+            updated_at = now()
+    `,
+      [resolvedCode, contactId, opportunityId, state],
+    )
+  } catch (error) {
+    console.error('dbUpsertSession failed, falling back to file store:', {
+      code: String(code || '').trim(),
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    await fallbackUpsertSession({ code, contactId, opportunityId, state })
+  }
 }
 
 async function dbDeleteSession(code) {
   if (!pool) return fallbackDeleteSession(code)
-  const existing = await dbGetSession(code)
-  if (!existing?.session_code) return false
-  await pool.query('delete from ti_sessions where session_code=$1', [existing.session_code])
-  return true
+  try {
+    const existing = await dbGetSession(code)
+    if (!existing?.session_code) return false
+    await pool.query('delete from ti_sessions where session_code=$1', [existing.session_code])
+    return true
+  } catch (error) {
+    console.error('dbDeleteSession failed, falling back to file store:', {
+      code: String(code || '').trim(),
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    return fallbackDeleteSession(code)
+  }
 }
 
 async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {}) {
@@ -7819,22 +7843,41 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
     await dbUpsertSession({ code, contactId, opportunityId, state })
     return code
   }
-  let res = null
-  if (opportunityId) {
-    res = await pool.query('select session_code from ti_sessions where ghl_opportunity_id=$1 order by updated_at desc limit 1', [opportunityId])
+  try {
+    let res = null
+    if (opportunityId) {
+      res = await pool.query('select session_code from ti_sessions where ghl_opportunity_id=$1 order by updated_at desc limit 1', [opportunityId])
+    }
+    if (!res?.rows?.[0] && contactId) {
+      res = await pool.query('select session_code from ti_sessions where ghl_contact_id=$1 order by updated_at desc limit 1', [contactId])
+    }
+    if (res.rows[0]?.session_code) return String(res.rows[0].session_code)
+    let code = generateSessionId()
+    // Extremely low collision chance, but just in case:
+    while (await dbGetSession(code)) code = generateSessionId()
+    const state = initialRoomState()
+    if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
+    if (contactId) state.answers.ghl_contact_id = contactId
+    await dbUpsertSession({ code, contactId, opportunityId, state })
+    return code
+  } catch (error) {
+    console.error('dbGetOrCreateSession failed, falling back to file store:', {
+      contactId: String(contactId || '').trim(),
+      opportunityId: String(opportunityId || '').trim(),
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    const existingCode =
+      (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
+      (contactId ? await fallbackFindSessionCode({ contactId }) : null)
+    if (existingCode) return existingCode
+    let code = generateSessionId()
+    while (await fallbackGetSession(code)) code = generateSessionId()
+    const state = initialRoomState()
+    if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
+    if (contactId) state.answers.ghl_contact_id = contactId
+    await fallbackUpsertSession({ code, contactId, opportunityId, state })
+    return code
   }
-  if (!res?.rows?.[0] && contactId) {
-    res = await pool.query('select session_code from ti_sessions where ghl_contact_id=$1 order by updated_at desc limit 1', [contactId])
-  }
-  if (res.rows[0]?.session_code) return String(res.rows[0].session_code)
-  let code = generateSessionId()
-  // Extremely low collision chance, but just in case:
-  while (await dbGetSession(code)) code = generateSessionId()
-  const state = initialRoomState()
-  if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
-  if (contactId) state.answers.ghl_contact_id = contactId
-  await dbUpsertSession({ code, contactId, opportunityId, state })
-  return code
 }
 
 function getConsultationIdentityKey(item = {}) {
