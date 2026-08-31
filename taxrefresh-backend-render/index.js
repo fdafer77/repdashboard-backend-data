@@ -7404,7 +7404,9 @@ async function dbDeleteSession(code) {
 
 async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {}) {
   if (!pool) {
-    const existingCode = await fallbackFindSessionCode({ contactId, opportunityId })
+    const existingCode =
+      (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
+      (contactId ? await fallbackFindSessionCode({ contactId }) : null)
     if (existingCode) return existingCode
     let code = generateSessionId()
     while (await dbGetSession(code)) code = generateSessionId()
@@ -7414,10 +7416,11 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
     await dbUpsertSession({ code, contactId, opportunityId, state })
     return code
   }
-  let res
+  let res = null
   if (opportunityId) {
     res = await pool.query('select session_code from ti_sessions where ghl_opportunity_id=$1 order by updated_at desc limit 1', [opportunityId])
-  } else {
+  }
+  if (!res?.rows?.[0] && contactId) {
     res = await pool.query('select session_code from ti_sessions where ghl_contact_id=$1 order by updated_at desc limit 1', [contactId])
   }
   if (res.rows[0]?.session_code) return String(res.rows[0].session_code)
@@ -7429,6 +7432,33 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
   if (contactId) state.answers.ghl_contact_id = contactId
   await dbUpsertSession({ code, contactId, opportunityId, state })
   return code
+}
+
+function getConsultationIdentityKey(item = {}) {
+  const opportunityId = String(item?.opportunityId || '').trim()
+  if (opportunityId) return `opp:${opportunityId}`
+  const contactId = String(item?.contactId || '').trim()
+  if (contactId) return `contact:${contactId}`
+  const email = String(item?.email || '').trim().toLowerCase()
+  if (email) return `email:${email}`
+  return `session:${String(item?.sessionCode || '').trim()}`
+}
+
+function getConsultationIdentityUpdatedAt(item = {}) {
+  return new Date(item?.updatedAt || item?.createdAt || 0).getTime()
+}
+
+function dedupeConsultationRecords(items = []) {
+  const deduped = new Map()
+  items.forEach((item) => {
+    if (!item) return
+    const key = getConsultationIdentityKey(item)
+    const existing = deduped.get(key)
+    if (!existing || getConsultationIdentityUpdatedAt(item) >= getConsultationIdentityUpdatedAt(existing)) {
+      deduped.set(key, item)
+    }
+  })
+  return Array.from(deduped.values())
 }
 
 function getPlaidClient() {
@@ -7826,7 +7856,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         limit $1
       `
     const res = await pool.query(query, params)
-    const items = res.rows.map((row) =>
+    const items = dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationSummary({
         sessionCode: row.session_code,
         contactId: row.ghl_contact_id,
@@ -7835,7 +7865,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       }),
-    )
+    ))
     if (!hasSearch) return items
     return items
       .sort(
@@ -7876,7 +7906,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
     )
   })
 
-  return Array.from(persistedByCode.values())
+  return dedupeConsultationRecords(Array.from(persistedByCode.values()))
     .filter((entry) => consultationMatchesSearch(entry, search))
     .sort(
       (a, b) =>
@@ -10274,7 +10304,7 @@ async function listAllConsultationDetails() {
       from ti_sessions
       order by updated_at desc
     `)
-    return res.rows.map((row) =>
+    return dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationDetail({
         sessionCode: row.session_code,
         contactId: row.ghl_contact_id,
@@ -10283,7 +10313,7 @@ async function listAllConsultationDetails() {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       }),
-    )
+    ))
   }
 
   const persistedRows = await fallbackListSessions()
@@ -10313,7 +10343,9 @@ async function listAllConsultationDetails() {
       }),
     )
   }
-  return Array.from(persistedByCode.values()).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+  return dedupeConsultationRecords(Array.from(persistedByCode.values())).sort(
+    (a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')),
+  )
 }
 
 function buildConsultationAnalytics(items = [], account = null) {
