@@ -2264,6 +2264,28 @@ function getBillingStatusTone(row = {}) {
   return 'pending'
 }
 
+function getBillingRowMatchKey(row = {}) {
+  const normalizedDate = normalizeBillingDateValue(row?.date || row?.processedAt || '')
+  const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+  if (!normalizedDate && normalizedAmount === '0.00') return ''
+  return `${normalizedDate}|${normalizedAmount}`
+}
+
+function getOutstandingBillingRows(rows = []) {
+  const processedKeys = new Set(
+    rows
+      .filter((row) => getBillingStatusTone(row) === 'processed')
+      .map((row) => getBillingRowMatchKey(row))
+      .filter(Boolean),
+  )
+  return rows.filter((row) => {
+    if (getBillingStatusTone(row) === 'processed') return false
+    const matchKey = getBillingRowMatchKey(row)
+    if (matchKey && processedKeys.has(matchKey)) return false
+    return Boolean(normalizeBillingDateValue(row?.date || ''))
+  })
+}
+
 function getBillingTimingTone(value = '') {
   const normalized = normalizeBillingDateValue(value)
   if (!normalized) return ''
@@ -5569,11 +5591,9 @@ function buildConsultationSummary(record) {
   const billingSchedule = getBillingScheduleRowsFromAnswers(answers)
   const processedPaymentCount = billingSchedule.filter((row) => getBillingStatusTone(row) === 'processed').length
   const hasProcessedPayment = processedPaymentCount > 0
-  const nextPendingBillingRow =
-    billingSchedule
-      .filter((row) => getBillingStatusTone(row) === 'pending')
-      .sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
-  const nextBillingDate = String(nextPendingBillingRow?.date || '').trim()
+  const nextOutstandingBillingRow =
+    getOutstandingBillingRows(billingSchedule).sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
+  const nextBillingDate = String(nextOutstandingBillingRow?.date || '').trim()
   const nextBillingTimingTone = getBillingTimingTone(nextBillingDate)
   const billingPaymentMethods = parseStoredPaymentMethods(answers.billing_payment_methods)
   const portalPaymentMethods = parseStoredPaymentMethods(answers.client_portal_payment_methods)
