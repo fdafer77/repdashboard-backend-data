@@ -2197,9 +2197,38 @@ function normalizeBillingDateValue(value) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
   const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})T/)
   if (isoMatch) return isoMatch[1]
-  const parsed = new Date(raw)
-  if (Number.isNaN(parsed.getTime())) return raw
-  return parsed.toISOString().slice(0, 10)
+  const slashMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (slashMatch) {
+    const [, left, right, year] = slashMatch
+    const leftNum = Number.parseInt(left, 10)
+    const rightNum = Number.parseInt(right, 10)
+    const month = leftNum > 12 && rightNum <= 12 ? right : left
+    const day = leftNum > 12 && rightNum <= 12 ? left : right
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`
+  }
+  const digits = raw.replace(/\D/g, '')
+  if (digits.length === 8) {
+    const first4 = Number.parseInt(digits.slice(0, 4), 10)
+    if (first4 >= 1900 && first4 <= 2099) {
+      const year = digits.slice(0, 4)
+      const month = digits.slice(4, 6)
+      const day = digits.slice(6, 8)
+      return `${year}-${month}-${day}`
+    }
+    const month = digits.slice(0, 2)
+    const day = digits.slice(2, 4)
+    const year = digits.slice(4, 8)
+    return `${year}-${month}-${day}`
+  }
+  return raw
+}
+
+function getTodayBillingDateValue() {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function normalizeBillingScheduleRows(rows = []) {
@@ -2353,7 +2382,7 @@ function getOutstandingBillingRows(rows = []) {
 function getBillingTimingTone(value = '') {
   const normalized = normalizeBillingDateValue(value)
   if (!normalized) return ''
-  const today = normalizeBillingDateValue(new Date().toISOString())
+  const today = getTodayBillingDateValue()
   if (!today) return ''
   if (normalized === today) return 'today'
   return normalized > today ? 'upcoming' : 'past'
