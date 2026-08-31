@@ -3866,6 +3866,53 @@ function summarizeBoldsignRequest({ path = '', query, body } = {}) {
   return summary
 }
 
+function getErrorMessageChain(error) {
+  const seen = new Set()
+  const messages = []
+  let current = error
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    const nextMessage = String(current.message || current.code || '').trim()
+    if (nextMessage) messages.push(nextMessage)
+    current = current.cause
+  }
+  return messages.join(' :: ')
+}
+
+function isRetryableBoldsignTransportMessage(message = '') {
+  return /connection terminated unexpectedly|fetch failed|socket hang up|other side closed|headers timeout|body timeout|network.*reset|terminated|econnreset|econnrefused|enotfound|etimedout|ehostunreach|und_err_socket|und_err_connect_timeout|eai_again|epipe/i.test(
+    String(message || ''),
+  )
+}
+
+function buildBoldsignTransportError(error, { path, method, query, body }) {
+  const transportMessage = getErrorMessageChain(error)
+  const wrapped = new Error(
+    isRetryableBoldsignTransportMessage(transportMessage)
+      ? 'BoldSign connection terminated unexpectedly. Please try again.'
+      : transportMessage || 'Failed to reach BoldSign.',
+  )
+  wrapped.status = 503
+  wrapped.retryable = true
+  wrapped.cause = error
+  wrapped.boldsign = {
+    path,
+    method,
+    transportError: transportMessage,
+    request: summarizeBoldsignRequest({ path, query, body }),
+  }
+  return wrapped
+}
+
+function shouldRetryBoldsignError(error) {
+  const status = typeof error?.status === 'number' ? error.status : 0
+  if (status === 429) return false
+  if (status === 408) return true
+  if (status >= 500 && status < 600) return true
+  if (error?.retryable === true) return true
+  return isRetryableBoldsignTransportMessage(getErrorMessageChain(error))
+}
+
 async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
   const config = getBoldsignConfig()
   if (!config.ready) {
@@ -3879,41 +3926,68 @@ async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
       url.searchParams.set(key, String(value))
     }
   }
+  const requestSummary = summarizeBoldsignRequest({ path, query, body })
+  const maxAttempts = 3
 
-  const response = await fetch(url, {
-    method,
-    headers: {
-      accept: 'application/json',
-      'X-API-KEY': config.apiKey,
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    const retryAfterHeader = String(response.headers.get('retry-after') || '').trim()
-    const retryAfterSeconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Number(retryAfterHeader) : 0
-    const message =
-      data?.error ||
-      data?.title ||
-      data?.errors?.[0]?.message ||
-      data?.errors?.[0] ||
-      `BoldSign request failed (${response.status})`
-    const error = new Error(message)
-    error.status = response.status
-    if (retryAfterSeconds) error.retryAfterSeconds = retryAfterSeconds
-    if (response.status === 429) error.noRetry = true
-    error.boldsign = {
-      path,
-      method,
-      status: response.status,
-      retryAfterSeconds,
-      response: data,
-      request: summarizeBoldsignRequest({ path, query, body }),
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: {
+          accept: 'application/json',
+          'X-API-KEY': config.apiKey,
+          ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        const retryAfterHeader = String(response.headers.get('retry-after') || '').trim()
+        const retryAfterSeconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Number(retryAfterHeader) : 0
+        const message =
+          data?.error ||
+          data?.title ||
+          data?.errors?.[0]?.message ||
+          data?.errors?.[0] ||
+          `BoldSign request failed (${response.status})`
+        const error = new Error(message)
+        error.status = response.status
+        error.retryable = response.status === 408 || (response.status >= 500 && response.status < 600)
+        if (retryAfterSeconds) error.retryAfterSeconds = retryAfterSeconds
+        if (response.status === 429 || (response.status >= 400 && response.status < 500 && response.status !== 408)) {
+          error.noRetry = true
+        }
+        error.boldsign = {
+          path,
+          method,
+          status: response.status,
+          retryAfterSeconds,
+          response: data,
+          request: requestSummary,
+        }
+        throw error
+      }
+      return data
+    } catch (error) {
+      const normalizedError =
+        error?.boldsign || typeof error?.status === 'number'
+          ? error
+          : buildBoldsignTransportError(error, { path, method, query, body })
+      if (!normalizedError?.boldsign) {
+        normalizedError.boldsign = {
+          path,
+          method,
+          request: requestSummary,
+        }
+      }
+      if (!shouldRetryBoldsignError(normalizedError) || attempt >= maxAttempts) {
+        throw normalizedError
+      }
+      await new Promise((resolve) => setTimeout(resolve, 800 * attempt))
     }
-    throw error
   }
-  return data
+
+  throw new Error('BoldSign request failed.')
 }
 
 async function boldsignDownloadDocument(documentId, { onBehalfOf } = {}) {
@@ -9769,7 +9843,14 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (error?.boldsign) {
       console.error('BoldSign send-document-email debug:', error.boldsign)
     }
-    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to send document email.' })
+    const status = typeof error?.status === 'number' ? error.status : 500
+    if (status === 429) {
+      const retryAfterSeconds = typeof error?.retryAfterSeconds === 'number' && Number.isFinite(error.retryAfterSeconds) ? error.retryAfterSeconds : 60
+      return res
+        .status(429)
+        .json({ error: `BoldSign is rate limiting right now. Please wait ${retryAfterSeconds} seconds and try again.` })
+    }
+    return res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to send document email.' })
   }
 })
 
