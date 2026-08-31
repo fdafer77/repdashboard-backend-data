@@ -2386,27 +2386,81 @@ function getBillingScheduleRowsFromAnswers(answers = {}) {
   return mapClientPortalPendingPaymentsToBillingRows(answers?.client_portal_pending_payments)
 }
 
+function getBillingProcessedAtValue(row = {}) {
+  return (
+    String(row?.processedAt || '').trim() ||
+    String(row?.processed_at || '').trim() ||
+    String(row?.processed_at_iso || '').trim() ||
+    ''
+  )
+}
+
+function getBillingStripePaymentIntentIdValue(row = {}) {
+  return (
+    String(row?.stripePaymentIntentId || '').trim() ||
+    String(row?.stripe_payment_intent_id || '').trim() ||
+    String(row?.stripe_payment_intent || '').trim() ||
+    ''
+  )
+}
+
+function getBillingProcessedStripePaymentMethodIdValue(row = {}) {
+  return (
+    String(row?.processedStripePaymentMethodId || '').trim() ||
+    String(row?.processed_stripe_payment_method_id || '').trim() ||
+    ''
+  )
+}
+
+function getBillingProcessedPaymentMethodLast4Value(row = {}) {
+  return (
+    String(row?.processedPaymentMethodLast4 || '').trim() ||
+    String(row?.processed_payment_method_last4 || '').trim() ||
+    ''
+  )
+}
+
+function getBillingProcessedPaymentMethodBrandValue(row = {}) {
+  return (
+    String(row?.processedPaymentMethodBrand || '').trim() ||
+    String(row?.processed_payment_method_brand || '').trim() ||
+    ''
+  )
+}
+
+function hasBillingProcessingEvidence(row = {}) {
+  return Boolean(
+    getBillingProcessedAtValue(row) ||
+      getBillingStripePaymentIntentIdValue(row) ||
+      getBillingProcessedStripePaymentMethodIdValue(row) ||
+      getBillingProcessedPaymentMethodLast4Value(row) ||
+      getBillingProcessedPaymentMethodBrandValue(row),
+  )
+}
+
 function getBillingStatusTone(row = {}) {
   const rawStatus = String(row?.status || '').trim().toLowerCase()
+  if (['failed', 'declined', 'rejected', 'error'].includes(rawStatus)) return 'failed'
+  const hasProcessingEvidence = hasBillingProcessingEvidence(row)
+
+  // Back-compat: some legacy rows were persisted without a reliable `status`, but do contain
+  // Stripe evidence fields (`processed_at`, `stripe_payment_intent_id`, etc.). We should still
+  // treat these as processed, otherwise processed revenue totals drop unexpectedly.
+  if (hasProcessingEvidence) return 'processed'
+
   if (['processed', 'paid', 'succeeded', 'successful', 'complete', 'completed'].includes(rawStatus)) {
     const normalizedDate = normalizeBillingDateValue(row?.date || '')
-    const hasProcessingEvidence = Boolean(
-      String(row?.processedAt || '').trim() ||
-        String(row?.stripePaymentIntentId || '').trim() ||
-        String(row?.processedStripePaymentMethodId || '').trim() ||
-        String(row?.processedPaymentMethodLast4 || '').trim() ||
-        String(row?.processedPaymentMethodBrand || '').trim(),
+    const isFutureScheduleWithoutEvidence = Boolean(
+      normalizedDate && normalizedDate > getTodayBillingDateValue() && !hasProcessingEvidence,
     )
-    const isFutureScheduleWithoutEvidence = Boolean(normalizedDate && normalizedDate > getTodayBillingDateValue() && !hasProcessingEvidence)
     if (isFutureScheduleWithoutEvidence) return 'pending'
     return 'processed'
   }
-  if (['failed', 'declined', 'rejected', 'error'].includes(rawStatus)) return 'failed'
   return 'pending'
 }
 
 function getBillingRowMatchKey(row = {}) {
-  const normalizedDate = normalizeBillingDateValue(row?.date || row?.processedAt || '')
+  const normalizedDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
   const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
   if (!normalizedDate && normalizedAmount === '0.00') return ''
   return `${normalizedDate}|${normalizedAmount}`
@@ -11015,7 +11069,7 @@ function buildConsultationAnalytics(items = [], account = null) {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
           if (tone === 'pending' && !docsSignedEligible) return
-          const normalizedDate = normalizeBillingDateValue(row?.processedAt || row?.date || '')
+          const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
