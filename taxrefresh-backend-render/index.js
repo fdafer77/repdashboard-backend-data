@@ -2604,38 +2604,81 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
 
   let customerId = String(answers.stripe_customer_id || '').trim()
   const email = String(answers.email || '').trim()
+  const safeSessionCode = normalizedRoomCode.replace(/[^a-zA-Z0-9_-]/g, '')
 
+  // Prefer Stripe metadata search when available (most reliable; doesn't rely on email being present).
+  if (!customerId && safeSessionCode && typeof stripe?.customers?.search === 'function') {
+    try {
+      const search = await stripe.customers.search({
+        query: `metadata['sessionCode']:'${safeSessionCode}'`,
+        limit: 1,
+      })
+      customerId = String(search?.data?.[0]?.id || '').trim()
+      if (customerId) answers.stripe_customer_id = customerId
+    } catch {
+      // ignore search errors; we'll try other approaches
+    }
+  }
+
+  // Fallback: find customer by email if we have it.
   if (!customerId && email) {
     const candidates = await stripe.customers.list({ email, limit: 10 })
     const match =
       candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim() === normalizedRoomCode) ||
       candidates.data[0]
     customerId = String(match?.id || '').trim()
-    if (customerId) {
-      answers.stripe_customer_id = customerId
+    if (customerId) answers.stripe_customer_id = customerId
+  }
+
+  // Fallback: search Payment Intents by metadata sessionCode (if the Stripe account supports it).
+  // This also works even when the Stripe customer can't be resolved yet.
+  let intentData = null
+  if (safeSessionCode && typeof stripe?.paymentIntents?.search === 'function') {
+    try {
+      const search = await stripe.paymentIntents.search({
+        query: `metadata['sessionCode']:'${safeSessionCode}'`,
+        limit: 100,
+        expand: ['data.payment_method'],
+      })
+      if (Array.isArray(search?.data) && search.data.length) {
+        intentData = search.data
+        if (!customerId) {
+          const inferredCustomer = String(search.data.find((intent) => intent?.customer)?.customer || '').trim()
+          if (inferredCustomer) {
+            customerId = inferredCustomer
+            answers.stripe_customer_id = inferredCustomer
+          }
+        }
+      }
+    } catch {
+      // ignore search errors; we'll try listing intents by customer next
     }
   }
 
   // Nothing to restore (no linked customer).
-  if (!customerId) {
+  if (!customerId && !intentData) {
     answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
     await persist(nextState)
     return
   }
 
-  const intents = await stripe.paymentIntents.list({
-    customer: customerId,
-    limit: 100,
-    expand: ['data.payment_method'],
-  })
+  if (!intentData) {
+    const intents = await stripe.paymentIntents.list({
+      customer: customerId,
+      limit: 100,
+      expand: ['data.payment_method'],
+    })
+    intentData = intents.data
+  }
 
-  const candidates = intents.data
+  const candidates = (Array.isArray(intentData) ? intentData : [])
     .filter((intent) => intent && (intent.status === 'succeeded' || intent.status === 'requires_capture'))
     .map((intent) => {
       const received = Number(intent.amount_received || intent.amount || 0)
       const amount = received ? received / 100 : 0
       const processedAt = new Date(Number(intent.created || 0) * 1000).toISOString()
       const normalizedDate = normalizeBillingDateValue(processedAt)
+      const billingMode = String(intent?.metadata?.billingMode || '').trim().toLowerCase()
       const paymentMethod = intent.payment_method
       const paymentMethodId = typeof paymentMethod === 'string' ? paymentMethod : String(paymentMethod?.id || '')
       let brand = ''
@@ -2659,11 +2702,12 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
         status: 'processed',
         stripePaymentIntentId: String(intent.id || '').trim(),
         processedAt,
-        processedStripeCustomerId: customerId,
+        processedStripeCustomerId: customerId || String(intent.customer || '').trim(),
         processedStripePaymentMethodId: String(paymentMethodId || '').trim(),
         processedPaymentMethodBrand: brand,
         processedPaymentMethodLast4: last4,
         processedPaymentMethodType: methodType,
+        _billingMode: billingMode,
       }
     })
     .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
@@ -2703,8 +2747,49 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
     existingIntentIds.add(intentId)
   })
 
-  const nextSchedule = sanitizeBillingScheduleRowsForPersistence(merged, existingDirectSchedule)
+  const nextSchedule = sanitizeBillingScheduleRowsForPersistence(
+    // remove helper-only field before saving
+    merged.map((row) => {
+      const { _billingMode, ...rest } = row || {}
+      return rest
+    }),
+    existingDirectSchedule,
+  )
   answers.billing_schedule = nextSchedule
+
+  // Also populate scoped schedules if we can infer billing mode from Stripe metadata.
+  const hasAnyModeTags = candidates.some((row) => String(row?._billingMode || '').trim())
+  if (hasAnyModeTags) {
+    const existingInvestigation = normalizeBillingScheduleRows(parseStoredObject(answers.investigation_billing_schedule, []))
+    const existingResolution = normalizeBillingScheduleRows(parseStoredObject(answers.resolution_billing_schedule, []))
+    const invMerged = sanitizeBillingScheduleRowsForPersistence(
+      mergeUniqueBillingScheduleRows(
+        existingInvestigation,
+        candidates
+          .filter((row) => String(row?._billingMode || '').trim() !== 'resolution')
+          .map((row) => {
+            const { _billingMode, ...rest } = row || {}
+            return rest
+          }),
+      ),
+      existingInvestigation,
+    )
+    const resMerged = sanitizeBillingScheduleRowsForPersistence(
+      mergeUniqueBillingScheduleRows(
+        existingResolution,
+        candidates
+          .filter((row) => String(row?._billingMode || '').trim() === 'resolution')
+          .map((row) => {
+            const { _billingMode, ...rest } = row || {}
+            return rest
+          }),
+      ),
+      existingResolution,
+    )
+    answers.investigation_billing_schedule = invMerged
+    answers.resolution_billing_schedule = resMerged
+  }
+
   answers._auto_stripe_billing_restore_attempted_at = new Date().toISOString()
   answers._auto_stripe_billing_restore_at = new Date().toISOString()
   nextState.answers = answers
