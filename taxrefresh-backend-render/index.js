@@ -5721,6 +5721,16 @@ function buildConsultationSummary(record) {
   )
   const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
   const investigationDocumentsSigned = hasAnySignedInvestigationDocuments(answers)
+  const onboardingStatus = String(answers.onboarding_status || '').trim()
+  const normalizedOnboardingStatus = onboardingStatus.toLowerCase()
+  const effectiveOnboardingStatus =
+    investigationDocumentsSigned &&
+    (!normalizedOnboardingStatus ||
+      normalizedOnboardingStatus === 'documents_ready_for_signature' ||
+      normalizedOnboardingStatus === 'ready_for_signature' ||
+      normalizedOnboardingStatus.includes('ready for signature'))
+      ? 'documents_signed'
+      : onboardingStatus
   const eaTranscriptsReadyForClient =
     answers.ea_transcripts_ready_for_client === true ||
     String(answers.ea_transcripts_ready_for_client || '')
@@ -5778,7 +5788,7 @@ function buildConsultationSummary(record) {
     eaPriority: String(answers.ea_priority || ''),
     route: String(state?.route || '/session'),
     step: Number(state?.step || 0),
-    onboardingStatus: String(answers.onboarding_status || ''),
+    onboardingStatus: effectiveOnboardingStatus,
     form8821Status: String(answers.form8821_status || ''),
     createdAt: createdAtRaw ? new Date(createdAtRaw).toISOString() : '',
     updatedAt: updatedAtRaw ? new Date(updatedAtRaw).toISOString() : '',
