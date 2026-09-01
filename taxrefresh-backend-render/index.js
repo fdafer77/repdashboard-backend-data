@@ -6594,6 +6594,17 @@ function buildConsultationSummary(record) {
       .filter(Boolean)
       .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ||
     ''
+  const consultationNotes = Array.isArray(answers.consultation_notes)
+    ? answers.consultation_notes.filter(Boolean)
+    : parseStoredObject(answers.consultation_notes, []).filter(Boolean)
+  const activeConsultationNotes = consultationNotes.filter((entry) => !entry?.archived)
+  const latestConsultationNote = activeConsultationNotes
+    .slice()
+    .sort((left, right) => {
+      const leftAt = new Date(String(left?.updatedAt || left?.createdAt || '')).getTime()
+      const rightAt = new Date(String(right?.updatedAt || right?.createdAt || '')).getTime()
+      return rightAt - leftAt
+    })[0] || null
 
   return {
     sessionCode: String(record?.sessionCode || ''),
@@ -6646,6 +6657,10 @@ function buildConsultationSummary(record) {
     eaTranscriptsReadyForClient,
     redDocumentViewedAt,
     resolutionDocumentsViewedAt,
+    consultationNotesCount: activeConsultationNotes.length,
+    latestConsultationNoteUpdatedAt: String(latestConsultationNote?.updatedAt || latestConsultationNote?.createdAt || '').trim(),
+    latestConsultationNoteAuthor: String(latestConsultationNote?.author || '').trim(),
+    latestConsultationNoteOwnerKey: String(latestConsultationNote?.ownerKey || '').trim().toLowerCase(),
     appointmentCount: appointments.length,
     nextAppointmentAt: appointments[0]?.startAt || '',
     appointments,
