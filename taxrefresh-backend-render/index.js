@@ -424,11 +424,12 @@ async function fallbackUpsertSession({ code, contactId = null, opportunityId = n
   const resolvedCode = String(existing?.session_code || code)
   const createdAt = existing?.created_at || new Date().toISOString()
   const updatedAt = new Date().toISOString()
+  const nextState = mergeSessionStateForPersistence(existing?.state, state, { code: resolvedCode, source: 'fallback' })
   fallbackSessions.set(resolvedCode, {
     sessionCode: resolvedCode,
     contactId: contactId ?? existing?.ghl_contact_id ?? null,
     opportunityId: opportunityId ?? existing?.ghl_opportunity_id ?? null,
-    state,
+    state: nextState,
     createdAt: existing?.created_at || createdAt,
     updatedAt,
   })
@@ -8184,6 +8185,82 @@ function initialRoomState() {
   return { step: 0, route: '/session', answers: {}, updatedAt: Date.now() }
 }
 
+const CRITICAL_SESSION_ANSWER_KEYS = [
+  'billing_schedule',
+  'investigation_billing_schedule',
+  'resolution_billing_schedule',
+  'billing_invoice_amount',
+  'billing_invoice_created_at',
+  'investigation_billing_invoice_amount',
+  'investigation_billing_invoice_created_at',
+  'resolution_billing_invoice_amount',
+  'resolution_billing_invoice_created_at',
+  'document_receipts',
+  'document_delivery_log',
+  'document_email_log',
+  'hidden_document_receipt_names',
+  'ea_documents',
+  'consultation_notes',
+  'ea_activity_timeline',
+  'boldsign_8821_document_id',
+  'boldsign_8821_spouse_document_id',
+  'boldsign_8821_sent_at',
+  'boldsign_8821_signed_at',
+  'signed_8821_saved_at',
+  'signed_8821_file_name',
+  'signed_8821_first_page_saved_at',
+  'signed_8821_first_page_file_name',
+  'signed_8821_render_version',
+  'signed_8821_first_page_render_version',
+  'boldsign_resolution_document_id',
+  'boldsign_resolution_sent_at',
+  'boldsign_resolution_signed_at',
+]
+
+function hasMeaningfulSessionValue(value) {
+  if (value === null || value === undefined) return false
+  if (typeof value === 'string') return value.trim().length > 0
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value).length > 0
+  return true
+}
+
+function mergeSessionAnswersForPersistence(existingAnswers = {}, incomingAnswers = {}, { code = '', source = '' } = {}) {
+  const mergedAnswers = { ...(existingAnswers && typeof existingAnswers === 'object' ? existingAnswers : {}) }
+  const safeIncomingAnswers = incomingAnswers && typeof incomingAnswers === 'object' ? incomingAnswers : {}
+  Object.keys(safeIncomingAnswers).forEach((key) => {
+    const nextValue = safeIncomingAnswers[key]
+    if (nextValue !== undefined) mergedAnswers[key] = nextValue
+  })
+
+  const protectedKeys = CRITICAL_SESSION_ANSWER_KEYS.filter((key) => {
+    if (!hasMeaningfulSessionValue(existingAnswers?.[key])) return false
+    return !Object.prototype.hasOwnProperty.call(safeIncomingAnswers, key)
+  })
+
+  if (protectedKeys.length) {
+    console.warn('session persistence guard preserved missing critical answers', {
+      code: String(code || '').trim(),
+      source: String(source || '').trim(),
+      protectedKeys,
+    })
+  }
+
+  return sanitizeSensitiveBillingAnswers(mergedAnswers)
+}
+
+function mergeSessionStateForPersistence(existingState = null, incomingState = null, { code = '', source = '' } = {}) {
+  const baseState = existingState && typeof existingState === 'object' ? existingState : initialRoomState()
+  const nextState = incomingState && typeof incomingState === 'object' ? incomingState : {}
+  const mergedAnswers = mergeSessionAnswersForPersistence(baseState.answers, nextState.answers, { code, source })
+  return {
+    ...baseState,
+    ...nextState,
+    answers: mergedAnswers,
+    updatedAt: Number(nextState?.updatedAt || 0) || Date.now(),
+  }
+}
+
 function isStripeReady() {
   return Boolean(stripe && STRIPE_PUBLISHABLE_KEY)
 }
@@ -8497,6 +8574,7 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
   try {
     const existing = await dbGetSession(code)
     const resolvedCode = String(existing?.session_code || code)
+    const nextState = mergeSessionStateForPersistence(existing?.state, state, { code: resolvedCode, source: 'database' })
     await pool.query(
       `
       insert into ti_sessions(session_code, ghl_contact_id, ghl_opportunity_id, state)
@@ -8507,7 +8585,7 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
             state = excluded.state,
             updated_at = now()
     `,
-      [resolvedCode, contactId, opportunityId, state],
+      [resolvedCode, contactId, opportunityId, nextState],
     )
     invalidateDashboardAnalyticsCache()
   } catch (error) {
