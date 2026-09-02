@@ -1174,6 +1174,18 @@ function normalizePersistedSigned8821State(answers = {}) {
   return strippedPayloads || beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
 }
 
+function normalizePersistedResolutionSignedState(answers = {}) {
+  if (!String(answers?.boldsign_resolution_signed_at || '').trim() && !hasSignedResolutionDocuments(answers)) return false
+  const signedAt = String(answers?.boldsign_resolution_signed_at || '').trim() || new Date().toISOString()
+  const documentCode = String(answers?.boldsign_resolution_document_id || '').trim()
+  const beforeDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
+  const beforeReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
+  markSignedResolutionDeliveryEntries(answers, signedAt, documentCode)
+  const afterDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
+  const afterReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
+  return beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
+}
+
 function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
   const normalizedNextRoute = String(nextRoute || '').trim()
   const normalizedPreviousRoute = String(previousRoute || '').trim()
@@ -3071,6 +3083,7 @@ async function autoSyncStripePaymentMethodsIfMissing({ roomCode, state, persist 
 
 const STRIPE_BILLING_RESTORE_QUEUE_MAX = 2000
 const STRIPE_BILLING_RESTORE_WORK_INTERVAL_MS = 1000
+const RECORD_INTEGRITY_REPAIR_STARTUP_LIMIT = Math.max(1, Math.min(20000, Number(process.env.RECORD_INTEGRITY_REPAIR_STARTUP_LIMIT || 5000) || 5000))
 const stripeBillingRestoreQueue = new Set()
 let stripeBillingRestoreWorkerStarted = false
 
@@ -3081,11 +3094,82 @@ function queueStripeBillingRestore(roomCode = '') {
   stripeBillingRestoreQueue.add(normalized)
 }
 
+async function repairConsultationRecordIntegrity({ roomCode, state, persist } = {}) {
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) return { normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
+  if (typeof persist !== 'function') {
+    return { normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
+  }
+
+  let currentState = state && typeof state === 'object' ? state : initialRoomState()
+  const results = {
+    normalized8821: false,
+    normalizedResolution: false,
+    reconciled8821: false,
+    reconciledResolution: false,
+    restoredBilling: false,
+    syncedPaymentMethods: false,
+    storedSigned8821: false,
+  }
+  const persistAndCapture = async (nextState) => {
+    currentState = nextState && typeof nextState === 'object' ? nextState : currentState
+    await persist(currentState)
+  }
+
+  const answers = currentState.answers || {}
+  results.normalized8821 = normalizePersistedSigned8821State(answers)
+  results.normalizedResolution = normalizePersistedResolutionSignedState(answers)
+  if (results.normalized8821 || results.normalizedResolution) {
+    currentState.answers = answers
+    await persistAndCapture(currentState)
+  }
+
+  results.reconciled8821 = await reconcileBoldsign8821Status({
+    roomCode: normalizedRoomCode,
+    state: currentState,
+    persist: persistAndCapture,
+  })
+  results.reconciledResolution = await reconcileBoldsignResolutionStatus({
+    roomCode: normalizedRoomCode,
+    state: currentState,
+    persist: persistAndCapture,
+  })
+  results.restoredBilling = await autoRestoreStripeBillingEvidenceIfMissing({
+    roomCode: normalizedRoomCode,
+    state: currentState,
+    persist: persistAndCapture,
+  })
+  results.syncedPaymentMethods = await autoSyncStripePaymentMethodsIfMissing({
+    roomCode: normalizedRoomCode,
+    state: currentState,
+    persist: persistAndCapture,
+  })
+
+  const tempRoom = { state: currentState }
+  results.storedSigned8821 = await ensureSigned8821StoredOnRecord(normalizedRoomCode, tempRoom).catch(() => false)
+  currentState = tempRoom.state || currentState
+
+  return results
+}
+
+async function seedStripeBillingRestoreQueue(limit = 5000) {
+  const normalizedLimit = Math.max(1, Math.min(20000, Number(limit) || 5000))
+  if (pool) {
+    const res = await pool.query('select session_code from ti_sessions order by updated_at desc limit $1', [normalizedLimit])
+    res.rows.forEach((row) => queueStripeBillingRestore(String(row?.session_code || '').trim()))
+    return res.rows.length
+  }
+  const rows = (await fallbackListSessions())
+    .sort((left, right) => String(right?.updated_at || right?.updatedAt || '').localeCompare(String(left?.updated_at || left?.updatedAt || '')))
+    .slice(0, normalizedLimit)
+  rows.forEach((row) => queueStripeBillingRestore(String(row?.session_code || row?.sessionCode || '').trim()))
+  return rows.length
+}
+
 function startStripeBillingRestoreWorker() {
   if (stripeBillingRestoreWorkerStarted) return
   stripeBillingRestoreWorkerStarted = true
   setInterval(async () => {
-    if (!stripe) return
     for (let i = 0; i < 3; i += 1) {
       const iterator = stripeBillingRestoreQueue.values().next()
       if (iterator.done) return
@@ -3094,7 +3178,7 @@ function startStripeBillingRestoreWorker() {
       try {
         const row = await dbGetSession(nextCode)
         if (row?.state) {
-          await autoRestoreStripeBillingEvidenceIfMissing({
+          await repairConsultationRecordIntegrity({
             roomCode: row.session_code,
             state: row.state,
             persist: async (nextState) => {
@@ -3107,7 +3191,7 @@ function startStripeBillingRestoreWorker() {
         const room =
           rooms.get(nextCode) || rooms.get(String(nextCode).toUpperCase()) || rooms.get(String(nextCode).toLowerCase())
         if (room?.state) {
-          await autoRestoreStripeBillingEvidenceIfMissing({
+          await repairConsultationRecordIntegrity({
             roomCode: nextCode,
             state: room.state,
             persist: async (nextState) => {
@@ -3117,7 +3201,7 @@ function startStripeBillingRestoreWorker() {
           })
         }
       } catch (error) {
-        console.error('stripe billing auto-restore worker failed:', {
+        console.error('consultation integrity repair worker failed:', {
           code: String(nextCode || '').trim(),
           message: error instanceof Error ? error.message : String(error || ''),
         })
@@ -9153,31 +9237,7 @@ async function getConsultationRecordByCode(code) {
   if (!normalized) return null
   const row = await dbGetSession(normalized)
   if (row) {
-    await reconcileBoldsign8821Status({
-      roomCode: row.session_code,
-      state: row.state,
-      persist: async (nextState) => {
-        row.state = nextState
-        await dbUpsertSession({ code: row.session_code, state: nextState })
-      },
-    })
-    await reconcileBoldsignResolutionStatus({
-      roomCode: row.session_code,
-      state: row.state,
-      persist: async (nextState) => {
-        row.state = nextState
-        await dbUpsertSession({ code: row.session_code, state: nextState })
-      },
-    })
-    await autoRestoreStripeBillingEvidenceIfMissing({
-      roomCode: row.session_code,
-      state: row.state,
-      persist: async (nextState) => {
-        row.state = nextState
-        await dbUpsertSession({ code: row.session_code, state: nextState })
-      },
-    })
-    await autoSyncStripePaymentMethodsIfMissing({
+    await repairConsultationRecordIntegrity({
       roomCode: row.session_code,
       state: row.state,
       persist: async (nextState) => {
@@ -9196,31 +9256,7 @@ async function getConsultationRecordByCode(code) {
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
   if (!room) return null
-  await reconcileBoldsign8821Status({
-    roomCode: normalized,
-    state: room.state,
-    persist: async (nextState) => {
-      room.state = nextState
-      await dbUpsertSession({ code: normalized, state: nextState })
-    },
-  })
-  await reconcileBoldsignResolutionStatus({
-    roomCode: normalized,
-    state: room.state,
-    persist: async (nextState) => {
-      room.state = nextState
-      await dbUpsertSession({ code: normalized, state: nextState })
-    },
-  })
-  await autoRestoreStripeBillingEvidenceIfMissing({
-    roomCode: normalized,
-    state: room.state,
-    persist: async (nextState) => {
-      room.state = nextState
-      await dbUpsertSession({ code: normalized, state: nextState })
-    },
-  })
-  await autoSyncStripePaymentMethodsIfMissing({
+  await repairConsultationRecordIntegrity({
     roomCode: normalized,
     state: room.state,
     persist: async (nextState) => {
@@ -12645,10 +12681,18 @@ server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Server listening on http://localhost:${PORT}`)
 
-  // Background repair: rebuild missing Stripe billing evidence gradually without any manual UI action.
+  // Background repair: rebuild missing billing, signed-document, and payment-method evidence
+  // gradually without any manual UI action.
   try {
     startStripeBillingRestoreWorker()
   } catch (error) {
-    console.error('Failed to start Stripe billing restore worker:', error)
+    console.error('Failed to start consultation integrity repair worker:', error)
   }
+  void seedStripeBillingRestoreQueue(RECORD_INTEGRITY_REPAIR_STARTUP_LIMIT)
+    .then((queuedCount) => {
+      console.log(`Queued ${queuedCount} consultation records for integrity repair`)
+    })
+    .catch((error) => {
+      console.error('Failed to seed consultation integrity repair queue:', error)
+    })
 })
