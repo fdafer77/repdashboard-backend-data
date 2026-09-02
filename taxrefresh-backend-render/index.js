@@ -242,6 +242,204 @@ async function dbInsertBillingAudit({ sessionCode, eventType, billingMode = '', 
   }
 }
 
+const SESSION_BACKUP_RESTORE_ANSWER_KEYS = [
+  'name',
+  'full_name',
+  'first_name',
+  'last_name',
+  'email',
+  'email_address',
+  'phone',
+  'phone_number',
+  'mailing_address',
+  'mailing_city',
+  'mailing_state',
+  'mailing_zip',
+  'filingStatus',
+  'filing_status',
+  'spouse_name',
+  'spouse_first_name',
+  'spouse_last_name',
+  'spouse_email',
+  'stripe_customer_id',
+  'billing_schedule',
+  'investigation_billing_schedule',
+  'resolution_billing_schedule',
+  'billing_invoice_amount',
+  'billing_invoice_created_at',
+  'investigation_billing_invoice_amount',
+  'investigation_billing_invoice_created_at',
+  'resolution_billing_invoice_amount',
+  'resolution_billing_invoice_created_at',
+  'billing_payment_method',
+  'billing_payment_methods',
+  'client_portal_payment_method',
+  'client_portal_payment_methods',
+  'document_receipts',
+  'document_delivery_log',
+  'document_email_log',
+  'hidden_document_receipt_names',
+  'ea_documents',
+  'consultation_notes',
+  'ea_activity_timeline',
+  'form8821_status',
+  'form8821_spouse_status',
+  'onboarding_status',
+  'completed_at',
+  'current_8821_document_code',
+  'active_8821_document_code',
+  'boldsign_8821_document_id',
+  'boldsign_8821_spouse_document_id',
+  'boldsign_8821_file_name',
+  'boldsign_8821_spouse_file_name',
+  'boldsign_8821_sent_at',
+  'boldsign_8821_spouse_sent_at',
+  'boldsign_8821_sender_email',
+  'boldsign_8821_spouse_sender_email',
+  'boldsign_8821_signed_at',
+  'signed_8821_saved_at',
+  'signed_8821_file_name',
+  'signed_8821_first_page_saved_at',
+  'signed_8821_first_page_file_name',
+  'signed_8821_render_version',
+  'signed_8821_first_page_render_version',
+  'boldsign_resolution_document_id',
+  'boldsign_resolution_file_name',
+  'boldsign_resolution_sent_at',
+  'boldsign_resolution_sender_email',
+  'boldsign_resolution_signed_at',
+]
+
+function stripValueForSessionBackup(value, key = '') {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => stripValueForSessionBackup(entry))
+      .filter((entry) => entry !== undefined)
+  }
+  if (typeof value !== 'object') return value
+
+  const next = {}
+  Object.entries(value).forEach(([entryKey, entryValue]) => {
+    if (entryKey.startsWith('_ui_') || entryKey.startsWith('_auto_')) return
+    if (entryKey === 'dataUrl' || entryKey === 'rawText' || entryKey === 'raw_text' || entryKey === 'extractedTextPreview') return
+    const stripped = stripValueForSessionBackup(entryValue, entryKey)
+    if (stripped !== undefined) next[entryKey] = stripped
+  })
+  return next
+}
+
+function buildSessionBackupPayload({ code = '', contactId = '', opportunityId = '', state } = {}) {
+  const safeState = state && typeof state === 'object' ? safeJsonClone(state) || {} : {}
+  const answers = safeState.answers && typeof safeState.answers === 'object' ? safeState.answers : {}
+  const sanitizedAnswers = sanitizeSensitiveBillingAnswers(stripValueForSessionBackup(answers) || {})
+  return {
+    version: 1,
+    sessionCode: String(code || '').trim(),
+    contactId: String(contactId || '').trim(),
+    opportunityId: String(opportunityId || '').trim(),
+    route: String(safeState.route || '').trim(),
+    step: Number(safeState.step || 0) || 0,
+    profile: {
+      clientName: getPrimaryAnswer(sanitizedAnswers, ['full_name', 'name', 'client_name', 'clientName']),
+      email: getPrimaryAnswer(sanitizedAnswers, ['email', 'email_address']),
+      phone: getPrimaryAnswer(sanitizedAnswers, ['phone', 'phone_number']),
+    },
+    answers: sanitizedAnswers,
+  }
+}
+
+function getSessionBackupChecksum(payload = {}) {
+  return crypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex')
+}
+
+async function dbInsertSessionBackup({ sessionCode, contactId = '', opportunityId = '', state, previousState = null, reason = 'session_upsert' } = {}) {
+  if (!pool) return false
+  const normalizedCode = String(sessionCode || '').trim()
+  if (!normalizedCode) return false
+
+  const payload = buildSessionBackupPayload({ code: normalizedCode, contactId, opportunityId, state })
+  const previousPayload = previousState ? buildSessionBackupPayload({ code: normalizedCode, contactId, opportunityId, state: previousState }) : null
+  const checksum = getSessionBackupChecksum(payload)
+  const previousChecksum = previousPayload ? getSessionBackupChecksum(previousPayload) : ''
+
+  if (previousChecksum && previousChecksum === checksum) return false
+  if (!Object.keys(payload?.answers || {}).length) return false
+
+  try {
+    await pool.query(
+      `insert into ti_session_backups(session_code, ghl_contact_id, ghl_opportunity_id, backup_reason, backup_checksum, payload)
+       values ($1, $2, $3, $4, $5, $6)`,
+      [normalizedCode, String(contactId || '').trim() || null, String(opportunityId || '').trim() || null, String(reason || 'session_upsert'), checksum, payload],
+    )
+    return true
+  } catch (error) {
+    console.error('session backup insert failed:', {
+      sessionCode: normalizedCode,
+      reason: String(reason || 'session_upsert'),
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    return false
+  }
+}
+
+async function dbGetLatestSessionBackup(sessionCode = '') {
+  if (!pool) return null
+  const normalizedCode = String(sessionCode || '').trim()
+  if (!normalizedCode) return null
+  try {
+    const res = await pool.query(
+      `select payload, created_at
+         from ti_session_backups
+        where session_code = $1
+        order by created_at desc
+        limit 1`,
+      [normalizedCode],
+    )
+    return res.rows?.[0] || null
+  } catch (error) {
+    console.error('session backup lookup failed:', {
+      sessionCode: normalizedCode,
+      message: error instanceof Error ? error.message : String(error || ''),
+    })
+    return null
+  }
+}
+
+function restoreCriticalAnswersFromBackup(currentAnswers = {}, backupAnswers = {}) {
+  const nextAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : {}
+  const sourceAnswers = backupAnswers && typeof backupAnswers === 'object' ? backupAnswers : {}
+  let changed = false
+
+  SESSION_BACKUP_RESTORE_ANSWER_KEYS.forEach((key) => {
+    if (!hasMeaningfulSessionValue(sourceAnswers[key])) return
+    if (hasMeaningfulSessionValue(nextAnswers[key])) return
+    nextAnswers[key] = safeJsonClone(sourceAnswers[key])
+    changed = true
+  })
+
+  return changed
+}
+
+async function restoreCriticalSessionDataFromBackupIfMissing({ roomCode, state, persist } = {}) {
+  if (!pool || typeof persist !== 'function') return false
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) return false
+  const roomState = state && typeof state === 'object' ? state : initialRoomState()
+  const answers = roomState.answers && typeof roomState.answers === 'object' ? roomState.answers : {}
+  const latestBackup = await dbGetLatestSessionBackup(normalizedRoomCode)
+  const backupAnswers = latestBackup?.payload?.answers
+  if (!backupAnswers || typeof backupAnswers !== 'object') return false
+
+  const changed = restoreCriticalAnswersFromBackup(answers, backupAnswers)
+  if (!changed) return false
+  roomState.answers = sanitizeSensitiveBillingAnswers(answers)
+  await persist(roomState)
+  return true
+}
+
 function getDashboardAnalyticsCacheKey(account = null) {
   const designatedPosition = String(account?.designatedPosition || '').trim().toLowerCase()
   const email = String(account?.email || '').trim().toLowerCase()
@@ -3096,13 +3294,14 @@ function queueStripeBillingRestore(roomCode = '') {
 
 async function repairConsultationRecordIntegrity({ roomCode, state, persist } = {}) {
   const normalizedRoomCode = String(roomCode || '').trim()
-  if (!normalizedRoomCode) return { normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
+  if (!normalizedRoomCode) return { restoredFromBackup: false, normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
   if (typeof persist !== 'function') {
-    return { normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
+    return { restoredFromBackup: false, normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
   }
 
   let currentState = state && typeof state === 'object' ? state : initialRoomState()
   const results = {
+    restoredFromBackup: false,
     normalized8821: false,
     normalizedResolution: false,
     reconciled8821: false,
@@ -3116,6 +3315,11 @@ async function repairConsultationRecordIntegrity({ roomCode, state, persist } = 
     await persist(currentState)
   }
 
+  results.restoredFromBackup = await restoreCriticalSessionDataFromBackupIfMissing({
+    roomCode: normalizedRoomCode,
+    state: currentState,
+    persist: persistAndCapture,
+  })
   const answers = currentState.answers || {}
   results.normalized8821 = normalizePersistedSigned8821State(answers)
   results.normalizedResolution = normalizePersistedResolutionSignedState(answers)
@@ -8671,6 +8875,14 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
     `,
       [resolvedCode, contactId, opportunityId, nextState],
     )
+    await dbInsertSessionBackup({
+      sessionCode: resolvedCode,
+      contactId: contactId ?? existing?.ghl_contact_id ?? '',
+      opportunityId: opportunityId ?? existing?.ghl_opportunity_id ?? '',
+      state: nextState,
+      previousState: existing?.state || null,
+      reason: 'session_upsert',
+    })
     invalidateDashboardAnalyticsCache()
   } catch (error) {
     console.error('dbUpsertSession failed, falling back to file store:', {
