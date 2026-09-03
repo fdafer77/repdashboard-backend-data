@@ -131,8 +131,10 @@ const CLIENT_PORTAL_SMS_SEND_COOLDOWN_MS = Math.max(15_000, Number(process.env.C
 const CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS = Math.max(3, Math.min(10, Number(process.env.CLIENT_PORTAL_SMS_VERIFY_MAX_ATTEMPTS || 5) || 5))
 const SESSION_PERSIST_DEBOUNCE_MS = Math.max(100, Number(process.env.SESSION_PERSIST_DEBOUNCE_MS || 250) || 250)
 const DASHBOARD_ANALYTICS_CACHE_TTL_MS = Math.max(2000, Number(process.env.DASHBOARD_ANALYTICS_CACHE_TTL_MS || 10_000) || 10_000)
+const CONSULTATION_INTEGRITY_REPAIR_COOLDOWN_MS = Math.max(10_000, Number(process.env.CONSULTATION_INTEGRITY_REPAIR_COOLDOWN_MS || 60_000) || 60_000)
 const pendingSessionPersists = new Map()
 const dashboardAnalyticsCache = new Map()
+const consultationIntegrityRepairTimestamps = new Map()
 
 function invalidateDashboardAnalyticsCache() {
   dashboardAnalyticsCache.clear()
@@ -9467,14 +9469,19 @@ async function getConsultationRecordByCode(code) {
   if (!normalized) return null
   const row = await dbGetSession(normalized)
   if (row) {
-    await repairConsultationRecordIntegrity({
-      roomCode: row.session_code,
-      state: row.state,
-      persist: async (nextState) => {
-        row.state = nextState
-        await dbUpsertSession({ code: row.session_code, state: nextState })
-      },
-    })
+    const repairKey = String(row.session_code || normalized).trim()
+    const lastRepairAt = consultationIntegrityRepairTimestamps.get(repairKey) || 0
+    if (Date.now() - lastRepairAt >= CONSULTATION_INTEGRITY_REPAIR_COOLDOWN_MS) {
+      consultationIntegrityRepairTimestamps.set(repairKey, Date.now())
+      void repairConsultationRecordIntegrity({
+        roomCode: row.session_code,
+        state: row.state,
+        persist: async (nextState) => {
+          row.state = nextState
+          await dbUpsertSession({ code: row.session_code, state: nextState })
+        },
+      }).catch(() => {})
+    }
     return attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -9486,14 +9493,18 @@ async function getConsultationRecordByCode(code) {
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
   if (!room) return null
-  await repairConsultationRecordIntegrity({
-    roomCode: normalized,
-    state: room.state,
-    persist: async (nextState) => {
-      room.state = nextState
-      await dbUpsertSession({ code: normalized, state: nextState })
-    },
-  })
+  const lastRepairAt = consultationIntegrityRepairTimestamps.get(normalized) || 0
+  if (Date.now() - lastRepairAt >= CONSULTATION_INTEGRITY_REPAIR_COOLDOWN_MS) {
+    consultationIntegrityRepairTimestamps.set(normalized, Date.now())
+    void repairConsultationRecordIntegrity({
+      roomCode: normalized,
+      state: room.state,
+      persist: async (nextState) => {
+        room.state = nextState
+        await dbUpsertSession({ code: normalized, state: nextState })
+      },
+    }).catch(() => {})
+  }
   return attachSmsThreadToConsultationDetail(buildConsultationDetail({
     sessionCode: normalized,
     contactId: room.contactId,
