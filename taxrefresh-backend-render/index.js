@@ -10990,8 +10990,16 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     if (!targetRow) return res.status(404).json({ error: 'Billing schedule row not found' })
     const amount = Number(targetRow.amount || 0)
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'The scheduled amount is invalid.' })
-    const customerId = await ensureStripeCustomerForRoom(roomCode, room)
-    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    let customerId = await ensureStripeCustomerForRoom(roomCode, room)
+    let paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    const paymentMethodCustomerId = String(paymentMethod?.customer || '').trim()
+    if (paymentMethodCustomerId && paymentMethodCustomerId !== customerId) {
+      customerId = await persistStripeCustomerIdForRoom(roomCode, room, paymentMethodCustomerId)
+    }
+    if (!String(paymentMethod?.customer || '').trim()) {
+      await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId })
+      paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+    }
     const isUsBankAccount = String(paymentMethod?.type || '').trim().toLowerCase() === 'us_bank_account'
 
     const processedPaymentMethodLast4 = (() => {
