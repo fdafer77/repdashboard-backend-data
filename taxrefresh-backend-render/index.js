@@ -12326,6 +12326,10 @@ function buildConsultationAnalytics(items = [], account = null) {
       let pendingRevenue = 0
       let failedRevenue = 0
       if (!isCancellationRequested) {
+        const countedProcessedIntentIds = new Set()
+        const countedProcessedMatchKeys = new Set()
+        const countedPendingMatchKeys = new Set()
+        const countedFailedMatchKeys = new Set()
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
@@ -12335,6 +12339,29 @@ function buildConsultationAnalytics(items = [], account = null) {
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
           const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
+          const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
+          const paymentIntentId = getBillingStripePaymentIntentIdValue(row)
+          if (tone === 'processed') {
+            if (paymentIntentId) {
+              if (countedProcessedIntentIds.has(paymentIntentId)) return
+              countedProcessedIntentIds.add(paymentIntentId)
+            } else if (matchKey) {
+              // Some schedule representations can duplicate a processed payment without storing the payment_intent.
+              // When we don't have an intent id, collapse by date+amount to prevent double counting.
+              if (countedProcessedMatchKeys.has(matchKey)) return
+              countedProcessedMatchKeys.add(matchKey)
+            }
+          } else if (tone === 'failed') {
+            if (matchKey) {
+              if (countedFailedMatchKeys.has(matchKey)) return
+              countedFailedMatchKeys.add(matchKey)
+            }
+          } else if (!isPastDuePending && pendingRevenueEligible) {
+            if (matchKey) {
+              if (countedPendingMatchKeys.has(matchKey)) return
+              countedPendingMatchKeys.add(matchKey)
+            }
+          }
           const paymentScheduleEntry = {
             id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
             sessionCode: String(item.sessionCode || '').trim(),
