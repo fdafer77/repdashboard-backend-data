@@ -2917,23 +2917,38 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
 
   const existingScheduleRows = getBillingScheduleRowsFromAnswers(answers)
   const hasExistingEvidence = existingScheduleRows.some((row) => hasBillingProcessingEvidence(row))
-  if (hasExistingEvidence) return
+  const outstandingDueRows = getOutstandingBillingRows(existingScheduleRows).filter((row) => {
+    const tone = getBillingTimingTone(row?.date || '')
+    return tone === 'today' || tone === 'past'
+  })
+  // Previously we bailed out as soon as we saw *any* processing evidence. That can miss later payments
+  // (e.g. one payment intent succeeded but never got written back to the schedule). If there are
+  // due/past rows still outstanding, we should attempt a restore (throttled by attempted_at).
+  if (hasExistingEvidence && outstandingDueRows.length === 0) return
 
   let customerId = String(answers.stripe_customer_id || '').trim()
   const email = String(answers.email || '').trim()
-  const safeSessionCode = normalizedRoomCode.replace(/[^a-zA-Z0-9_-]/g, '')
+  const sessionCodeVariants = Array.from(
+    new Set([normalizedRoomCode, normalizedRoomCode.toUpperCase(), normalizedRoomCode.toLowerCase()]),
+  ).filter(Boolean)
+  const safeSessionCodeVariants = Array.from(
+    new Set(sessionCodeVariants.map((value) => String(value || '').replace(/[^a-zA-Z0-9_-]/g, ''))),
+  ).filter(Boolean)
 
   // Prefer Stripe metadata search when available (most reliable; doesn't rely on email being present).
-  if (!customerId && safeSessionCode && typeof stripe?.customers?.search === 'function') {
-    try {
-      const search = await stripe.customers.search({
-        query: `metadata['sessionCode']:'${safeSessionCode}'`,
-        limit: 1,
-      })
-      customerId = String(search?.data?.[0]?.id || '').trim()
-      if (customerId) answers.stripe_customer_id = customerId
-    } catch {
-      // ignore search errors; we'll try other approaches
+  if (!customerId && safeSessionCodeVariants.length && typeof stripe?.customers?.search === 'function') {
+    for (const safeSessionCode of safeSessionCodeVariants) {
+      if (customerId) break
+      try {
+        const search = await stripe.customers.search({
+          query: `metadata['sessionCode']:'${safeSessionCode}'`,
+          limit: 1,
+        })
+        customerId = String(search?.data?.[0]?.id || '').trim()
+        if (customerId) answers.stripe_customer_id = customerId
+      } catch {
+        // ignore search errors; we'll try other approaches
+      }
     }
   }
 
@@ -2941,7 +2956,7 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   if (!customerId && email) {
     const candidates = await stripe.customers.list({ email, limit: 10 })
     const match =
-      candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim() === normalizedRoomCode) ||
+      candidates.data.find((customer) => String(customer?.metadata?.sessionCode || '').trim().toLowerCase() === normalizedRoomCode.toLowerCase()) ||
       candidates.data[0]
     customerId = String(match?.id || '').trim()
     if (customerId) answers.stripe_customer_id = customerId
@@ -2950,25 +2965,28 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   // Fallback: search Payment Intents by metadata sessionCode (if the Stripe account supports it).
   // This also works even when the Stripe customer can't be resolved yet.
   let intentData = null
-  if (safeSessionCode && typeof stripe?.paymentIntents?.search === 'function') {
-    try {
-      const search = await stripe.paymentIntents.search({
-        query: `metadata['sessionCode']:'${safeSessionCode}'`,
-        limit: 100,
-        expand: ['data.payment_method'],
-      })
-      if (Array.isArray(search?.data) && search.data.length) {
-        intentData = search.data
-        if (!customerId) {
-          const inferredCustomer = String(search.data.find((intent) => intent?.customer)?.customer || '').trim()
-          if (inferredCustomer) {
-            customerId = inferredCustomer
-            answers.stripe_customer_id = inferredCustomer
+  if (safeSessionCodeVariants.length && typeof stripe?.paymentIntents?.search === 'function') {
+    for (const safeSessionCode of safeSessionCodeVariants) {
+      if (intentData) break
+      try {
+        const search = await stripe.paymentIntents.search({
+          query: `metadata['sessionCode']:'${safeSessionCode}'`,
+          limit: 100,
+          expand: ['data.payment_method'],
+        })
+        if (Array.isArray(search?.data) && search.data.length) {
+          intentData = search.data
+          if (!customerId) {
+            const inferredCustomer = String(search.data.find((intent) => intent?.customer)?.customer || '').trim()
+            if (inferredCustomer) {
+              customerId = inferredCustomer
+              answers.stripe_customer_id = inferredCustomer
+            }
           }
         }
+      } catch {
+        // ignore search errors; we'll try listing intents by customer next
       }
-    } catch {
-      // ignore search errors; we'll try listing intents by customer next
     }
   }
 
@@ -10262,6 +10280,99 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
     return res.json({ ok: true, item })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update billing adjustments' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const scheduledDateRaw = String(req.body?.scheduledDate || '').trim()
+    const scheduledAmount = Number(req.body?.scheduledAmount)
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    const normalizedDate = normalizeBillingDateValue(scheduledDateRaw)
+    if (!normalizedDate) return res.status(400).json({ error: 'scheduledDate is required' })
+    if (!Number.isFinite(scheduledAmount) || scheduledAmount <= 0) {
+      return res.status(400).json({ error: 'scheduledAmount is required' })
+    }
+
+    const room = await ensureRoom(roomCode)
+    const nowIso = new Date().toISOString()
+    const actorEmail = String(req.adminUser?.email || '')
+
+    const parseScheduleValue = (value) => {
+      if (Array.isArray(value)) return value
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value)
+          return Array.isArray(parsed) ? parsed : []
+        } catch {
+          return []
+        }
+      }
+      return []
+    }
+
+    const scheduleKeys = ['billing_schedule', 'investigation_billing_schedule', 'resolution_billing_schedule']
+    const nextAnswers = room.state.answers || {}
+    const persistPatches = []
+    let updatedCount = 0
+
+    scheduleKeys.forEach((key) => {
+      const existingSchedule = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[key]))
+      if (!existingSchedule.length) return
+
+      let keyUpdated = 0
+      const nextSchedule = existingSchedule.map((row) => {
+        const rowDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
+        const rowAmount = toNumberValue(row?.amount)
+        const dateMatches = rowDate === normalizedDate
+        const amountMatches = Math.abs(Number(rowAmount) - Number(scheduledAmount)) < 0.01
+        if (!dateMatches || !amountMatches) return row
+        if (getBillingStatusTone(row) === 'processed') return row
+        updatedCount += 1
+        keyUpdated += 1
+        return {
+          ...(row || {}),
+          status: 'processed',
+          failureReason: '',
+          processorReason: '',
+          reason: '',
+          processedAt: getBillingProcessedAtValue(row) || nowIso,
+          processedManually: true,
+          processedManualBy: actorEmail,
+          processedManualAt: nowIso,
+        }
+      })
+
+      if (keyUpdated === 0) return
+      const sanitized = sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule)
+      nextAnswers[key] = sanitized
+      persistPatches.push({ type: 'setAnswer', questionId: key, value: sanitized })
+    })
+
+    if (updatedCount === 0) {
+      return res.status(404).json({ error: 'No matching billing schedule row was found to mark processed.' })
+    }
+
+    room.state.answers = nextAnswers
+    await persistRoomState(roomCode, room, persistPatches)
+    void dbInsertBillingAudit({
+      sessionCode: roomCode,
+      eventType: 'payment_marked_processed',
+      billingMode: '',
+      actorEmail,
+      payload: {
+        scheduledDate: normalizedDate,
+        scheduledAmount,
+        updatedCount,
+        at: nowIso,
+      },
+    })
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, updatedCount })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to mark payment processed' })
   }
 })
 
