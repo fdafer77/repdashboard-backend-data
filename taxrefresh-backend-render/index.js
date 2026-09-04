@@ -8930,6 +8930,43 @@ async function dbGetSession(code) {
   }
 }
 
+async function dbGetSessionStrict(code) {
+  if (!pool) return fallbackGetSession(code)
+  if (isDbCircuitOpen()) {
+    const error = new Error('Database is temporarily unavailable.')
+    error.isTransientDb = true
+    throw error
+  }
+  try {
+    const result = await retry(
+      async () => {
+        try {
+          for (const candidate of getCodeVariants(code)) {
+            const res = await pool.query(
+              'select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at from ti_sessions where session_code=$1',
+              [candidate],
+            )
+            if (res.rows?.[0]) return res.rows[0]
+          }
+          return null
+        } catch (error) {
+          if (!isTransientDbConnectionError(error)) error.noRetry = true
+          throw error
+        }
+      },
+      { attempts: 6, delayMs: 1000 },
+    )
+    return result
+  } catch (error) {
+    if (isTransientDbConnectionError(error)) {
+      const wrapped = new Error('Database is waking up.')
+      wrapped.isTransientDb = true
+      throw wrapped
+    }
+    throw error
+  }
+}
+
 async function dbUpsertSession({ code, contactId = null, opportunityId = null, state }) {
   if (!pool) return fallbackUpsertSession({ code, contactId, opportunityId, state })
   if (isDbCircuitOpen()) return fallbackUpsertSession({ code, contactId, opportunityId, state })
@@ -9819,13 +9856,30 @@ app.post('/api/admin/consultations/:code/calendly/booking-link', async (req, res
 app.get('/api/admin/consultations/:code', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
-    const item = await getConsultationRecordByCode(req.params.code)
+    // Strict read for admin: never show partial data from fallback store when Postgres is down.
+    // If Postgres is unavailable, return a 503 so the UI can retry instead of showing empty fields.
+    const row = await dbGetSessionStrict(req.params.code)
+    if (!row) return res.status(404).json({ error: 'Consultation record not found' })
+    const item = attachSmsThreadToConsultationDetail(buildConsultationDetail({
+      sessionCode: row.session_code,
+      contactId: row.ghl_contact_id,
+      opportunityId: row.ghl_opportunity_id,
+      state: row.state,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }))
     if (!item) return res.status(404).json({ error: 'Consultation record not found' })
     if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
       return res.status(403).json({ error: 'You do not have access to this consultation record.' })
     }
     return res.json({ item })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    if (isTransientDbConnectionError(error)) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation detail' })
   }
 })
