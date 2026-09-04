@@ -128,6 +128,10 @@ const DB_CIRCUIT_COOLDOWN_MS = Math.max(5_000, Number(process.env.DB_CIRCUIT_COO
 const DB_CIRCUIT_LOG_THROTTLE_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_LOG_THROTTLE_MS || 10_000) || 10_000)
 const DB_RECOVERY_MERGE_WINDOW_MS = Math.max(60_000, Number(process.env.DB_RECOVERY_MERGE_WINDOW_MS || 10 * 60_000) || 10 * 60_000)
 const DB_CIRCUIT_PROBE_INTERVAL_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_PROBE_INTERVAL_MS || 2_000) || 2_000)
+// When enabled, the backend refuses to write to the local file-store fallback.
+// This prevents the system from "appearing to save" while Postgres is unavailable,
+// which is a major source of data trust issues.
+const STRICT_DB_MODE = String(process.env.STRICT_DB_MODE || '').trim() === '1' || String(process.env.STRICT_DB_MODE || '').trim().toLowerCase() === 'true'
 let dbCircuitOpenUntil = 0
 let dbLastFailureAt = 0
 let dbLastFailureMessage = ''
@@ -688,6 +692,11 @@ async function fallbackGetSession(code) {
 }
 
 async function fallbackUpsertSession({ code, contactId = null, opportunityId = null, state }) {
+  if (STRICT_DB_MODE) {
+    const error = new Error('Database is temporarily unavailable. Refusing to write to fallback store.')
+    error.isTransientDb = true
+    throw error
+  }
   await ensureFallbackStoreLoaded()
   const existing = await fallbackGetSession(code)
   const resolvedCode = String(existing?.session_code || code)
@@ -707,6 +716,11 @@ async function fallbackUpsertSession({ code, contactId = null, opportunityId = n
 }
 
 async function fallbackDeleteSession(code) {
+  if (STRICT_DB_MODE) {
+    const error = new Error('Database is temporarily unavailable. Refusing to delete from fallback store.')
+    error.isTransientDb = true
+    throw error
+  }
   await ensureFallbackStoreLoaded()
   let deleted = false
   for (const candidate of getCodeVariants(code)) {
@@ -9024,8 +9038,14 @@ async function dbGetSessionStrict(code) {
 }
 
 async function dbUpsertSession({ code, contactId = null, opportunityId = null, state }) {
-  if (!pool) return fallbackUpsertSession({ code, contactId, opportunityId, state })
-  if (isDbCircuitOpen()) return fallbackUpsertSession({ code, contactId, opportunityId, state })
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return fallbackUpsertSession({ code, contactId, opportunityId, state })
+  }
   try {
     const existing = await dbGetSession(code)
     const resolvedCode = String(existing?.session_code || code)
@@ -9053,13 +9073,24 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
     invalidateDashboardAnalyticsCache()
   } catch (error) {
     recordDbFailure('dbUpsertSession failed, falling back to file store:', error, { code: String(code || '').trim() })
+    if (STRICT_DB_MODE) {
+      const wrapped = new Error('Database is temporarily unavailable.')
+      wrapped.isTransientDb = true
+      throw wrapped
+    }
     await fallbackUpsertSession({ code, contactId, opportunityId, state })
   }
 }
 
 async function dbDeleteSession(code) {
-  if (!pool) return fallbackDeleteSession(code)
-  if (isDbCircuitOpen()) return fallbackDeleteSession(code)
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return fallbackDeleteSession(code)
+  }
   try {
     const existing = await dbGetSession(code)
     if (!existing?.session_code) return false
@@ -9068,25 +9099,23 @@ async function dbDeleteSession(code) {
     return true
   } catch (error) {
     recordDbFailure('dbDeleteSession failed, falling back to file store:', error, { code: String(code || '').trim() })
+    if (STRICT_DB_MODE) {
+      const wrapped = new Error('Database is temporarily unavailable.')
+      wrapped.isTransientDb = true
+      throw wrapped
+    }
     return fallbackDeleteSession(code)
   }
 }
 
 async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {}) {
-  if (!pool) {
-    const existingCode =
-      (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
-      (contactId ? await fallbackFindSessionCode({ contactId }) : null)
-    if (existingCode) return existingCode
-    let code = generateSessionId()
-    while (await dbGetSession(code)) code = generateSessionId()
-    const state = initialRoomState()
-    if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
-    if (contactId) state.answers.ghl_contact_id = contactId
-    await dbUpsertSession({ code, contactId, opportunityId, state })
-    return code
-  }
-  if (isDbCircuitOpen()) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    // Legacy behavior: allow creating sessions in fallback store.
     const existingCode =
       (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
       (contactId ? await fallbackFindSessionCode({ contactId }) : null)
@@ -9121,6 +9150,11 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
       contactId: String(contactId || '').trim(),
       opportunityId: String(opportunityId || '').trim(),
     })
+    if (STRICT_DB_MODE) {
+      const wrapped = new Error('Database is temporarily unavailable.')
+      wrapped.isTransientDb = true
+      throw wrapped
+    }
     const existingCode =
       (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
       (contactId ? await fallbackFindSessionCode({ contactId }) : null)
