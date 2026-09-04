@@ -10386,6 +10386,124 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
   }
 })
 
+app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const billingModeRaw = String(req.body?.billingMode || '').trim().toLowerCase()
+    const billingMode = billingModeRaw === 'resolution' ? 'resolution' : 'investigation'
+    const paymentMethodRaw = String(req.body?.paymentMethod || req.body?.method || '').trim().toLowerCase()
+    const paymentMethod = paymentMethodRaw === 'cash' ? 'cash' : paymentMethodRaw ? paymentMethodRaw : 'manual'
+    const manualNote = String(req.body?.note || req.body?.manualNote || '').trim()
+    const scheduledAmount = Number(req.body?.scheduledAmount ?? req.body?.amount)
+    const scheduledDateRaw = String(req.body?.scheduledDate || req.body?.date || '').trim()
+    const normalizedDate = normalizeBillingDateValue(scheduledDateRaw || getTodayBillingDateValue())
+
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    if (!normalizedDate) return res.status(400).json({ error: 'scheduledDate is required' })
+    if (!Number.isFinite(scheduledAmount) || scheduledAmount <= 0) {
+      return res.status(400).json({ error: 'scheduledAmount is required' })
+    }
+
+    const room = await ensureRoom(roomCode)
+    const nowIso = new Date().toISOString()
+    const actorEmail = String(req.adminUser?.email || '')
+
+    const parseScheduleValue = (value) => {
+      if (Array.isArray(value)) return value
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value)
+          return Array.isArray(parsed) ? parsed : []
+        } catch {
+          return []
+        }
+      }
+      return []
+    }
+
+    const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
+    const nextAnswers = room.state.answers || {}
+    const existingSchedule = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[scheduleFieldKey]))
+    const manualLabel = paymentMethod === 'cash' ? 'Cash payment' : `${paymentMethod} payment`
+    const manualReason = manualNote ? `${manualLabel}: ${manualNote}` : manualLabel
+
+    let updatedCount = 0
+    let appended = false
+
+    const nextSchedule = existingSchedule.map((row) => {
+      const rowDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
+      const rowAmount = toNumberValue(row?.amount)
+      const dateMatches = rowDate === normalizedDate
+      const amountMatches = Math.abs(Number(rowAmount) - Number(scheduledAmount)) < 0.01
+      if (!dateMatches || !amountMatches) return row
+      if (getBillingStatusTone(row) === 'processed') return row
+      updatedCount += 1
+      return {
+        ...(row || {}),
+        status: 'processed',
+        failureReason: '',
+        processorReason: manualReason,
+        reason: manualReason,
+        processedAt: getBillingProcessedAtValue(row) || nowIso,
+        processedManually: true,
+        processedManualBy: actorEmail,
+        processedManualAt: nowIso,
+        processedManualMethod: paymentMethod,
+        processedManualNote: manualNote,
+      }
+    })
+
+    if (updatedCount === 0) {
+      appended = true
+      nextSchedule.push({
+        date: normalizedDate,
+        amount: scheduledAmount,
+        status: 'processed',
+        failureReason: '',
+        processorReason: manualReason,
+        reason: manualReason,
+        processedAt: nowIso,
+        processedManually: true,
+        processedManualBy: actorEmail,
+        processedManualAt: nowIso,
+        processedManualMethod: paymentMethod,
+        processedManualNote: manualNote,
+      })
+    }
+
+    const sanitized = sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule)
+    nextAnswers[scheduleFieldKey] = sanitized
+    const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: sanitized }]
+
+    room.state.answers = nextAnswers
+    await persistRoomState(roomCode, room, persistPatches)
+
+    void dbInsertBillingAudit({
+      sessionCode: roomCode,
+      eventType: 'payment_recorded_manual',
+      billingMode,
+      actorEmail,
+      payload: {
+        billingMode,
+        scheduleFieldKey,
+        scheduledDate: normalizedDate,
+        scheduledAmount,
+        paymentMethod,
+        note: manualNote,
+        updatedCount,
+        appended,
+        at: nowIso,
+      },
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item, updatedCount, appended })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to record manual payment' })
+  }
+})
+
 app.post('/api/admin/consultations/:code/stripe/setup-intent', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   if (!isStripeReady()) return res.status(503).json({ error: 'Stripe is not configured.' })
