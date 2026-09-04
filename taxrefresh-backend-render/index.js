@@ -142,6 +142,15 @@ function isDbCircuitOpen() {
   return Boolean(pool && Date.now() < dbCircuitOpenUntil)
 }
 
+function getRequestId(req) {
+  return (
+    String(req.headers['x-request-id'] || '').trim() ||
+    String(req.headers['x-amzn-trace-id'] || '').trim() ||
+    String(req.headers['cf-ray'] || '').trim() ||
+    ''
+  )
+}
+
 async function probeDbAndMaybeCloseCircuit({ timeoutMs = 1500 } = {}) {
   if (!pool) return false
   const now = Date.now()
@@ -177,6 +186,46 @@ function isTransientDbConnectionError(error) {
     message.includes('timeout') ||
     message.includes('etimedout')
   )
+}
+
+async function dbInsertEvent({
+  sessionCode = '',
+  eventType = '',
+  domain = '',
+  actorEmail = '',
+  idempotencyKey = '',
+  requestId = '',
+  payload = {},
+} = {}) {
+  if (!pool) return false
+  if (isDbCircuitOpen()) return false
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedEventType = String(eventType || '').trim()
+  if (!normalizedSessionCode || !normalizedEventType) return false
+  const normalizedIdempotencyKey = String(idempotencyKey || '').trim()
+  const resolvedIdempotencyKey = normalizedIdempotencyKey ? normalizedIdempotencyKey : null
+  try {
+    await pool.query(
+      `
+      insert into ti_events(session_code, event_type, domain, actor_email, idempotency_key, request_id, payload)
+      values ($1, $2, $3, $4, $5, $6, $7)
+      on conflict (session_code, idempotency_key) where idempotency_key is not null do nothing
+    `,
+      [
+        normalizedSessionCode,
+        normalizedEventType,
+        String(domain || '').trim() || null,
+        String(actorEmail || '').trim() || null,
+        resolvedIdempotencyKey,
+        String(requestId || '').trim() || null,
+        payload && typeof payload === 'object' ? payload : { value: payload },
+      ],
+    )
+    return true
+  } catch (error) {
+    recordDbFailure('dbInsertEvent failed:', error, { sessionCode: normalizedSessionCode, eventType: normalizedEventType })
+    return false
+  }
 }
 
 function recordDbFailure(label, error, meta = {}) {
@@ -9791,6 +9840,34 @@ app.get('/api/admin/diagnostics/data', async (req, res) => {
   }
 })
 
+app.get('/api/admin/consultations/:code/events', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const limitRaw = Number(req.query?.limit)
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : 100
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.' })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open' })
+
+    const { rows } = await pool.query(
+      `
+      select id, session_code as "sessionCode", event_type as "eventType", domain, actor_email as "actorEmail",
+             idempotency_key as "idempotencyKey", request_id as "requestId", payload, created_at as "createdAt"
+      from ti_events
+      where session_code = $1
+      order by created_at desc
+      limit $2
+    `,
+      [roomCode, limit],
+    )
+
+    return res.json({ ok: true, sessionCode: roomCode, events: rows })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load event log' })
+  }
+})
+
 app.get('/api/admin/consultations', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
@@ -10473,6 +10550,19 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
       // ignore; record will still update in-memory
     }
 
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'answer_updated',
+      domain: 'answers',
+      actorEmail: String(req.adminUser?.email || ''),
+      requestId: getRequestId(req),
+      payload: {
+        key: answerKey,
+        valuePreview: typeof normalizedValue === 'string' ? normalizedValue.slice(0, 200) : normalizedValue,
+        at: new Date().toISOString(),
+      },
+    })
+
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item })
   } catch (error) {
@@ -10569,6 +10659,21 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
         invoiceAmountFieldKey,
         invoiceCreatedAtFieldKey,
         scheduleFieldKey,
+        invoiceAmount,
+        invoiceCreatedAt,
+        scheduleLength: Array.isArray(schedule) ? schedule.length : 0,
+        at: new Date().toISOString(),
+      },
+    })
+
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'billing_updated',
+      domain: 'billing',
+      actorEmail: String(req.adminUser?.email || ''),
+      requestId: getRequestId(req),
+      payload: {
+        billingMode,
         invoiceAmount,
         invoiceCreatedAt,
         scheduleLength: Array.isArray(schedule) ? schedule.length : 0,
@@ -10788,6 +10893,22 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
     })
 
     const item = await getConsultationRecordByCode(roomCode)
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'payment_recorded_manual',
+      domain: 'billing',
+      actorEmail,
+      requestId: getRequestId(req),
+      payload: {
+        billingMode,
+        scheduledDate: normalizedDate,
+        scheduledAmount,
+        paymentMethod,
+        updatedCount,
+        appended,
+        at: nowIso,
+      },
+    })
     return res.json({ ok: true, item, updatedCount, appended })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to record manual payment' })
@@ -10880,6 +11001,20 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
       eventType: 'stripe_payment_method_attached',
       billingMode: '',
       actorEmail: String(req.adminUser?.email || ''),
+      payload: {
+        stripeCustomerId: customerId,
+        stripePaymentMethodId: paymentMethodId,
+        setupIntentId,
+        at: new Date().toISOString(),
+      },
+    })
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'payment_method_attached',
+      domain: 'billing',
+      actorEmail: String(req.adminUser?.email || ''),
+      idempotencyKey: `stripe_pm_attach:${paymentMethodId}`,
+      requestId: getRequestId(req),
       payload: {
         stripeCustomerId: customerId,
         stripePaymentMethodId: paymentMethodId,
@@ -11487,6 +11622,24 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
         processedAt: rows[targetScheduleIndex]?.processedAt || new Date().toISOString(),
       },
     })
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'payment_processed',
+      domain: 'billing',
+      actorEmail: String(req.adminUser?.email || ''),
+      idempotencyKey: `stripe_pi:${String(intent.id || '').trim()}`,
+      requestId: getRequestId(req),
+      payload: {
+        billingMode,
+        scheduleIndex: targetScheduleIndex,
+        amount,
+        stripePaymentIntentId: intent.id,
+        stripeCustomerId: customerId,
+        processedStripePaymentMethodId: paymentMethodId,
+        status: intent.status,
+        processedAt: rows[targetScheduleIndex]?.processedAt || new Date().toISOString(),
+      },
+    })
     const item = await getConsultationRecordByCode(roomCode)
     return res.json({ ok: true, item, paymentIntentId: intent.id, status: intent.status })
   } catch (error) {
@@ -11796,6 +11949,19 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       updatedAt: room.state?.updatedAt || Date.now(),
     })
     emitDashboardRecordsUpdated({ reason: 'document_sent', sessionCode: roomCode })
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'document_email_sent',
+      domain: 'documents',
+      actorEmail: String(req.adminUser?.email || ''),
+      requestId: getRequestId(req),
+      payload: {
+        documentType,
+        recipientEmail: resolvedRecipientEmail,
+        spouseRecipientEmail: spouseRecipientEmail || '',
+        sentAt,
+      },
+    })
     return res.json({
       ok: true,
       item: refreshedItem,
@@ -11881,6 +12047,18 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
       updatedAt: room.state?.updatedAt || Date.now(),
     })
     emitDashboardRecordsUpdated({ reason: 'spouse_document_released', sessionCode: roomCode })
+    void dbInsertEvent({
+      sessionCode: roomCode,
+      eventType: 'document_email_released_spouse',
+      domain: 'documents',
+      actorEmail: String(req.adminUser?.email || ''),
+      requestId: getRequestId(req),
+      payload: {
+        sentAt: releaseResult.sentAt || answers.form8821_spouse_released_at || '',
+        spouseRecipientEmail: releaseResult.recipientEmail || answers.spouse_email || '',
+        spouseStatus: answers.form8821_spouse_status || '',
+      },
+    })
     return res.json({
       ok: true,
       item: refreshedItem,

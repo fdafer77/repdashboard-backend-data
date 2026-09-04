@@ -84,4 +84,28 @@ export async function ensureSchema(pool) {
   await pool.query(`create index if not exists ti_session_backups_session_code_idx on ti_session_backups(session_code);`)
   await pool.query(`create index if not exists ti_session_backups_created_at_idx on ti_session_backups(created_at desc);`)
   await pool.query(`create index if not exists ti_session_backups_session_code_created_at_idx on ti_session_backups(session_code, created_at desc);`)
+
+  // Append-only event log for forensics + recovery.
+  // This is the backbone for "data is never lost" investigations.
+  await pool.query(`
+    create table if not exists ti_events (
+      id bigserial primary key,
+      session_code text not null,
+      event_type text not null,
+      domain text,
+      actor_email text,
+      idempotency_key text,
+      request_id text,
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now()
+    );
+  `)
+  await pool.query(`create index if not exists ti_events_session_code_idx on ti_events(session_code);`)
+  await pool.query(`create index if not exists ti_events_created_at_idx on ti_events(created_at desc);`)
+  await pool.query(`create index if not exists ti_events_session_code_created_at_idx on ti_events(session_code, created_at desc);`)
+  await pool.query(`create index if not exists ti_events_event_type_idx on ti_events(event_type);`)
+  // Only enforce idempotency uniqueness when a key is present.
+  await pool.query(
+    `create unique index if not exists ti_events_session_code_idempotency_key_uq on ti_events(session_code, idempotency_key) where idempotency_key is not null;`,
+  )
 }
