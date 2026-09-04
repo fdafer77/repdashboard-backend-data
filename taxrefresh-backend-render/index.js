@@ -756,7 +756,7 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-app.get('/health/db', async (_req, res) => {
+async function handleDbHealth(_req, res) {
   if (!pool) return res.status(503).json({ ok: false, dbReady: false, reason: 'DATABASE_URL not configured' })
   if (isDbCircuitOpen()) {
     return res.status(503).json({ ok: false, dbReady: false, reason: 'db_circuit_open' })
@@ -779,7 +779,13 @@ app.get('/health/db', async (_req, res) => {
     recordDbFailure('health db readiness check failed:', error, {})
     return res.status(503).json({ ok: false, dbReady: false, reason: 'db_unavailable' })
   }
-})
+}
+
+// Main endpoint (recommended)
+app.get('/health/db', handleDbHealth)
+// Aliases to avoid slash/backslash confusion and support simplistic monitors.
+app.get('/healthdb', handleDbHealth)
+app.get('/health-db', handleDbHealth)
 
 function parseGoogleAddressComponents(components = []) {
   const list = Array.isArray(components) ? components : []
