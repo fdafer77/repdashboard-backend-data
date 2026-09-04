@@ -9596,6 +9596,74 @@ app.post('/api/admin/consultations/auth', (req, res) => {
   })
 })
 
+app.get('/api/admin/diagnostics/data', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const now = Date.now()
+    const diagnostics = {
+      at: new Date(now).toISOString(),
+      poolConfigured: Boolean(pool),
+      dbCircuitOpen: Boolean(isDbCircuitOpen()),
+      dbCircuitOpenForMs: Math.max(0, dbCircuitOpenUntil - now),
+      dbLastFailureAt: dbLastFailureAt ? new Date(dbLastFailureAt).toISOString() : '',
+      dbLastFailureMessage,
+      fallbackStorePath: SESSION_STORE_PATH,
+      fallbackStoreLoaded: Boolean(fallbackStoreLoaded),
+      fallbackSessionCount: fallbackSessions.size,
+      liveRoomCount: rooms.size,
+      dbReady: false,
+      dbSessionCount: null,
+      dbLatestUpdatedAt: '',
+      dbBackupCount: null,
+    }
+
+    if (!pool) return res.json({ ok: true, diagnostics })
+
+    // Quick "is the DB accepting connections" check + counts (read-only).
+    try {
+      const ready = await retry(
+        async () => {
+          try {
+            await pool.query('select 1 as ok')
+            return true
+          } catch (error) {
+            if (!isTransientDbConnectionError(error)) error.noRetry = true
+            throw error
+          }
+        },
+        { attempts: 3, delayMs: 800 },
+      )
+      diagnostics.dbReady = Boolean(ready)
+    } catch (error) {
+      recordDbFailure('diagnostics db readiness check failed:', error, {})
+      diagnostics.dbReady = false
+    }
+
+    if (diagnostics.dbReady) {
+      try {
+        const counts = await pool.query(
+          `select
+              (select count(*)::int from ti_sessions) as session_count,
+              (select coalesce(max(updated_at), now()) from ti_sessions) as latest_updated_at,
+              (select count(*)::int from ti_session_backups) as backup_count
+          `,
+        )
+        diagnostics.dbSessionCount = counts?.rows?.[0]?.session_count ?? null
+        diagnostics.dbLatestUpdatedAt = counts?.rows?.[0]?.latest_updated_at
+          ? new Date(counts.rows[0].latest_updated_at).toISOString()
+          : ''
+        diagnostics.dbBackupCount = counts?.rows?.[0]?.backup_count ?? null
+      } catch (error) {
+        recordDbFailure('diagnostics db count query failed:', error, {})
+      }
+    }
+
+    return res.json({ ok: true, diagnostics })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load diagnostics' })
+  }
+})
+
 app.get('/api/admin/consultations', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
