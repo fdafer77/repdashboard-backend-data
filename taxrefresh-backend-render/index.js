@@ -5088,6 +5088,9 @@ async function getBoldsignDocumentProperties(documentId, { onBehalfOf } = {}) {
 }
 
 const BOLDSIGN_RECONCILE_CACHE_MS = 5 * 60 * 1000
+// When an admin explicitly requests a refresh, allow more frequent checks,
+// but still protect against hammering BoldSign.
+const BOLDSIGN_RECONCILE_FORCE_MIN_INTERVAL_MS = 10 * 1000
 
 function hasFreshBoldsignReconcileCheck(value = '') {
   const normalized = String(value || '').trim()
@@ -5097,13 +5100,24 @@ function hasFreshBoldsignReconcileCheck(value = '') {
   return Date.now() - timestamp < BOLDSIGN_RECONCILE_CACHE_MS
 }
 
-async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
+function hasRecentBoldsignReconcileCheck(value = '', thresholdMs = 0) {
+  const normalized = String(value || '').trim()
+  if (!normalized) return false
+  const timestamp = new Date(normalized).getTime()
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return false
+  return Date.now() - timestamp < Math.max(0, Number(thresholdMs) || 0)
+}
+
+async function reconcileBoldsign8821Status({ roomCode, state, persist, force = false } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
   const documentId = String(answers.boldsign_8821_document_id || '').trim()
   if (!documentId) return false
   if (isForm8821FullySigned(answers)) return false
-  if (hasFreshBoldsignReconcileCheck(answers.boldsign_8821_last_checked_at)) return false
+  if (!force && hasFreshBoldsignReconcileCheck(answers.boldsign_8821_last_checked_at)) return false
+  if (force && hasRecentBoldsignReconcileCheck(answers.boldsign_8821_last_checked_at, BOLDSIGN_RECONCILE_FORCE_MIN_INTERVAL_MS)) {
+    return false
+  }
 
   try {
     const properties = await getBoldsignDocumentProperties(documentId)
@@ -5121,7 +5135,10 @@ async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
     }
     answers.onboarding_status = 'documents_signed'
     answers.completed_at = answers.completed_at || new Date().toISOString()
-    answers.boldsign_8821_signed_at = answers.boldsign_8821_signed_at || new Date().toISOString()
+    const completedAt =
+      String(properties?.completedDate || properties?.completed_at || properties?.completedOn || '').trim() ||
+      new Date().toISOString()
+    answers.boldsign_8821_signed_at = answers.boldsign_8821_signed_at || completedAt
     markSigned8821DeliveryEntries(answers, answers.boldsign_8821_signed_at, getActive8821DocumentCode(answers))
     roomState.answers = answers
     await persist(roomState)
@@ -5133,13 +5150,19 @@ async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
   }
 }
 
-async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = {}) {
+async function reconcileBoldsignResolutionStatus({ roomCode, state, persist, force = false } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
   const documentId = String(answers.boldsign_resolution_document_id || '').trim()
   if (!documentId) return false
   if (String(answers.boldsign_resolution_signed_at || '').trim()) return false
-  if (hasFreshBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at)) return false
+  if (!force && hasFreshBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at)) return false
+  if (
+    force &&
+    hasRecentBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at, BOLDSIGN_RECONCILE_FORCE_MIN_INTERVAL_MS)
+  ) {
+    return false
+  }
 
   try {
     const properties = await getBoldsignDocumentProperties(documentId, {
@@ -5153,7 +5176,9 @@ async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = 
       return false
     }
 
-    answers.boldsign_resolution_signed_at = new Date().toISOString()
+    answers.boldsign_resolution_signed_at =
+      String(properties?.completedDate || properties?.completed_at || properties?.completedOn || '').trim() ||
+      new Date().toISOString()
     markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
     roomState.answers = answers
     await persist(roomState)
@@ -10037,6 +10062,38 @@ app.get('/api/admin/consultations/:code/signed-resolution', async (req, res) => 
     return res.send(download.fileBuffer)
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load signed Form 2848.' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/refresh-documents', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const item = await getConsultationRecordByCode(req.params.code)
+    if (!item) return res.status(404).json({ error: 'Consultation record not found' })
+    if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
+      return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+    }
+
+    const roomCode = String(item.sessionCode || req.params.code || '').toUpperCase().trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
+    const room = await ensureRoom(roomCode)
+    const force = Boolean(req.body?.force)
+
+    const persist = async (nextState) => {
+      if (!room) return
+      room.state = nextState
+      await dbUpsertSession({ code: roomCode, contactId: room.contactId, opportunityId: room.opportunityId, state: nextState })
+    }
+
+    const results = {
+      reconciled8821: await reconcileBoldsign8821Status({ roomCode, state: room?.state, persist, force }),
+      reconciledResolution: await reconcileBoldsignResolutionStatus({ roomCode, state: room?.state, persist, force }),
+    }
+
+    const refreshed = await getConsultationRecordByCode(roomCode)
+    return res.json({ ok: true, item: refreshed, results })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to refresh documents' })
   }
 })
 
