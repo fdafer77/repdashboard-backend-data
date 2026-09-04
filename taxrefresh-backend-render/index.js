@@ -5509,17 +5509,16 @@ async function createBoldsignResolutionSigningLink({
 
   const boldsignConfig = getBoldsignConfig()
   const isMarriedJoint = isMarriedJointFilingAnswers(answers)
-  const isSingleFiling = isSingleFilingAnswers(answers)
-  const resolutionTemplateId = isSingleFiling
-    ? String(boldsignConfig.resolutionTemplateIdSingle || boldsignConfig.resolutionTemplateId || '').trim()
-    : String(boldsignConfig.resolutionTemplateId || '').trim()
+  // Resolution documents only need a spouse signer for MFJ. For all other filing
+  // statuses (including when filing status hasn't been set yet), use the single-signer template.
+  const resolutionTemplateId = isMarriedJoint
+    ? String(boldsignConfig.resolutionTemplateId || '').trim()
+    : String(boldsignConfig.resolutionTemplateIdSingle || boldsignConfig.resolutionTemplateId || '').trim()
   if (!resolutionTemplateId) throw new Error('The BoldSign resolution template is not configured yet.')
 
   const selectedBrandId = isMarriedJoint
     ? String(boldsignConfig.brandIdMfj || boldsignConfig.brandId || '').trim()
-    : isSingleFiling
-      ? String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
-      : String(boldsignConfig.brandId || '').trim()
+    : String(boldsignConfig.brandIdSingle || boldsignConfig.brandId || '').trim()
   const hideDocumentId = Boolean(boldsignConfig.hideDocumentId)
   const spouseEmail = isMarriedJoint ? String(spouseSignerEmail || getSpouseSignerEmailFromAnswers(answers) || '').trim() : ''
   const spouseSignerEmailForBoldsign = isMarriedJoint
