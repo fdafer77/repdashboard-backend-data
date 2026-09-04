@@ -127,13 +127,37 @@ if (pool) {
 const DB_CIRCUIT_COOLDOWN_MS = Math.max(5_000, Number(process.env.DB_CIRCUIT_COOLDOWN_MS || 30_000) || 30_000)
 const DB_CIRCUIT_LOG_THROTTLE_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_LOG_THROTTLE_MS || 10_000) || 10_000)
 const DB_RECOVERY_MERGE_WINDOW_MS = Math.max(60_000, Number(process.env.DB_RECOVERY_MERGE_WINDOW_MS || 10 * 60_000) || 10 * 60_000)
+const DB_CIRCUIT_PROBE_INTERVAL_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_PROBE_INTERVAL_MS || 2_000) || 2_000)
 let dbCircuitOpenUntil = 0
 let dbLastFailureAt = 0
 let dbLastFailureMessage = ''
 let dbLastFailureLoggedAt = 0
+let dbLastProbeAt = 0
 
 function isDbCircuitOpen() {
   return Boolean(pool && Date.now() < dbCircuitOpenUntil)
+}
+
+async function probeDbAndMaybeCloseCircuit({ timeoutMs = 1500 } = {}) {
+  if (!pool) return false
+  const now = Date.now()
+  if (!isDbCircuitOpen()) return true
+  if (now - dbLastProbeAt < DB_CIRCUIT_PROBE_INTERVAL_MS) return false
+  dbLastProbeAt = now
+
+  // Best-effort probe: if Postgres is already back, close the circuit early so we stop serving
+  // "db_circuit_open" for the full cooldown window.
+  try {
+    await Promise.race([
+      pool.query('select 1 as ok'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('db probe timeout')), timeoutMs)),
+    ])
+    dbCircuitOpenUntil = 0
+    return true
+  } catch (error) {
+    // Do not extend circuit on probe failure here; recordDbFailure will extend when real queries fail.
+    return false
+  }
 }
 
 function isTransientDbConnectionError(error) {
@@ -759,7 +783,8 @@ app.get('/health', (_req, res) => res.json({ ok: true }))
 async function handleDbHealth(_req, res) {
   if (!pool) return res.status(503).json({ ok: false, dbReady: false, reason: 'DATABASE_URL not configured' })
   if (isDbCircuitOpen()) {
-    return res.status(503).json({ ok: false, dbReady: false, reason: 'db_circuit_open' })
+    const recovered = await probeDbAndMaybeCloseCircuit({ timeoutMs: 1200 })
+    if (!recovered) return res.status(503).json({ ok: false, dbReady: false, reason: 'db_circuit_open' })
   }
   try {
     await retry(
