@@ -9463,7 +9463,17 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         order by updated_at desc
         limit $1
       `
-    const res = await pool.query(query, params)
+    const res = await retry(
+      async () => {
+        try {
+          return await pool.query(query, params)
+        } catch (error) {
+          if (!isTransientDbConnectionError(error)) error.noRetry = true
+          throw error
+        }
+      },
+      { attempts: 6, delayMs: 1000 },
+    )
     const items = dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationSummary({
         sessionCode: row.session_code,
@@ -9598,6 +9608,9 @@ app.get('/api/admin/consultations', async (req, res) => {
     }
     return res.json({ items })
   } catch (error) {
+    if (isTransientDbConnectionError(error)) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation records' })
   }
 })
@@ -9613,6 +9626,9 @@ app.get('/api/admin/consultations/analytics', async (req, res) => {
     setCachedDashboardAnalytics(cacheKey, analytics)
     return res.json({ analytics })
   } catch (error) {
+    if (isTransientDbConnectionError(error)) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load dashboard analytics' })
   }
 })
@@ -12435,11 +12451,21 @@ function getStoredRoomByCode(code = '') {
 
 async function listAllConsultationDetails() {
   if (pool) {
-    const res = await pool.query(`
-      select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
-      from ti_sessions
-      order by updated_at desc
-    `)
+    const res = await retry(
+      async () => {
+        try {
+          return await pool.query(`
+            select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+            from ti_sessions
+            order by updated_at desc
+          `)
+        } catch (error) {
+          if (!isTransientDbConnectionError(error)) error.noRetry = true
+          throw error
+        }
+      },
+      { attempts: 6, delayMs: 1000 },
+    )
     return dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationDetail({
         sessionCode: row.session_code,
