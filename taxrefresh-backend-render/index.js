@@ -756,6 +756,31 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+app.get('/health/db', async (_req, res) => {
+  if (!pool) return res.status(503).json({ ok: false, dbReady: false, reason: 'DATABASE_URL not configured' })
+  if (isDbCircuitOpen()) {
+    return res.status(503).json({ ok: false, dbReady: false, reason: 'db_circuit_open' })
+  }
+  try {
+    await retry(
+      async () => {
+        try {
+          await pool.query('select 1 as ok')
+          return true
+        } catch (error) {
+          if (!isTransientDbConnectionError(error)) error.noRetry = true
+          throw error
+        }
+      },
+      { attempts: 3, delayMs: 800 },
+    )
+    return res.json({ ok: true, dbReady: true })
+  } catch (error) {
+    recordDbFailure('health db readiness check failed:', error, {})
+    return res.status(503).json({ ok: false, dbReady: false, reason: 'db_unavailable' })
+  }
+})
+
 function parseGoogleAddressComponents(components = []) {
   const list = Array.isArray(components) ? components : []
   const findPart = (type, mode = 'long_name') =>
