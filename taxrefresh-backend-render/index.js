@@ -120,6 +120,56 @@ if (pool) {
   // eslint-disable-next-line no-console
   ensureSchema(pool).catch((e) => console.error('DB schema init failed:', e))
 }
+
+// DB circuit-breaker to avoid hammering Postgres during Render restarts/maintenance windows.
+// This does NOT change any DB data; it only reduces repeated connection attempts/log spam and
+// keeps the app responsive by using the existing file-store fallback when possible.
+const DB_CIRCUIT_COOLDOWN_MS = Math.max(5_000, Number(process.env.DB_CIRCUIT_COOLDOWN_MS || 30_000) || 30_000)
+const DB_CIRCUIT_LOG_THROTTLE_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_LOG_THROTTLE_MS || 10_000) || 10_000)
+const DB_RECOVERY_MERGE_WINDOW_MS = Math.max(60_000, Number(process.env.DB_RECOVERY_MERGE_WINDOW_MS || 10 * 60_000) || 10 * 60_000)
+let dbCircuitOpenUntil = 0
+let dbLastFailureAt = 0
+let dbLastFailureMessage = ''
+let dbLastFailureLoggedAt = 0
+
+function isDbCircuitOpen() {
+  return Boolean(pool && Date.now() < dbCircuitOpenUntil)
+}
+
+function isTransientDbConnectionError(error) {
+  const message = String(error instanceof Error ? error.message : error || '').toLowerCase()
+  if (!message) return false
+  return (
+    message.includes('not yet accepting connections') ||
+    message.includes('terminating connection') ||
+    message.includes('connection terminated') ||
+    message.includes('connection refused') ||
+    message.includes('econnrefused') ||
+    message.includes('server closed the connection') ||
+    message.includes('timeout') ||
+    message.includes('etimedout')
+  )
+}
+
+function recordDbFailure(label, error, meta = {}) {
+  if (!pool) return
+  const message = String(error instanceof Error ? error.message : error || '')
+  const now = Date.now()
+  if (isTransientDbConnectionError(error)) {
+    dbCircuitOpenUntil = Math.max(dbCircuitOpenUntil, now + DB_CIRCUIT_COOLDOWN_MS)
+    dbLastFailureAt = now
+  }
+
+  // Throttle log spam: only log once per window unless the message changed.
+  const shouldLog =
+    !dbLastFailureLoggedAt ||
+    now - dbLastFailureLoggedAt > DB_CIRCUIT_LOG_THROTTLE_MS ||
+    (message && message !== dbLastFailureMessage)
+  if (!shouldLog) return
+  dbLastFailureLoggedAt = now
+  dbLastFailureMessage = message
+  console.error(label, { ...(meta || {}), message })
+}
 const fallbackSessions = new Map()
 let fallbackStoreLoaded = false
 let fallbackStoreLoadPromise = null
@@ -359,6 +409,7 @@ function getSessionBackupChecksum(payload = {}) {
 
 async function dbInsertSessionBackup({ sessionCode, contactId = '', opportunityId = '', state, previousState = null, reason = 'session_upsert' } = {}) {
   if (!pool) return false
+  if (isDbCircuitOpen()) return false
   const normalizedCode = String(sessionCode || '').trim()
   if (!normalizedCode) return false
 
@@ -378,17 +429,14 @@ async function dbInsertSessionBackup({ sessionCode, contactId = '', opportunityI
     )
     return true
   } catch (error) {
-    console.error('session backup insert failed:', {
-      sessionCode: normalizedCode,
-      reason: String(reason || 'session_upsert'),
-      message: error instanceof Error ? error.message : String(error || ''),
-    })
+    recordDbFailure('session backup insert failed:', error, { sessionCode: normalizedCode, reason: String(reason || 'session_upsert') })
     return false
   }
 }
 
 async function dbGetLatestSessionBackup(sessionCode = '') {
   if (!pool) return null
+  if (isDbCircuitOpen()) return null
   const normalizedCode = String(sessionCode || '').trim()
   if (!normalizedCode) return null
   try {
@@ -402,10 +450,7 @@ async function dbGetLatestSessionBackup(sessionCode = '') {
     )
     return res.rows?.[0] || null
   } catch (error) {
-    console.error('session backup lookup failed:', {
-      sessionCode: normalizedCode,
-      message: error instanceof Error ? error.message : String(error || ''),
-    })
+    recordDbFailure('session backup lookup failed:', error, { sessionCode: normalizedCode })
     return null
   }
 }
@@ -8884,25 +8929,35 @@ async function persistStripeCustomerIdForRoom(roomCode, room, customerId = '') {
 
 async function dbGetSession(code) {
   if (!pool) return fallbackGetSession(code)
+  if (isDbCircuitOpen()) return fallbackGetSession(code)
   try {
     for (const candidate of getCodeVariants(code)) {
       const res = await pool.query('select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at from ti_sessions where session_code=$1', [
         candidate,
       ])
-      if (res.rows[0]) return res.rows[0]
+      const row = res.rows[0]
+      if (row) {
+        // During short DB outages we may have persisted to the file store; when DB returns,
+        // prefer the most recently updated copy to avoid the UI "going backwards".
+        if (dbLastFailureAt && Date.now() - dbLastFailureAt < DB_RECOVERY_MERGE_WINDOW_MS) {
+          const fallback = await fallbackGetSession(code).catch(() => null)
+          const fallbackUpdatedAt = fallback?.updated_at ? new Date(fallback.updated_at).getTime() : 0
+          const dbUpdatedAt = row?.updated_at ? new Date(row.updated_at).getTime() : 0
+          if (fallback && fallbackUpdatedAt > dbUpdatedAt) return fallback
+        }
+        return row
+      }
     }
     return null
   } catch (error) {
-    console.error('dbGetSession failed, falling back to file store:', {
-      code: String(code || '').trim(),
-      message: error instanceof Error ? error.message : String(error || ''),
-    })
+    recordDbFailure('dbGetSession failed, falling back to file store:', error, { code: String(code || '').trim() })
     return fallbackGetSession(code)
   }
 }
 
 async function dbUpsertSession({ code, contactId = null, opportunityId = null, state }) {
   if (!pool) return fallbackUpsertSession({ code, contactId, opportunityId, state })
+  if (isDbCircuitOpen()) return fallbackUpsertSession({ code, contactId, opportunityId, state })
   try {
     const existing = await dbGetSession(code)
     const resolvedCode = String(existing?.session_code || code)
@@ -8929,16 +8984,14 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
     })
     invalidateDashboardAnalyticsCache()
   } catch (error) {
-    console.error('dbUpsertSession failed, falling back to file store:', {
-      code: String(code || '').trim(),
-      message: error instanceof Error ? error.message : String(error || ''),
-    })
+    recordDbFailure('dbUpsertSession failed, falling back to file store:', error, { code: String(code || '').trim() })
     await fallbackUpsertSession({ code, contactId, opportunityId, state })
   }
 }
 
 async function dbDeleteSession(code) {
   if (!pool) return fallbackDeleteSession(code)
+  if (isDbCircuitOpen()) return fallbackDeleteSession(code)
   try {
     const existing = await dbGetSession(code)
     if (!existing?.session_code) return false
@@ -8946,10 +8999,7 @@ async function dbDeleteSession(code) {
     invalidateDashboardAnalyticsCache()
     return true
   } catch (error) {
-    console.error('dbDeleteSession failed, falling back to file store:', {
-      code: String(code || '').trim(),
-      message: error instanceof Error ? error.message : String(error || ''),
-    })
+    recordDbFailure('dbDeleteSession failed, falling back to file store:', error, { code: String(code || '').trim() })
     return fallbackDeleteSession(code)
   }
 }
@@ -8966,6 +9016,19 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
     if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
     if (contactId) state.answers.ghl_contact_id = contactId
     await dbUpsertSession({ code, contactId, opportunityId, state })
+    return code
+  }
+  if (isDbCircuitOpen()) {
+    const existingCode =
+      (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
+      (contactId ? await fallbackFindSessionCode({ contactId }) : null)
+    if (existingCode) return existingCode
+    let code = generateSessionId()
+    while (await fallbackGetSession(code)) code = generateSessionId()
+    const state = initialRoomState()
+    if (opportunityId) state.answers.ghl_opportunity_id = opportunityId
+    if (contactId) state.answers.ghl_contact_id = contactId
+    await fallbackUpsertSession({ code, contactId, opportunityId, state })
     return code
   }
   try {
@@ -8986,10 +9049,9 @@ async function dbGetOrCreateSession({ contactId = '', opportunityId = '' } = {})
     await dbUpsertSession({ code, contactId, opportunityId, state })
     return code
   } catch (error) {
-    console.error('dbGetOrCreateSession failed, falling back to file store:', {
+    recordDbFailure('dbGetOrCreateSession failed, falling back to file store:', error, {
       contactId: String(contactId || '').trim(),
       opportunityId: String(opportunityId || '').trim(),
-      message: error instanceof Error ? error.message : String(error || ''),
     })
     const existingCode =
       (opportunityId ? await fallbackFindSessionCode({ opportunityId }) : null) ||
