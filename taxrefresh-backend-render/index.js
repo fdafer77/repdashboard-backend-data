@@ -48,6 +48,11 @@ const ADMIN_OWNER_PASSWORD_DEFAULTS = {
   'zach.risheq@taxrefresh.info': 'Rweg2F1&VCx2q^UNJ$eFZg',
 }
 const SESSION_STORE_PATH = path.resolve(process.env.SESSION_STORE_PATH || path.join(process.cwd(), '.data', 'sessions.json'))
+const OUTBOUND_EMAILS_DISABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.DISABLE_OUTBOUND_EMAILS || process.env.DISABLE_CLIENT_EMAILS || '').trim().toLowerCase(),
+)
+const OUTBOUND_8821_EMAILS_DISABLED = OUTBOUND_EMAILS_DISABLED || ['1', 'true', 'yes', 'on'].includes(String(process.env.DISABLE_8821_EMAILS || '').trim().toLowerCase())
+const INTEGRITY_REPAIR_WORKER_DISABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.DISABLE_RECORD_INTEGRITY_REPAIR_WORKER || '').trim().toLowerCase())
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_PUBLISHABLE_KEY = String(process.env.STRIPE_PUBLISHABLE_KEY || '').trim()
 const GOOGLE_PLACES_SERVER_API_KEY = String(
@@ -4756,6 +4761,7 @@ function buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }) 
 }
 
 async function sendSigned8821CopyEmail({ roomCode, room }) {
+  if (OUTBOUND_8821_EMAILS_DISABLED) return false
   const answers = room?.state?.answers || {}
   if (!isForm8821FullySigned(answers)) return false
   if (String(answers.signed_8821_client_emailed_at || '').trim()) return false
@@ -4851,11 +4857,13 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
     } else {
       room.state.answers.form8821_spouse_release_attempted_at = new Date().toISOString()
       try {
-        await releasePendingMfj8821SpouseEmail({
-          roomCode,
-          room,
-          senderEmail: String(room.state.answers.boldsign_8821_sender_email || '').trim(),
-        })
+        if (!OUTBOUND_EMAILS_DISABLED) {
+          await releasePendingMfj8821SpouseEmail({
+            roomCode,
+            room,
+            senderEmail: String(room.state.answers.boldsign_8821_sender_email || '').trim(),
+          })
+        }
       } catch (error) {
         room.state.answers.form8821_spouse_status = 'release_failed'
         room.state.answers.form8821_spouse_release_error = error instanceof Error ? error.message : 'Unable to release the spouse signing email.'
@@ -4901,9 +4909,11 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
       .catch((error) => {
         console.error('Signed 8821 storage failed:', error)
       })
-    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
-      console.error('Signed 8821 client email failed:', error)
-    })
+    if (!OUTBOUND_8821_EMAILS_DISABLED) {
+      void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
+        console.error('Signed 8821 client email failed:', error)
+      })
+    }
   }
   logMemoryDiagnostics('markBoldsign8821Completed:after-persist', {
     roomCode,
@@ -12050,6 +12060,9 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!['8821 Document', 'Resolution Documents'].includes(documentType)) {
       return res.status(400).json({ error: 'A supported document type is required.' })
     }
+    if (OUTBOUND_EMAILS_DISABLED) {
+      return res.status(503).json({ error: 'Outbound client emails are temporarily disabled.' })
+    }
 
     const room = await ensureRoom(roomCode)
     const item = await getConsultationRecordByCode(roomCode)
@@ -12332,6 +12345,9 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
   try {
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
+    if (OUTBOUND_EMAILS_DISABLED) {
+      return res.status(503).json({ error: 'Outbound client emails are temporarily disabled.' })
+    }
 
     const room = await ensureRoom(roomCode)
     const item = await getConsultationRecordByCode(roomCode)
@@ -13995,6 +14011,10 @@ server.listen(PORT, () => {
 
   // Background repair: rebuild missing billing, signed-document, and payment-method evidence
   // gradually without any manual UI action.
+  if (INTEGRITY_REPAIR_WORKER_DISABLED) {
+    console.log('Consultation integrity repair worker disabled by env flag.')
+    return
+  }
   try {
     startStripeBillingRestoreWorker()
   } catch (error) {
