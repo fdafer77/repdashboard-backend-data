@@ -897,6 +897,54 @@ async function restoreCriticalSessionDataFromBackupIfMissing({ roomCode, state, 
   return true
 }
 
+function getMissingCriticalAnswerKeys(answers = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.filter((key) => !hasMeaningfulSessionValue(sourceAnswers[key]))
+}
+
+function getRestorableCriticalAnswerKeys(currentAnswers = {}, backupAnswers = {}) {
+  const liveAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : {}
+  const sourceAnswers = backupAnswers && typeof backupAnswers === 'object' ? backupAnswers : {}
+  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.filter((key) => {
+    if (hasMeaningfulSessionValue(liveAnswers[key])) return false
+    return hasMeaningfulSessionValue(sourceAnswers[key])
+  })
+}
+
+function buildConsultationAnswersPreview(answers = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const billingSchedule = getBillingScheduleRowsFromAnswers(sourceAnswers)
+  const documentReceipts = Array.isArray(sourceAnswers.document_receipts)
+    ? sourceAnswers.document_receipts
+    : parseStoredObject(sourceAnswers.document_receipts, [])
+  const notes = Array.isArray(sourceAnswers.consultation_notes)
+    ? sourceAnswers.consultation_notes
+    : parseStoredObject(sourceAnswers.consultation_notes, [])
+  return {
+    clientName: String(getPrimaryAnswer(sourceAnswers, ['full_name', 'name', 'client_name', 'clientName']) || '').trim(),
+    email: String(getPrimaryAnswer(sourceAnswers, ['email', 'email_address']) || '').trim(),
+    phone: String(getPrimaryAnswer(sourceAnswers, ['phone', 'phone_number']) || '').trim(),
+    filingStatus: String(getPrimaryAnswer(sourceAnswers, ['filingStatus', 'filing_status']) || '').trim(),
+    onboardingStatus: String(sourceAnswers.onboarding_status || '').trim(),
+    form8821Status: String(sourceAnswers.form8821_status || '').trim(),
+    resolutionSignedAt: String(sourceAnswers.boldsign_resolution_signed_at || '').trim(),
+    stripeCustomerId: String(sourceAnswers.stripe_customer_id || '').trim(),
+    billingScheduleCount: billingSchedule.length,
+    documentReceiptCount: Array.isArray(documentReceipts) ? documentReceipts.length : 0,
+    noteCount: Array.isArray(notes) ? notes.length : 0,
+  }
+}
+
+function getConsultationSparsityFlags(answers = {}) {
+  const preview = buildConsultationAnswersPreview(answers)
+  return {
+    coreProfileSparse: !(preview.clientName || preview.email || preview.phone),
+    workflowSparse: !(preview.onboardingStatus || preview.form8821Status || preview.resolutionSignedAt),
+    billingSparse: !(preview.stripeCustomerId || preview.billingScheduleCount),
+    documentsSparse: preview.documentReceiptCount === 0,
+  }
+}
+
 function getDashboardAnalyticsCacheKey(account = null) {
   const designatedPosition = String(account?.designatedPosition || '').trim().toLowerCase()
   const email = String(account?.email || '').trim().toLowerCase()
@@ -10181,6 +10229,111 @@ app.get('/api/admin/diagnostics/data', async (req, res) => {
     return res.json({ ok: true, diagnostics })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load diagnostics' })
+  }
+})
+
+app.get('/api/admin/diagnostics/consultation/:code', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+
+    const diagnostics = {
+      requestedCode: roomCode,
+      codeVariants: getCodeVariants(roomCode),
+      dbReady: Boolean(pool) && !isDbCircuitOpen(),
+      sessionFound: false,
+      backupCount: 0,
+      sessionCode: '',
+      sessionUpdatedAt: '',
+      sessionCreatedAt: '',
+      currentAnswerStats: {
+        nonEmptyCriticalKeyCount: 0,
+        missingCriticalKeys: [],
+      },
+      currentPreview: null,
+      currentSparsity: null,
+      backupLatestAt: '',
+      backupAnswerStats: {
+        nonEmptyCriticalKeyCount: 0,
+        missingCriticalKeys: [],
+      },
+      backupPreview: null,
+      backupSparsity: null,
+      restorableKeys: [],
+      likelyBlankRecord: false,
+    }
+
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.', diagnostics })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open', diagnostics })
+
+    const variantList = diagnostics.codeVariants
+    const [sessionRes, backupCountRes, latestBackupRes] = await Promise.all([
+      pool.query(
+        `select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+         from ti_sessions
+         where session_code = any($1::text[])
+         order by updated_at desc
+         limit 1`,
+        [variantList],
+      ),
+      pool.query(
+        `select count(*)::int as backup_count
+         from ti_session_backups
+         where session_code = any($1::text[])`,
+        [variantList],
+      ),
+      pool.query(
+        `select session_code, payload, created_at
+         from ti_session_backups
+         where session_code = any($1::text[])
+         order by created_at desc
+         limit 1`,
+        [variantList],
+      ),
+    ])
+
+    const row = sessionRes.rows?.[0] || null
+    const latestBackup = latestBackupRes.rows?.[0] || null
+    diagnostics.backupCount = backupCountRes.rows?.[0]?.backup_count ?? 0
+
+    if (row) {
+      diagnostics.sessionFound = true
+      diagnostics.sessionCode = String(row.session_code || '').trim()
+      diagnostics.sessionUpdatedAt = row.updated_at ? new Date(row.updated_at).toISOString() : ''
+      diagnostics.sessionCreatedAt = row.created_at ? new Date(row.created_at).toISOString() : ''
+      const currentAnswers = row.state?.answers && typeof row.state.answers === 'object' ? row.state.answers : {}
+      const missingCriticalKeys = getMissingCriticalAnswerKeys(currentAnswers)
+      diagnostics.currentAnswerStats.nonEmptyCriticalKeyCount = SESSION_BACKUP_RESTORE_ANSWER_KEYS.length - missingCriticalKeys.length
+      diagnostics.currentAnswerStats.missingCriticalKeys = missingCriticalKeys
+      diagnostics.currentPreview = buildConsultationAnswersPreview(currentAnswers)
+      diagnostics.currentSparsity = getConsultationSparsityFlags(currentAnswers)
+    }
+
+    if (latestBackup?.payload?.answers && typeof latestBackup.payload.answers === 'object') {
+      const backupAnswers = latestBackup.payload.answers
+      const missingBackupKeys = getMissingCriticalAnswerKeys(backupAnswers)
+      diagnostics.backupLatestAt = latestBackup.created_at ? new Date(latestBackup.created_at).toISOString() : ''
+      diagnostics.backupAnswerStats.nonEmptyCriticalKeyCount = SESSION_BACKUP_RESTORE_ANSWER_KEYS.length - missingBackupKeys.length
+      diagnostics.backupAnswerStats.missingCriticalKeys = missingBackupKeys
+      diagnostics.backupPreview = buildConsultationAnswersPreview(backupAnswers)
+      diagnostics.backupSparsity = getConsultationSparsityFlags(backupAnswers)
+      diagnostics.restorableKeys = getRestorableCriticalAnswerKeys(row?.state?.answers || {}, backupAnswers)
+    }
+
+    diagnostics.likelyBlankRecord = Boolean(
+      diagnostics.sessionFound &&
+        diagnostics.currentSparsity &&
+        diagnostics.currentSparsity.coreProfileSparse &&
+        diagnostics.currentSparsity.workflowSparse,
+    )
+
+    return res.json({ ok: true, diagnostics })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load consultation diagnostics' })
   }
 })
 
