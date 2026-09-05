@@ -918,6 +918,49 @@ async function dbGetLatestSessionBackup(sessionCode = '') {
   }
 }
 
+function getCriticalAnswerCoverageScore(answers = {}, currentAnswers = null) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const liveAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : null
+  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.reduce((total, key) => {
+    if (!hasMeaningfulSessionValue(sourceAnswers[key])) return total
+    if (liveAnswers && hasMeaningfulSessionValue(liveAnswers[key])) return total
+    return total + 1
+  }, 0)
+}
+
+async function dbGetBestSessionBackup(sessionCode = '', currentAnswers = {}) {
+  if (!pool) return null
+  if (isDbCircuitOpen()) return null
+  const normalizedCode = String(sessionCode || '').trim()
+  if (!normalizedCode) return null
+  try {
+    const res = await pool.query(
+      `select payload, created_at
+         from ti_session_backups
+        where session_code = $1
+        order by created_at desc
+        limit 250`,
+      [normalizedCode],
+    )
+    const rows = Array.isArray(res.rows) ? res.rows : []
+    let best = null
+    let bestScore = 0
+    for (const row of rows) {
+      const backupAnswers = row?.payload?.answers
+      if (!backupAnswers || typeof backupAnswers !== 'object') continue
+      const score = getCriticalAnswerCoverageScore(backupAnswers, currentAnswers)
+      if (score > bestScore) {
+        best = row
+        bestScore = score
+      }
+    }
+    return bestScore > 0 ? best : null
+  } catch (error) {
+    recordDbFailure('session best-backup lookup failed:', error, { sessionCode: normalizedCode })
+    return null
+  }
+}
+
 function restoreCriticalAnswersFromBackup(currentAnswers = {}, backupAnswers = {}) {
   const nextAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : {}
   const sourceAnswers = backupAnswers && typeof backupAnswers === 'object' ? backupAnswers : {}
@@ -939,8 +982,8 @@ async function restoreCriticalSessionDataFromBackupIfMissing({ roomCode, state, 
   if (!normalizedRoomCode) return false
   const roomState = state && typeof state === 'object' ? state : initialRoomState()
   const answers = roomState.answers && typeof roomState.answers === 'object' ? roomState.answers : {}
-  const latestBackup = await dbGetLatestSessionBackup(normalizedRoomCode)
-  const backupAnswers = latestBackup?.payload?.answers
+  const bestBackup = await dbGetBestSessionBackup(normalizedRoomCode, answers)
+  const backupAnswers = bestBackup?.payload?.answers
   if (!backupAnswers || typeof backupAnswers !== 'object') return false
 
   const changed = restoreCriticalAnswersFromBackup(answers, backupAnswers)
