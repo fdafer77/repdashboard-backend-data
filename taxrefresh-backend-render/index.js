@@ -5608,6 +5608,14 @@ async function boldsignFetch(path, { method = 'GET', query, body } = {}) {
   if (query) {
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === '') continue
+      if (Array.isArray(value)) {
+        value.forEach((entry) => {
+          const normalized = String(entry ?? '').trim()
+          if (!normalized) return
+          url.searchParams.append(key, normalized)
+        })
+        continue
+      }
       url.searchParams.set(key, String(value))
     }
   }
@@ -5733,6 +5741,90 @@ async function getBoldsignDocumentProperties(documentId, { onBehalfOf } = {}) {
   })
 }
 
+const BOLDSIGN_SEARCH_CACHE_MS = 6 * 60 * 60 * 1000
+
+function hasFreshBoldsignSearchCheck(value = '') {
+  const normalized = String(value || '').trim()
+  if (!normalized) return false
+  const timestamp = new Date(normalized).getTime()
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return false
+  return Date.now() - timestamp < BOLDSIGN_SEARCH_CACHE_MS
+}
+
+async function boldsignListDocuments({
+  page = 1,
+  pageSize = 50,
+  status = [],
+  recipients = [],
+  sentBy = [],
+  searchKey = '',
+} = {}) {
+  const normalizedPage = Math.max(1, Number(page) || 1)
+  const normalizedPageSize = Math.max(1, Math.min(100, Number(pageSize) || 50))
+  return boldsignFetch('v1/document/list', {
+    query: {
+      Page: normalizedPage,
+      PageSize: normalizedPageSize,
+      ...(Array.isArray(status) && status.length ? { Status: status } : {}),
+      ...(Array.isArray(recipients) && recipients.length ? { Recipients: recipients } : {}),
+      ...(Array.isArray(sentBy) && sentBy.length ? { SentBy: sentBy } : {}),
+      ...(String(searchKey || '').trim() ? { SearchKey: String(searchKey || '').trim() } : {}),
+    },
+  })
+}
+
+function boldsignRecordHasSignerEmail(record, targetEmail = '') {
+  const normalizedTarget = String(targetEmail || '').trim().toLowerCase()
+  if (!normalizedTarget) return false
+  const signers = Array.isArray(record?.signerDetails) ? record.signerDetails : []
+  return signers.some((signer) => String(signer?.signerEmail || '').trim().toLowerCase() === normalizedTarget)
+}
+
+async function findBoldsignCompletedDocumentIdViaSearch({
+  clientEmail = '',
+  kind = 'resolution',
+  senderEmail = '',
+} = {}) {
+  const normalizedEmail = String(clientEmail || '').trim().toLowerCase()
+  if (!normalizedEmail) return ''
+
+  const sentBy = String(senderEmail || '').trim()
+  const titleNeedles =
+    kind === 'resolution'
+      ? [/resolution/i, /2848/i]
+      : [
+          /8821/i,
+          /\bred\b/i,
+          /service\s*agreement/i,
+          /\bagreement\b/i,
+        ]
+
+  const candidatePages = [1, 2]
+  for (const page of candidatePages) {
+    const payload = await boldsignListDocuments({
+      page,
+      status: ['Completed'],
+      recipients: [normalizedEmail],
+      ...(sentBy ? { sentBy: [sentBy] } : {}),
+      searchKey: normalizedEmail,
+    }).catch(() => null)
+
+    const results = Array.isArray(payload?.result) ? payload.result : []
+    for (const record of results) {
+      const status = String(record?.status || record?.displayStatus || '').trim().toLowerCase()
+      if (status !== 'completed') continue
+      if (!boldsignRecordHasSignerEmail(record, normalizedEmail)) continue
+      const title = String(record?.messageTitle || '').trim()
+      if (!title) continue
+      if (!titleNeedles.some((regex) => regex.test(title))) continue
+      const documentId = String(record?.documentId || '').trim()
+      if (documentId) return documentId
+    }
+  }
+
+  return ''
+}
+
 const BOLDSIGN_RECONCILE_CACHE_MS = 5 * 60 * 1000
 
 function hasFreshBoldsignReconcileCheck(value = '') {
@@ -5746,7 +5838,22 @@ function hasFreshBoldsignReconcileCheck(value = '') {
 async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
-  const documentId = String(answers.boldsign_8821_document_id || '').trim()
+  let documentId = String(answers.boldsign_8821_document_id || '').trim()
+  if (!documentId) {
+    const searchStampKey = 'boldsign_8821_search_last_checked_at'
+    if (!hasFreshBoldsignSearchCheck(answers?.[searchStampKey])) {
+      answers[searchStampKey] = new Date().toISOString()
+      const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+      const senderEmail = String(answers.boldsign_8821_sender_email || '').trim()
+      const found = await findBoldsignCompletedDocumentIdViaSearch({ clientEmail, kind: '8821', senderEmail }).catch(() => '')
+      if (found) {
+        answers.boldsign_8821_document_id = found
+        documentId = found
+      }
+      roomState.answers = answers
+      await persist(roomState)
+    }
+  }
   if (!documentId) return false
   if (isForm8821FullySigned(answers)) return false
   if (hasFreshBoldsignReconcileCheck(answers.boldsign_8821_last_checked_at)) return false
@@ -5782,7 +5889,22 @@ async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
 async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
-  const documentId = String(answers.boldsign_resolution_document_id || '').trim()
+  let documentId = String(answers.boldsign_resolution_document_id || '').trim()
+  if (!documentId) {
+    const searchStampKey = 'boldsign_resolution_search_last_checked_at'
+    if (!hasFreshBoldsignSearchCheck(answers?.[searchStampKey])) {
+      answers[searchStampKey] = new Date().toISOString()
+      const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+      const senderEmail = String(answers.boldsign_resolution_sender_email || answers.boldsign_8821_sender_email || '').trim()
+      const found = await findBoldsignCompletedDocumentIdViaSearch({ clientEmail, kind: 'resolution', senderEmail }).catch(() => '')
+      if (found) {
+        answers.boldsign_resolution_document_id = found
+        documentId = found
+      }
+      roomState.answers = answers
+      await persist(roomState)
+    }
+  }
   if (!documentId) return false
   if (String(answers.boldsign_resolution_signed_at || '').trim()) return false
   if (hasFreshBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at)) return false
