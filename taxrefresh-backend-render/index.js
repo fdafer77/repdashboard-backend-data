@@ -1162,12 +1162,23 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
           .map((row) => (row?.payload && typeof row.payload === 'object' ? { ...row.payload } : null))
           .filter(Boolean),
       )
+    const existingAllRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.billing_schedule, []))
+    const existingInvestigationRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.investigation_billing_schedule, []))
+    const existingResolutionRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.resolution_billing_schedule, []))
     const allRows = normalizeProjectedRows('all')
     const investigationRows = normalizeProjectedRows('investigation')
     const resolutionRows = normalizeProjectedRows('resolution')
-    nextAnswers.billing_schedule = allRows.length ? allRows : mergeUniqueBillingScheduleRows(investigationRows, resolutionRows)
-    nextAnswers.investigation_billing_schedule = investigationRows
-    nextAnswers.resolution_billing_schedule = resolutionRows
+    const mergedInvestigationRows = mergeUniqueBillingScheduleRows(existingInvestigationRows, investigationRows)
+    const mergedResolutionRows = mergeUniqueBillingScheduleRows(existingResolutionRows, resolutionRows)
+    const mergedAllRows = mergeUniqueBillingScheduleRows(
+      existingAllRows,
+      allRows.length ? allRows : [],
+      mergedInvestigationRows,
+      mergedResolutionRows,
+    )
+    nextAnswers.billing_schedule = mergedAllRows
+    nextAnswers.investigation_billing_schedule = mergedInvestigationRows
+    nextAnswers.resolution_billing_schedule = mergedResolutionRows
   }
 
   if (profile) {
