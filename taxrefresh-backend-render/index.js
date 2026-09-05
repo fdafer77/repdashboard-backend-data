@@ -5005,6 +5005,21 @@ function hasStoredPaymentMethodOnFile(answers = {}) {
   )
 }
 
+function hasActiveCancellationRequestStatus(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  if (
+    normalized.includes('requesting cancellation') ||
+    normalized.includes('cancellation requested') ||
+    normalized.includes('pending cancellation') ||
+    normalized === 'cancelled' ||
+    normalized === 'canceled'
+  ) {
+    return true
+  }
+  return false
+}
+
 function formatMonthLabel(monthKey = '') {
   if (!/^\d{4}-\d{2}$/.test(monthKey)) return monthKey
   const [year, month] = monthKey.split('-')
@@ -13450,7 +13465,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
     const cancellationStatus = String(room?.state?.answers?.cancellation_request_status || '').trim().toLowerCase()
-    if (cancellationStatus.includes('cancel')) {
+    if (hasActiveCancellationRequestStatus(cancellationStatus)) {
       return res.status(409).json({ error: 'This record is marked as requesting cancellation. Payments are disabled.' })
     }
     const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
@@ -14957,7 +14972,7 @@ function buildConsultationAnalytics(items = [], account = null) {
       const cancellationStatus = String(getPrimaryAnswer(answers, ['cancellation_request_status']) || '')
         .trim()
         .toLowerCase()
-      const isCancellationRequested = cancellationStatus.includes('cancel')
+      const isCancellationRequested = hasActiveCancellationRequestStatus(cancellationStatus)
       const investigationDocumentsSigned = hasSignedPendingRevenueDocuments(answers)
       const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
       const hasStoredPaymentMethod = hasStoredPaymentMethodOnFile(answers)
