@@ -7193,8 +7193,10 @@ function buildStateFromGhlOpportunity(room, opportunity, pipelineNameById, stage
       ghl_last_status_change_at: String(opportunity?.lastStatusChangeAt || ''),
       ghl_last_stage_change_at: String(opportunity?.lastStageChangeAt || ''),
       ghl_calendar_events: stringifyStructuredValue(calendarEvents, '[]'),
-      name: String(existingAnswers.name || existingAnswers.full_name || '').trim() || contactName,
-      full_name: String(existingAnswers.full_name || existingAnswers.name || '').trim() || contactName,
+      name: String(existingAnswers.name || existingAnswers.full_name || existingAnswers.client_name || existingAnswers.clientName || '').trim() || contactName,
+      full_name: String(existingAnswers.full_name || existingAnswers.name || existingAnswers.client_name || existingAnswers.clientName || '').trim() || contactName,
+      client_name: String(existingAnswers.client_name || existingAnswers.clientName || existingAnswers.full_name || existingAnswers.name || '').trim() || contactName,
+      clientName: String(existingAnswers.clientName || existingAnswers.client_name || existingAnswers.full_name || existingAnswers.name || '').trim() || contactName,
       email: contactEmail || String(existingAnswers.email || existingAnswers.email_address || ''),
       email_address: contactEmail || String(existingAnswers.email_address || existingAnswers.email || ''),
       phone: contactPhone || String(existingAnswers.phone || existingAnswers.phone_number || ''),
@@ -7349,7 +7351,7 @@ function buildConsultationSummary(record) {
   const recordUpdatedAt = record?.updatedAt ? new Date(record.updatedAt).getTime() : 0
   const updatedAtRaw = Math.max(stateUpdatedAt, recordUpdatedAt)
   const createdAtRaw = record?.createdAt ? new Date(record.createdAt).getTime() : 0
-  const clientName = getPrimaryAnswer(answers, ['full_name', 'name']) || 'Unnamed client'
+  const clientName = getPrimaryAnswer(answers, ['full_name', 'name', 'client_name', 'clientName']) || 'Unnamed client'
   const email = getPrimaryAnswer(answers, ['email', 'email_address'])
   const phone = getPrimaryAnswer(answers, ['phone', 'phone_number'])
   const clientState = String(getPrimaryAnswer(answers, ['mailing_state', 'mailingState', 'state', 'stateCode', 'expenseState']) || '').trim()
