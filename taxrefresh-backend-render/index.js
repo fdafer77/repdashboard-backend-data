@@ -10545,7 +10545,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
         })
       },
     })
-    const item = attachSmsThreadToConsultationDetail(buildConsultationDetail({
+    const item = await attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
       opportunityId: row.ghl_opportunity_id,
