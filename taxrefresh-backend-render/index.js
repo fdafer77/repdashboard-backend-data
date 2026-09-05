@@ -12717,6 +12717,53 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
   }
 })
 
+app.post('/api/admin/consultations/:code/documents/refresh', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
+
+    const room = await ensureRoom(roomCode)
+    if (String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
+      const currentItem = await getConsultationRecordByCode(roomCode)
+      if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+        return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+      }
+    }
+
+    const answers = room?.state?.answers && typeof room.state.answers === 'object' ? room.state.answers : {}
+    answers.boldsign_8821_last_checked_at = ''
+    answers.boldsign_resolution_last_checked_at = ''
+    room.state.answers = answers
+
+    await repairConsultationRecordIntegrity({
+      roomCode,
+      state: room.state,
+      persist: async (nextState) => {
+        room.state = nextState && typeof nextState === 'object' ? nextState : room.state
+        await dbUpsertSession({
+          code: roomCode,
+          contactId: room.contactId || null,
+          opportunityId: room.opportunityId || null,
+          state: room.state,
+        })
+      },
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({
+      ok: true,
+      item,
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }),
+    })
+  } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to refresh document statuses' })
+  }
+})
+
 app.post('/api/session/:code/release-spouse-document-email', async (req, res) => {
   try {
     const roomCode = String(req.params.code || '').toUpperCase().trim()
