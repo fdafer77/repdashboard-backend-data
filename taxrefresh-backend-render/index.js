@@ -228,6 +228,334 @@ async function dbInsertEvent({
   }
 }
 
+function buildSnapshotMeta({ source = 'db', updatedAt } = {}) {
+  const normalizedSource = String(source || '').trim() || 'unknown'
+  const updatedMs = updatedAt ? new Date(updatedAt).getTime() : Date.now()
+  const safeUpdatedMs = Number.isFinite(updatedMs) ? updatedMs : Date.now()
+  return {
+    dbReady: Boolean(pool) && !isDbCircuitOpen(),
+    source: normalizedSource,
+    updatedAt: new Date(safeUpdatedMs).toISOString(),
+    snapshotVersion: safeUpdatedMs,
+  }
+}
+
+function buildSnapshotMetaFromItems(items = [], { source = 'db' } = {}) {
+  const maxUpdatedMs = (Array.isArray(items) ? items : []).reduce((maxValue, item) => {
+    const candidate = new Date(item?.updatedAt || item?.createdAt || 0).getTime()
+    if (!Number.isFinite(candidate)) return maxValue
+    return Math.max(maxValue, candidate)
+  }, 0)
+  return buildSnapshotMeta({ source, updatedAt: maxUpdatedMs || Date.now() })
+}
+
+function buildDeterministicId(prefix, seed = '') {
+  const normalizedPrefix = String(prefix || 'id').trim() || 'id'
+  const normalizedSeed = String(seed || '').trim()
+  const digest = crypto.createHash('sha256').update(`${normalizedPrefix}:${normalizedSeed}`).digest('hex').slice(0, 24)
+  return `${normalizedPrefix}_${digest}`
+}
+
+function normalizeConsultationNotesValue(value) {
+  const list = parseStoredObject(value, [])
+  if (!Array.isArray(list)) return []
+  return list
+    .filter((note) => note && typeof note === 'object')
+    .map((note) => ({
+      id: String(note.id || '').trim(),
+      title: String(note.title || '').trim(),
+      content: String(note.content || '').trim(),
+      author: String(note.author || '').trim(),
+      ownerKey: String(note.ownerKey || '').trim(),
+      archived: Boolean(note.archived),
+      createdAt: String(note.createdAt || '').trim(),
+      updatedAt: String(note.updatedAt || '').trim(),
+    }))
+    .filter((note) => note.id && (note.title || note.content))
+}
+
+async function dbUpsertNoteRecord({ sessionCode, note, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode || !note?.id) return false
+  const createdAt = note.createdAt ? new Date(note.createdAt) : new Date()
+  const updatedAt = note.updatedAt ? new Date(note.updatedAt) : new Date()
+  const archivedAt = note.archived ? new Date(note.updatedAt || Date.now()) : null
+  const body = JSON.stringify({
+    title: note.title,
+    content: note.content,
+    author: note.author,
+    ownerKey: note.ownerKey,
+  })
+  try {
+    await pool.query(
+      `
+      insert into ti_notes(note_id, session_code, body, created_at, updated_at, archived_at, actor_email)
+      values ($1, $2, $3, $4, $5, $6, $7)
+      on conflict (note_id) do update
+        set session_code = excluded.session_code,
+            body = excluded.body,
+            created_at = least(ti_notes.created_at, excluded.created_at),
+            updated_at = excluded.updated_at,
+            archived_at = excluded.archived_at,
+            actor_email = excluded.actor_email
+    `,
+      [
+        note.id,
+        normalizedSessionCode,
+        body,
+        Number.isNaN(createdAt.getTime()) ? new Date() : createdAt,
+        Number.isNaN(updatedAt.getTime()) ? new Date() : updatedAt,
+        archivedAt && !Number.isNaN(archivedAt.getTime()) ? archivedAt : null,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_notes upsert failed:', error, { sessionCode: normalizedSessionCode, noteId: note.id })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbArchiveNoteRecord({ sessionCode, noteId, actorEmail = '', archivedAt = null } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedNoteId = String(noteId || '').trim()
+  if (!normalizedSessionCode || !normalizedNoteId) return false
+  const at = archivedAt ? new Date(archivedAt) : new Date()
+  try {
+    await pool.query(
+      `
+      update ti_notes
+        set archived_at = $1,
+            updated_at = $1,
+            actor_email = $2
+      where session_code = $3 and note_id = $4
+    `,
+      [Number.isNaN(at.getTime()) ? new Date() : at, String(actorEmail || '').trim() || null, normalizedSessionCode, normalizedNoteId],
+    )
+  } catch (error) {
+    recordDbFailure('ti_notes archive failed:', error, { sessionCode: normalizedSessionCode, noteId: normalizedNoteId })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbSyncConsultationNotes({ sessionCode, previousNotes = [], nextNotes = [], actorEmail = '', requestId = '' } = {}) {
+  const before = normalizeConsultationNotesValue(previousNotes)
+  const after = normalizeConsultationNotesValue(nextNotes)
+  const previousById = new Map(before.map((note) => [note.id, note]))
+  const nextById = new Map(after.map((note) => [note.id, note]))
+
+  for (const note of after) {
+    const prev = previousById.get(note.id) || null
+    await dbUpsertNoteRecord({ sessionCode, note, actorEmail })
+
+    let eventType = ''
+    if (!prev) eventType = 'note_created'
+    else if (Boolean(prev.archived) !== Boolean(note.archived)) eventType = note.archived ? 'note_archived' : 'note_restored'
+    else if (prev.title !== note.title || prev.content !== note.content) eventType = 'note_updated'
+
+    if (eventType) {
+      const ok = await dbInsertEvent({
+        sessionCode,
+        eventType,
+        domain: 'notes',
+        actorEmail,
+        requestId,
+        payload: { noteId: note.id, title: note.title, archived: Boolean(note.archived), at: new Date().toISOString() },
+      })
+      if (!ok && STRICT_DB_MODE) throw new Error(`Failed to insert ${eventType} event.`)
+    }
+  }
+
+  for (const prev of before) {
+    if (nextById.has(prev.id)) continue
+    await dbArchiveNoteRecord({ sessionCode, noteId: prev.id, actorEmail, archivedAt: new Date().toISOString() })
+    const ok = await dbInsertEvent({
+      sessionCode,
+      eventType: 'note_archived',
+      domain: 'notes',
+      actorEmail,
+      requestId,
+      payload: { noteId: prev.id, title: prev.title, archived: true, at: new Date().toISOString(), reason: 'removed_from_session_notes' },
+    })
+    if (!ok && STRICT_DB_MODE) throw new Error('Failed to insert note_archived event.')
+  }
+}
+
+function normalizeDocumentReceiptValue(value) {
+  if (!value || typeof value !== 'object') return null
+  const name = String(value.name || '').trim()
+  if (!name) return null
+  const sentAt = String(value.sentAt || value.sent_at || '').trim()
+  const signedAt = String(value.signedAt || value.signed_at || '').trim()
+  return {
+    id: String(value.id || '').trim(),
+    name,
+    documentCode: String(value.documentCode || value.document_code || '').trim(),
+    status: String(value.status || '').trim(),
+    method: String(value.method || '').trim(),
+    recipientEmail: String(value.recipientEmail || value.recipient_email || '').trim(),
+    sentAt,
+    signedAt,
+    payload: value && typeof value === 'object' ? value : { value },
+  }
+}
+
+function normalizeDocumentReceiptsValue(value) {
+  const list = parseStoredObject(value, [])
+  if (!Array.isArray(list)) return []
+  return list.map((entry) => normalizeDocumentReceiptValue(entry)).filter(Boolean)
+}
+
+async function dbUpsertDocumentReceiptRecord({ sessionCode, receipt, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode || !receipt?.name) return false
+  const receiptId = receipt.id || buildDeterministicId('receipt', `${normalizedSessionCode}:${buildStoredDocumentReceiptKey(receipt)}`)
+  const sentAt = receipt.sentAt ? new Date(receipt.sentAt) : null
+  const signedAt = receipt.signedAt ? new Date(receipt.signedAt) : null
+  const now = new Date()
+  try {
+    await pool.query(
+      `
+      insert into ti_document_receipts(
+        receipt_id, session_code, name, document_code, status, method, recipient_email,
+        sent_at, signed_at, payload, created_at, updated_at, actor_email
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      on conflict (receipt_id) do update
+        set session_code = excluded.session_code,
+            name = excluded.name,
+            document_code = excluded.document_code,
+            status = excluded.status,
+            method = excluded.method,
+            recipient_email = excluded.recipient_email,
+            sent_at = coalesce(excluded.sent_at, ti_document_receipts.sent_at),
+            signed_at = coalesce(excluded.signed_at, ti_document_receipts.signed_at),
+            payload = excluded.payload,
+            updated_at = excluded.updated_at,
+            actor_email = excluded.actor_email
+    `,
+      [
+        receiptId,
+        normalizedSessionCode,
+        receipt.name,
+        receipt.documentCode || '',
+        receipt.status || '',
+        receipt.method || '',
+        receipt.recipientEmail || '',
+        sentAt && !Number.isNaN(sentAt.getTime()) ? sentAt : null,
+        signedAt && !Number.isNaN(signedAt.getTime()) ? signedAt : null,
+        receipt.payload && typeof receipt.payload === 'object' ? receipt.payload : { value: receipt.payload },
+        now,
+        now,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_document_receipts upsert failed:', error, { sessionCode: normalizedSessionCode, receiptName: receipt.name })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbSyncDocumentReceiptsFromAnswers({ sessionCode, answers, actorEmail = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return
+  const receipts = normalizeDocumentReceiptsValue(answers?.document_receipts)
+  if (!receipts.length) return
+  for (const receipt of receipts) {
+    await dbUpsertDocumentReceiptRecord({ sessionCode: normalizedSessionCode, receipt, actorEmail })
+  }
+}
+
+async function adminPersistRoomStateAndLog({
+  req,
+  roomCode,
+  room,
+  patches = [],
+  eventType = '',
+  domain = '',
+  actorEmail = '',
+  payload = {},
+  previousNotes = null,
+  nextNotes = null,
+} = {}) {
+  if (!req) throw new Error('req is required')
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode) throw new Error('roomCode is required')
+  if (!room) throw new Error('room is required')
+
+  await persistRoomState(normalizedRoomCode, room, patches)
+
+  const ok = await dbInsertEvent({
+    sessionCode: normalizedRoomCode,
+    eventType,
+    domain,
+    actorEmail,
+    requestId: getRequestId(req),
+    payload,
+  })
+  if (!ok && STRICT_DB_MODE) throw new Error(`Failed to insert ${String(eventType || 'event')} event.`)
+
+  if (previousNotes !== null || nextNotes !== null) {
+    await dbSyncConsultationNotes({
+      sessionCode: normalizedRoomCode,
+      previousNotes: previousNotes || [],
+      nextNotes: nextNotes || [],
+      actorEmail,
+      requestId: getRequestId(req),
+    })
+  }
+}
+
 function recordDbFailure(label, error, meta = {}) {
   if (!pool) return
   const message = String(error instanceof Error ? error.message : error || '')
@@ -8950,6 +9278,12 @@ async function persistRoomState(roomCode, room, patches = []) {
   })
   if (patches.length) io.to(roomCode).emit('room_state', room.state)
   await schedulePersistRoomState(roomCode, room)
+
+  // If document receipts were updated, also persist a durable projection to ti_document_receipts.
+  // This prevents "receipts vanished" feelings due to mixed sources or session overwrites.
+  if (patches.some((patch) => patch?.type === 'setAnswer' && String(patch?.questionId || '').trim() === 'document_receipts')) {
+    await dbSyncDocumentReceiptsFromAnswers({ sessionCode: roomCode, answers: room?.state?.answers || {}, actorEmail: '' })
+  }
 }
 
 function schedulePersistRoomState(roomCode, room) {
@@ -9878,7 +10212,8 @@ app.get('/api/admin/consultations', async (req, res) => {
     if (String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
       items = items.filter((item) => canEnrolledAgentAccessItem(item, req.adminUser))
     }
-    return res.json({ items })
+    const snapshot = buildSnapshotMetaFromItems(items, { source: Boolean(pool) && !isDbCircuitOpen() ? 'db' : 'fallback' })
+    return res.json({ items, snapshot })
   } catch (error) {
     if (isTransientDbConnectionError(error)) {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
@@ -9892,11 +10227,16 @@ app.get('/api/admin/consultations/analytics', async (req, res) => {
   try {
     const cacheKey = getDashboardAnalyticsCacheKey(req.adminUser || null)
     const cachedAnalytics = getCachedDashboardAnalytics(cacheKey)
-    if (cachedAnalytics) return res.json({ analytics: cachedAnalytics })
+    if (cachedAnalytics) {
+      return res.json({ analytics: cachedAnalytics, snapshot: buildSnapshotMeta({ source: Boolean(pool) && !isDbCircuitOpen() ? 'db' : 'fallback', updatedAt: Date.now() }) })
+    }
     const items = await listAllConsultationDetails()
     const analytics = buildConsultationAnalytics(items, req.adminUser || null)
     setCachedDashboardAnalytics(cacheKey, analytics)
-    return res.json({ analytics })
+    return res.json({
+      analytics,
+      snapshot: buildSnapshotMetaFromItems(items, { source: Boolean(pool) && !isDbCircuitOpen() ? 'db' : 'fallback' }),
+    })
   } catch (error) {
     if (isTransientDbConnectionError(error)) {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
@@ -10039,7 +10379,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
     if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
       return res.status(403).json({ error: 'You do not have access to this consultation record.' })
     }
-    return res.json({ item })
+    return res.json({ item, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: row.updated_at || item?.updatedAt || null }) })
   } catch (error) {
     if (error?.isTransientDb) {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
@@ -10510,6 +10850,7 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
     }
     const nextValue = req.body?.value
     const normalizedValue = nextValue === null || nextValue === undefined ? '' : nextValue
+    const previousNotes = answerKey === 'consultation_notes' ? room.state.answers?.consultation_notes : null
     room.state.answers[answerKey] = normalizedValue
     mirrorAnswerAliases(room.state.answers, answerKey, normalizedValue)
     if (answerKey === 'name' || answerKey === 'full_name') {
@@ -10526,46 +10867,40 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
       room.state.answers.name = fullName
       room.state.answers.full_name = fullName
     }
-    room.state.updatedAt = Date.now()
-
-    io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: answerKey, value: room.state.answers[answerKey] },
-      updatedAt: room.state.updatedAt,
-    })
+    const patches = [{ type: 'setAnswer', questionId: answerKey, value: room.state.answers[answerKey] }]
     if (answerKey === 'name' || answerKey === 'full_name') {
-      io.to(roomCode).emit('room_patch', {
-        patch: { type: 'setAnswer', questionId: 'name', value: room.state.answers.name },
-        updatedAt: room.state.updatedAt,
-      })
-      io.to(roomCode).emit('room_patch', {
-        patch: { type: 'setAnswer', questionId: 'full_name', value: room.state.answers.full_name },
-        updatedAt: room.state.updatedAt,
-      })
-    }
-    io.to(roomCode).emit('room_state', room.state)
-
-    try {
-      await dbUpsertSession({ code: roomCode, state: room.state })
-    } catch {
-      // ignore; record will still update in-memory
+      patches.push({ type: 'setAnswer', questionId: 'name', value: room.state.answers.name })
+      patches.push({ type: 'setAnswer', questionId: 'full_name', value: room.state.answers.full_name })
+      patches.push({ type: 'setAnswer', questionId: 'first_name', value: room.state.answers.first_name })
+      patches.push({ type: 'setAnswer', questionId: 'last_name', value: room.state.answers.last_name })
+    } else if (answerKey === 'first_name' || answerKey === 'last_name') {
+      patches.push({ type: 'setAnswer', questionId: 'name', value: room.state.answers.name })
+      patches.push({ type: 'setAnswer', questionId: 'full_name', value: room.state.answers.full_name })
     }
 
-    void dbInsertEvent({
-      sessionCode: roomCode,
+    await adminPersistRoomStateAndLog({
+      req,
+      roomCode,
+      room,
+      patches,
       eventType: 'answer_updated',
       domain: 'answers',
       actorEmail: String(req.adminUser?.email || ''),
-      requestId: getRequestId(req),
       payload: {
         key: answerKey,
         valuePreview: typeof normalizedValue === 'string' ? normalizedValue.slice(0, 200) : normalizedValue,
         at: new Date().toISOString(),
       },
+      previousNotes,
+      nextNotes: answerKey === 'consultation_notes' ? room.state.answers?.consultation_notes : null,
     })
 
     const item = await getConsultationRecordByCode(roomCode)
-    return res.json({ ok: true, item })
+    return res.json({ ok: true, item, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update consultation field' })
   }
 })
@@ -10612,41 +10947,33 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
       room.state.answers.billing_invoice_created_at = room.state.answers[invoiceCreatedAtFieldKey]
       room.state.answers.billing_schedule = schedule
     }
-    room.state.updatedAt = Date.now()
-
-    io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: invoiceAmountFieldKey, value: room.state.answers[invoiceAmountFieldKey] },
-      updatedAt: room.state.updatedAt,
-    })
-    io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: invoiceCreatedAtFieldKey, value: room.state.answers[invoiceCreatedAtFieldKey] },
-      updatedAt: room.state.updatedAt,
-    })
-    io.to(roomCode).emit('room_patch', {
-      patch: { type: 'setAnswer', questionId: scheduleFieldKey, value: room.state.answers[scheduleFieldKey] },
-      updatedAt: room.state.updatedAt,
-    })
+    const patches = [
+      { type: 'setAnswer', questionId: invoiceAmountFieldKey, value: room.state.answers[invoiceAmountFieldKey] },
+      { type: 'setAnswer', questionId: invoiceCreatedAtFieldKey, value: room.state.answers[invoiceCreatedAtFieldKey] },
+      { type: 'setAnswer', questionId: scheduleFieldKey, value: room.state.answers[scheduleFieldKey] },
+    ]
     if (billingMode === 'investigation') {
-      io.to(roomCode).emit('room_patch', {
-        patch: { type: 'setAnswer', questionId: 'billing_invoice_amount', value: room.state.answers.billing_invoice_amount },
-        updatedAt: room.state.updatedAt,
-      })
-      io.to(roomCode).emit('room_patch', {
-        patch: { type: 'setAnswer', questionId: 'billing_invoice_created_at', value: room.state.answers.billing_invoice_created_at },
-        updatedAt: room.state.updatedAt,
-      })
-      io.to(roomCode).emit('room_patch', {
-        patch: { type: 'setAnswer', questionId: 'billing_schedule', value: room.state.answers.billing_schedule },
-        updatedAt: room.state.updatedAt,
-      })
+      patches.push({ type: 'setAnswer', questionId: 'billing_invoice_amount', value: room.state.answers.billing_invoice_amount })
+      patches.push({ type: 'setAnswer', questionId: 'billing_invoice_created_at', value: room.state.answers.billing_invoice_created_at })
+      patches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: room.state.answers.billing_schedule })
     }
-    io.to(roomCode).emit('room_state', room.state)
 
-    try {
-      await dbUpsertSession({ code: roomCode, state: room.state })
-    } catch (error) {
-      return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to persist billing adjustments' })
-    }
+    await adminPersistRoomStateAndLog({
+      req,
+      roomCode,
+      room,
+      patches,
+      eventType: 'billing_updated',
+      domain: 'billing',
+      actorEmail: String(req.adminUser?.email || ''),
+      payload: {
+        billingMode,
+        invoiceAmount,
+        invoiceCreatedAt,
+        scheduleLength: Array.isArray(schedule) ? schedule.length : 0,
+        at: new Date().toISOString(),
+      },
+    })
 
     // Immutable audit trail of billing edits (so invoice dates/amounts/schedules can be recovered).
     void dbInsertBillingAudit({
@@ -10666,24 +10993,12 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
       },
     })
 
-    void dbInsertEvent({
-      sessionCode: roomCode,
-      eventType: 'billing_updated',
-      domain: 'billing',
-      actorEmail: String(req.adminUser?.email || ''),
-      requestId: getRequestId(req),
-      payload: {
-        billingMode,
-        invoiceAmount,
-        invoiceCreatedAt,
-        scheduleLength: Array.isArray(schedule) ? schedule.length : 0,
-        at: new Date().toISOString(),
-      },
-    })
-
     const item = await getConsultationRecordByCode(roomCode)
-    return res.json({ ok: true, item })
+    return res.json({ ok: true, item, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update billing adjustments' })
   }
 })
@@ -10761,7 +11076,21 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
     }
 
     room.state.answers = nextAnswers
-    await persistRoomState(roomCode, room, persistPatches)
+    await adminPersistRoomStateAndLog({
+      req,
+      roomCode,
+      room,
+      patches: persistPatches,
+      eventType: 'payment_marked_processed',
+      domain: 'billing',
+      actorEmail,
+      payload: {
+        scheduledDate: normalizedDate,
+        scheduledAmount,
+        updatedCount,
+        at: nowIso,
+      },
+    })
     void dbInsertBillingAudit({
       sessionCode: roomCode,
       eventType: 'payment_marked_processed',
@@ -10775,8 +11104,11 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
       },
     })
     const item = await getConsultationRecordByCode(roomCode)
-    return res.json({ ok: true, item, updatedCount })
+    return res.json({ ok: true, item, updatedCount, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to mark payment processed' })
   }
 })
@@ -10893,7 +11225,7 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
     })
 
     const item = await getConsultationRecordByCode(roomCode)
-    void dbInsertEvent({
+    const eventOk = await dbInsertEvent({
       sessionCode: roomCode,
       eventType: 'payment_recorded_manual',
       domain: 'billing',
@@ -10909,8 +11241,12 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
         at: nowIso,
       },
     })
-    return res.json({ ok: true, item, updatedCount, appended })
+    if (!eventOk && STRICT_DB_MODE) throw new Error('Failed to insert payment_recorded_manual event.')
+    return res.json({ ok: true, item, updatedCount, appended, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to record manual payment' })
   }
 })
@@ -11008,7 +11344,7 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
         at: new Date().toISOString(),
       },
     })
-    void dbInsertEvent({
+    const eventOk = await dbInsertEvent({
       sessionCode: roomCode,
       eventType: 'payment_method_attached',
       domain: 'billing',
@@ -11022,9 +11358,13 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
         at: new Date().toISOString(),
       },
     })
+    if (!eventOk && STRICT_DB_MODE) throw new Error('Failed to insert payment_method_attached event.')
     const item = await getConsultationRecordByCode(roomCode)
-    return res.json({ ok: true, item, paymentMethod: nextMethod })
+    return res.json({ ok: true, item, paymentMethod: nextMethod, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to attach Stripe payment method' })
   }
 })
@@ -11622,7 +11962,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
         processedAt: rows[targetScheduleIndex]?.processedAt || new Date().toISOString(),
       },
     })
-    void dbInsertEvent({
+    const eventOk = await dbInsertEvent({
       sessionCode: roomCode,
       eventType: 'payment_processed',
       domain: 'billing',
@@ -11640,8 +11980,9 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
         processedAt: rows[targetScheduleIndex]?.processedAt || new Date().toISOString(),
       },
     })
+    if (!eventOk && STRICT_DB_MODE) throw new Error('Failed to insert payment_processed event.')
     const item = await getConsultationRecordByCode(roomCode)
-    return res.json({ ok: true, item, paymentIntentId: intent.id, status: intent.status })
+    return res.json({ ok: true, item, paymentIntentId: intent.id, status: intent.status, snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }) })
   } catch (error) {
     const roomCode = String(req.params.code || '').trim()
     const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
@@ -11949,7 +12290,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
       updatedAt: room.state?.updatedAt || Date.now(),
     })
     emitDashboardRecordsUpdated({ reason: 'document_sent', sessionCode: roomCode })
-    void dbInsertEvent({
+    const eventOk = await dbInsertEvent({
       sessionCode: roomCode,
       eventType: 'document_email_sent',
       domain: 'documents',
@@ -11962,12 +12303,14 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         sentAt,
       },
     })
+    if (!eventOk && STRICT_DB_MODE) throw new Error('Failed to insert document_email_sent event.')
     return res.json({
       ok: true,
       item: refreshedItem,
       sentAt,
       link: documentType === '8821 Document' ? links.form8821ClientLink : links.clientPortalLink,
       spouseLink: documentType === '8821 Document' && spouseRecipientEmail ? links.form8821SpouseLink : '',
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: room?.state?.updatedAt || Date.now() }),
     })
   } catch (error) {
     if (error?.boldsign) {
@@ -12047,7 +12390,7 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
       updatedAt: room.state?.updatedAt || Date.now(),
     })
     emitDashboardRecordsUpdated({ reason: 'spouse_document_released', sessionCode: roomCode })
-    void dbInsertEvent({
+    const eventOk = await dbInsertEvent({
       sessionCode: roomCode,
       eventType: 'document_email_released_spouse',
       domain: 'documents',
@@ -12059,12 +12402,14 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
         spouseStatus: answers.form8821_spouse_status || '',
       },
     })
+    if (!eventOk && STRICT_DB_MODE) throw new Error('Failed to insert document_email_released_spouse event.')
     return res.json({
       ok: true,
       item: refreshedItem,
       sentAt: releaseResult.sentAt || answers.form8821_spouse_released_at || '',
       spouseRecipientEmail: releaseResult.recipientEmail || answers.spouse_email || '',
       spouseLink: releaseResult.signingUrl || '',
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: room?.state?.updatedAt || Date.now() }),
     })
   } catch (error) {
     try {
@@ -12082,8 +12427,11 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
           { type: 'setAnswer', questionId: 'form8821_spouse_release_attempted_at', value: answers.form8821_spouse_release_attempted_at || '' },
         ])
       }
-    } catch {
-      // ignore persistence failures during error handling
+    } catch (persistError) {
+      console.error('Failed to persist spouse release error state:', persistError instanceof Error ? persistError.message : String(persistError || ''))
+    }
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
     }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to release spouse document email.' })
   }

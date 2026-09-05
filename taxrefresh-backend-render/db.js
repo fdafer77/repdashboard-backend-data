@@ -108,4 +108,43 @@ export async function ensureSchema(pool) {
   await pool.query(
     `create unique index if not exists ti_events_session_code_idempotency_key_uq on ti_events(session_code, idempotency_key) where idempotency_key is not null;`,
   )
+
+  // Notes as first-class durable records (instead of only being embedded in session JSON).
+  await pool.query(`
+    create table if not exists ti_notes (
+      note_id text primary key,
+      session_code text not null,
+      body text not null default '',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      archived_at timestamptz,
+      actor_email text
+    );
+  `)
+  await pool.query(`create index if not exists ti_notes_session_code_idx on ti_notes(session_code);`)
+  await pool.query(`create index if not exists ti_notes_session_code_updated_at_idx on ti_notes(session_code, updated_at desc);`)
+  await pool.query(`create index if not exists ti_notes_session_code_archived_at_idx on ti_notes(session_code, archived_at);`)
+
+  // Document receipts as first-class durable records (instead of only embedded in session JSON).
+  await pool.query(`
+    create table if not exists ti_document_receipts (
+      receipt_id text primary key,
+      session_code text not null,
+      name text not null default '',
+      document_code text not null default '',
+      status text not null default '',
+      method text not null default '',
+      recipient_email text not null default '',
+      sent_at timestamptz,
+      signed_at timestamptz,
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      actor_email text
+    );
+  `)
+  await pool.query(`create index if not exists ti_document_receipts_session_code_idx on ti_document_receipts(session_code);`)
+  await pool.query(
+    `create index if not exists ti_document_receipts_session_code_updated_at_idx on ti_document_receipts(session_code, updated_at desc);`,
+  )
 }
