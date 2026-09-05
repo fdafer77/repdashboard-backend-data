@@ -12736,18 +12736,32 @@ app.post('/api/admin/consultations/:code/documents/refresh', async (req, res) =>
     answers.boldsign_resolution_last_checked_at = ''
     room.state.answers = answers
 
-    await repairConsultationRecordIntegrity({
+    const persistState = async (nextState) => {
+      room.state = nextState && typeof nextState === 'object' ? nextState : room.state
+      await dbUpsertSession({
+        code: roomCode,
+        contactId: room.contactId || null,
+        opportunityId: room.opportunityId || null,
+        state: room.state,
+      })
+    }
+
+    const normalized8821 = normalizePersistedSigned8821State(answers)
+    const normalizedResolution = normalizePersistedResolutionSignedState(answers)
+    if (normalized8821 || normalizedResolution) {
+      room.state.answers = answers
+    }
+    await persistState(room.state)
+
+    await reconcileBoldsign8821Status({
       roomCode,
       state: room.state,
-      persist: async (nextState) => {
-        room.state = nextState && typeof nextState === 'object' ? nextState : room.state
-        await dbUpsertSession({
-          code: roomCode,
-          contactId: room.contactId || null,
-          opportunityId: room.opportunityId || null,
-          state: room.state,
-        })
-      },
+      persist: persistState,
+    })
+    await reconcileBoldsignResolutionStatus({
+      roomCode,
+      state: room.state,
+      persist: persistState,
     })
 
     const item = await getConsultationRecordByCode(roomCode)
