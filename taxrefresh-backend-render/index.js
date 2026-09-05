@@ -123,7 +123,9 @@ const pool = getPool()
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null
 if (pool) {
   // eslint-disable-next-line no-console
-  ensureSchema(pool).catch((e) => console.error('DB schema init failed:', e))
+  ensureSchema(pool)
+    .then(() => seedConsultationDurableProjectionBackfill().catch((error) => console.error('Durable projection backfill failed:', error)))
+    .catch((e) => console.error('DB schema init failed:', e))
 }
 
 // DB circuit-breaker to avoid hammering Postgres during Render restarts/maintenance windows.
@@ -133,6 +135,10 @@ const DB_CIRCUIT_COOLDOWN_MS = Math.max(5_000, Number(process.env.DB_CIRCUIT_COO
 const DB_CIRCUIT_LOG_THROTTLE_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_LOG_THROTTLE_MS || 10_000) || 10_000)
 const DB_RECOVERY_MERGE_WINDOW_MS = Math.max(60_000, Number(process.env.DB_RECOVERY_MERGE_WINDOW_MS || 10 * 60_000) || 10 * 60_000)
 const DB_CIRCUIT_PROBE_INTERVAL_MS = Math.max(1_000, Number(process.env.DB_CIRCUIT_PROBE_INTERVAL_MS || 2_000) || 2_000)
+const CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT = Math.max(
+  100,
+  Number(process.env.CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT || 5000) || 5000,
+)
 // When enabled, the backend refuses to write to the local file-store fallback.
 // This prevents the system from "appearing to save" while Postgres is unavailable,
 // which is a major source of data trust issues.
@@ -442,6 +448,775 @@ function normalizeDocumentReceiptsValue(value) {
   const list = parseStoredObject(value, [])
   if (!Array.isArray(list)) return []
   return list.map((entry) => normalizeDocumentReceiptValue(entry)).filter(Boolean)
+}
+
+function normalizeConsultationProfileProjection(answers = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const fullName = String(getPrimaryAnswer(sourceAnswers, ['full_name', 'name', 'client_name', 'clientName']) || '').trim()
+  const derivedName = deriveNameParts(fullName)
+  const firstName = String(getPrimaryAnswer(sourceAnswers, ['first_name', 'firstName']) || derivedName.firstName || '').trim()
+  const lastName = String(getPrimaryAnswer(sourceAnswers, ['last_name', 'lastName']) || derivedName.lastName || '').trim()
+  const addressLine1 = String(
+    getPrimaryAnswer(sourceAnswers, ['mailing_address', 'mailingAddress', 'mailing_street', 'mailingStreet', 'address', 'street', 'address1']) || '',
+  ).trim()
+  const city = String(getPrimaryAnswer(sourceAnswers, ['mailing_city', 'mailingCity', 'city']) || '').trim()
+  const stateCode = String(getPrimaryAnswer(sourceAnswers, ['mailing_state', 'mailingState', 'state', 'stateCode', 'expenseState', 'client_state']) || '').trim()
+  const postalCode = String(getPrimaryAnswer(sourceAnswers, ['mailing_zip', 'mailingZip', 'zip', 'zipCode', 'postalCode']) || '').trim()
+  const spouseFirstName = String(getPrimaryAnswer(sourceAnswers, ['spouse_first_name', 'spouseFirstName']) || '').trim()
+  const spouseLastName = String(getPrimaryAnswer(sourceAnswers, ['spouse_last_name', 'spouseLastName']) || '').trim()
+  const spouseFullName = String(
+    getPrimaryAnswer(sourceAnswers, ['spouse_full_name', 'spouseFullName', 'spouse_name']) || [spouseFirstName, spouseLastName].filter(Boolean).join(' '),
+  ).trim()
+  return {
+    clientName: fullName,
+    firstName,
+    lastName,
+    email: String(getPrimaryAnswer(sourceAnswers, ['email', 'email_address']) || '').trim(),
+    phone: String(getPrimaryAnswer(sourceAnswers, ['phone', 'phone_number']) || '').trim(),
+    addressLine1,
+    city,
+    stateCode,
+    postalCode,
+    mailingAddress: [addressLine1, city, stateCode, postalCode].filter(Boolean).join(', '),
+    dateOfBirth: String(
+      getPrimaryAnswer(sourceAnswers, ['dob', 'date_of_birth', 'birthdate', 'birth_date', 'birthDate', 'client_dob', 'clientDob', 'client_birthdate']) || '',
+    ).trim(),
+    ssn: String(getPrimaryAnswer(sourceAnswers, ['ssn', 'client_ssn', 'taxpayer_ssn']) || '').trim(),
+    spouseFullName,
+    spouseFirstName,
+    spouseLastName,
+    spouseEmail: String(getPrimaryAnswer(sourceAnswers, ['spouse_email', 'spouseEmail']) || '').trim(),
+    spousePhone: String(getPrimaryAnswer(sourceAnswers, ['spouse_phone', 'spousePhone']) || '').trim(),
+    spouseDateOfBirth: String(getPrimaryAnswer(sourceAnswers, ['spouse_dob', 'spouseDob', 'spouse_date_of_birth', 'spouseBirthDate']) || '').trim(),
+    spouseSsn: String(getPrimaryAnswer(sourceAnswers, ['spouse_ssn', 'spouseSsn']) || '').trim(),
+  }
+}
+
+function normalizeConsultationCaseFactsProjection(answers = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const rawIrsBalance = getPrimaryAnswer(sourceAnswers, ['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount'])
+  const rawStateBalance = getPrimaryAnswer(sourceAnswers, ['stateBalance', 'state_balance', 'stateTaxBalance', 'state_tax_balance'])
+  const rawDirectLiability = getPrimaryAnswer(
+    sourceAnswers,
+    ['taxLiability', 'tax_liability', 'totalLiability', 'total_liability', 'ghl_liability_value', 'ghl_opportunity_value'],
+  )
+  const irsBalance = toNumberValue(rawIrsBalance)
+  const stateBalance = toNumberValue(rawStateBalance)
+  const directLiability = toNumberValue(rawDirectLiability)
+  const hasIrsBalance = hasMeaningfulSessionValue(rawIrsBalance) || irsBalance > 0
+  const hasStateBalance = hasMeaningfulSessionValue(rawStateBalance) || stateBalance > 0
+  const hasTotalLiability = hasMeaningfulSessionValue(rawDirectLiability) || hasIrsBalance || hasStateBalance
+  return {
+    taxType: String(getPrimaryAnswer(sourceAnswers, ['taxType', 'tax_type', 'type', 'taxTypeValue', 'tax_type_value']) || '').trim(),
+    taxAgency: String(getPrimaryAnswer(sourceAnswers, ['oweWho', 'owe', 'owe_who', 'taxAgency', 'tax_agency']) || '').trim(),
+    taxSituation: String(getPrimaryAnswer(sourceAnswers, ['taxSituation', 'tax_situation', 'situation']) || '').trim(),
+    filingStatus: String(getPrimaryAnswer(sourceAnswers, ['filingStatus', 'filing_status', 'tax_filing_status']) || '').trim(),
+    irsBalance: hasIrsBalance ? String(irsBalance) : '',
+    stateBalance: hasStateBalance ? String(stateBalance) : '',
+    totalLiability: hasTotalLiability ? String(Math.max(0, irsBalance + stateBalance, directLiability)) : '',
+    oweYears: String(
+      getPrimaryAnswer(sourceAnswers, ['oweYears', 'owe_years', 'years', 'yearsUnfiled', 'years_unfiled', 'tax_years_owed', 'years_unfiled_or_owed']) || '',
+    ).trim(),
+  }
+}
+
+function normalizeConsultationFinancialProfileProjection(answers = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const payloadValue = parseStoredObject(sourceAnswers?.client_portal_financial_profile_payload, null)
+  const draftValue = parseStoredObject(sourceAnswers?.client_portal_financial_profile_draft, null)
+  const payload = payloadValue && typeof payloadValue === 'object' && !Array.isArray(payloadValue) ? safeJsonClone(payloadValue) : null
+  const draftPayload = draftValue && typeof draftValue === 'object' && !Array.isArray(draftValue) ? safeJsonClone(draftValue) : null
+  const rawComplete = sourceAnswers?.client_portal_financial_profile_complete
+  const normalizedComplete = String(rawComplete ?? '').trim().toLowerCase()
+  const profileComplete = rawComplete === true || ['1', 'true', 'yes', 'complete', 'completed'].includes(normalizedComplete) || Boolean(payload?.profile_complete)
+  const rawStep = Number(sourceAnswers?.client_portal_financial_profile_step || 0)
+  const currentStep = Number.isFinite(rawStep) ? Math.max(0, Math.round(rawStep)) : 0
+  const rawCompletionPercent = Number(sourceAnswers?.client_portal_financial_profile_completion_percent ?? (profileComplete ? 100 : 0))
+  const completionPercent = Number.isFinite(rawCompletionPercent) ? Math.max(0, Math.min(100, rawCompletionPercent)) : profileComplete ? 100 : 0
+  const rawMonthlyIncome = payload?.totals?.monthly_income
+  const rawMonthlyExpenses = payload?.totals?.monthly_expenses
+  const rawMonthlyNet = payload?.totals?.monthly_net
+  const rawTotalAssets = payload?.totals?.total_assets
+  return {
+    profileComplete,
+    currentStep,
+    stepLabel: String(sourceAnswers?.client_portal_financial_profile_step_label || (profileComplete ? 'Completed' : '')).trim(),
+    completionPercent: Number(completionPercent.toFixed(2)),
+    employmentStatus: String(payload?.employment_status || draftPayload?.employment || '').trim(),
+    filingStatus: String(payload?.filing_status || payload?.filingStatus || draftPayload?.fields?.filingStatus || '').trim(),
+    monthlyIncome: hasMeaningfulSessionValue(rawMonthlyIncome) ? String(toNumberValue(rawMonthlyIncome)) : '',
+    monthlyExpenses: hasMeaningfulSessionValue(rawMonthlyExpenses) ? String(toNumberValue(rawMonthlyExpenses)) : '',
+    monthlyNet: hasMeaningfulSessionValue(rawMonthlyNet) ? String(toNumberValue(rawMonthlyNet)) : '',
+    totalAssets: hasMeaningfulSessionValue(rawTotalAssets) ? String(toNumberValue(rawTotalAssets)) : '',
+    lastSavedAt: String(sourceAnswers?.client_portal_financial_profile_last_saved_at || draftPayload?.savedAt || payload?.savedAt || '').trim(),
+    payload: payload || {},
+    draftPayload: draftPayload || null,
+  }
+}
+
+function hasConsultationFinancialProfileProjectionData(projection = {}) {
+  const source = projection && typeof projection === 'object' ? projection : {}
+  if (source.profileComplete) return true
+  if (Number(source.currentStep || 0) > 0) return true
+  if (Number(source.completionPercent || 0) > 0) return true
+  if (hasMeaningfulSessionValue(source.stepLabel)) return true
+  if (hasMeaningfulSessionValue(source.employmentStatus)) return true
+  if (hasMeaningfulSessionValue(source.filingStatus)) return true
+  if (hasMeaningfulSessionValue(source.monthlyIncome)) return true
+  if (hasMeaningfulSessionValue(source.monthlyExpenses)) return true
+  if (hasMeaningfulSessionValue(source.monthlyNet)) return true
+  if (hasMeaningfulSessionValue(source.totalAssets)) return true
+  if (hasMeaningfulSessionValue(source.lastSavedAt)) return true
+  if (source.payload && typeof source.payload === 'object' && Object.keys(source.payload).length > 0) return true
+  if (source.draftPayload && typeof source.draftPayload === 'object' && Object.keys(source.draftPayload).length > 0) return true
+  return false
+}
+
+async function dbUpsertConsultationProfileProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const profile = normalizeConsultationProfileProjection(answers)
+  try {
+    await pool.query(
+      `
+      insert into ti_consultation_profiles(
+        session_code, ghl_contact_id, ghl_opportunity_id, client_name, email, phone,
+        state_code, postal_code, date_of_birth, ssn, payload, created_at, updated_at, actor_email
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now(),$12)
+      on conflict (session_code) do update
+        set ghl_contact_id = coalesce(excluded.ghl_contact_id, ti_consultation_profiles.ghl_contact_id),
+            ghl_opportunity_id = coalesce(excluded.ghl_opportunity_id, ti_consultation_profiles.ghl_opportunity_id),
+            client_name = excluded.client_name,
+            email = excluded.email,
+            phone = excluded.phone,
+            state_code = excluded.state_code,
+            postal_code = excluded.postal_code,
+            date_of_birth = excluded.date_of_birth,
+            ssn = excluded.ssn,
+            payload = excluded.payload,
+            updated_at = now(),
+            actor_email = excluded.actor_email
+    `,
+      [
+        normalizedSessionCode,
+        String(contactId || '').trim() || null,
+        String(opportunityId || '').trim() || null,
+        profile.clientName,
+        profile.email,
+        profile.phone,
+        profile.stateCode,
+        profile.postalCode,
+        profile.dateOfBirth,
+        profile.ssn,
+        profile,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_consultation_profiles upsert failed:', error, { sessionCode: normalizedSessionCode })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbUpsertConsultationCaseFactsProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const caseFacts = normalizeConsultationCaseFactsProjection(answers)
+  try {
+    await pool.query(
+      `
+      insert into ti_consultation_case_facts(
+        session_code, ghl_contact_id, ghl_opportunity_id, tax_type, tax_agency, tax_situation,
+        filing_status, irs_balance, state_balance, total_liability, owe_years, payload, created_at, updated_at, actor_email
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now(),$13)
+      on conflict (session_code) do update
+        set ghl_contact_id = coalesce(excluded.ghl_contact_id, ti_consultation_case_facts.ghl_contact_id),
+            ghl_opportunity_id = coalesce(excluded.ghl_opportunity_id, ti_consultation_case_facts.ghl_opportunity_id),
+            tax_type = excluded.tax_type,
+            tax_agency = excluded.tax_agency,
+            tax_situation = excluded.tax_situation,
+            filing_status = excluded.filing_status,
+            irs_balance = excluded.irs_balance,
+            state_balance = excluded.state_balance,
+            total_liability = excluded.total_liability,
+            owe_years = excluded.owe_years,
+            payload = excluded.payload,
+            updated_at = now(),
+            actor_email = excluded.actor_email
+    `,
+      [
+        normalizedSessionCode,
+        String(contactId || '').trim() || null,
+        String(opportunityId || '').trim() || null,
+        caseFacts.taxType,
+        caseFacts.taxAgency,
+        caseFacts.taxSituation,
+        caseFacts.filingStatus,
+        hasMeaningfulSessionValue(caseFacts.irsBalance) ? toNumberValue(caseFacts.irsBalance) : null,
+        hasMeaningfulSessionValue(caseFacts.stateBalance) ? toNumberValue(caseFacts.stateBalance) : null,
+        hasMeaningfulSessionValue(caseFacts.totalLiability) ? toNumberValue(caseFacts.totalLiability) : null,
+        caseFacts.oweYears,
+        caseFacts,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_consultation_case_facts upsert failed:', error, { sessionCode: normalizedSessionCode })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbUpsertConsultationFinancialProfileProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const financialProfile = normalizeConsultationFinancialProfileProjection(answers)
+  if (!hasConsultationFinancialProfileProjectionData(financialProfile)) return false
+  const lastSavedAt = financialProfile.lastSavedAt ? new Date(financialProfile.lastSavedAt) : null
+  try {
+    await pool.query(
+      `
+      insert into ti_consultation_financial_profiles(
+        session_code, ghl_contact_id, ghl_opportunity_id, profile_complete, current_step, step_label,
+        completion_percent, employment_status, filing_status, monthly_income, monthly_expenses,
+        monthly_net, total_assets, last_saved_at, payload, draft_payload, created_at, updated_at, actor_email
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now(),$17)
+      on conflict (session_code) do update
+        set ghl_contact_id = coalesce(excluded.ghl_contact_id, ti_consultation_financial_profiles.ghl_contact_id),
+            ghl_opportunity_id = coalesce(excluded.ghl_opportunity_id, ti_consultation_financial_profiles.ghl_opportunity_id),
+            profile_complete = excluded.profile_complete,
+            current_step = excluded.current_step,
+            step_label = excluded.step_label,
+            completion_percent = excluded.completion_percent,
+            employment_status = excluded.employment_status,
+            filing_status = excluded.filing_status,
+            monthly_income = excluded.monthly_income,
+            monthly_expenses = excluded.monthly_expenses,
+            monthly_net = excluded.monthly_net,
+            total_assets = excluded.total_assets,
+            last_saved_at = coalesce(excluded.last_saved_at, ti_consultation_financial_profiles.last_saved_at),
+            payload = excluded.payload,
+            draft_payload = excluded.draft_payload,
+            updated_at = now(),
+            actor_email = excluded.actor_email
+    `,
+      [
+        normalizedSessionCode,
+        String(contactId || '').trim() || null,
+        String(opportunityId || '').trim() || null,
+        Boolean(financialProfile.profileComplete),
+        Math.max(0, Number(financialProfile.currentStep || 0)),
+        financialProfile.stepLabel,
+        Number(financialProfile.completionPercent || 0),
+        financialProfile.employmentStatus,
+        financialProfile.filingStatus,
+        hasMeaningfulSessionValue(financialProfile.monthlyIncome) ? toNumberValue(financialProfile.monthlyIncome) : null,
+        hasMeaningfulSessionValue(financialProfile.monthlyExpenses) ? toNumberValue(financialProfile.monthlyExpenses) : null,
+        hasMeaningfulSessionValue(financialProfile.monthlyNet) ? toNumberValue(financialProfile.monthlyNet) : null,
+        hasMeaningfulSessionValue(financialProfile.totalAssets) ? toNumberValue(financialProfile.totalAssets) : null,
+        lastSavedAt && !Number.isNaN(lastSavedAt.getTime()) ? lastSavedAt : null,
+        financialProfile.payload && typeof financialProfile.payload === 'object' ? financialProfile.payload : {},
+        financialProfile.draftPayload && typeof financialProfile.draftPayload === 'object' ? financialProfile.draftPayload : null,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_consultation_financial_profiles upsert failed:', error, { sessionCode: normalizedSessionCode })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbSyncConsultationDurableFields({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  await dbUpsertConsultationProfileProjection({
+    sessionCode: normalizedSessionCode,
+    contactId,
+    opportunityId,
+    answers: sourceAnswers,
+    actorEmail,
+  })
+  await dbUpsertConsultationCaseFactsProjection({
+    sessionCode: normalizedSessionCode,
+    contactId,
+    opportunityId,
+    answers: sourceAnswers,
+    actorEmail,
+  })
+  await dbUpsertConsultationFinancialProfileProjection({
+    sessionCode: normalizedSessionCode,
+    contactId,
+    opportunityId,
+    answers: sourceAnswers,
+    actorEmail,
+  })
+}
+
+function buildBillingProjectionStatusLabel(row = {}) {
+  const tone = getBillingStatusTone(row)
+  const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
+  const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < getTodayBillingDateValue()
+  if (tone === 'processed') return 'Processed'
+  if (tone === 'failed') return 'Failed'
+  return isPastDuePending ? 'Past due' : 'Pending'
+}
+
+function buildConsultationBillingProjectionRows({ sessionCode, contactId = '', opportunityId = '', answers = {} } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return []
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const scopedSchedules = [
+    { scope: 'all', rows: getBillingScheduleRowsFromAnswers(sourceAnswers) },
+    { scope: 'investigation', rows: getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'investigation') },
+    { scope: 'resolution', rows: getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'resolution') },
+  ]
+  const rowCounts = new Map()
+  const projectionRows = []
+  scopedSchedules.forEach(({ scope, rows }) => {
+    normalizeBillingScheduleRows(Array.isArray(rows) ? rows : []).forEach((inputRow, rowIndex) => {
+      const payload = {
+        ...(inputRow && typeof inputRow === 'object' ? inputRow : {}),
+        date: normalizeBillingDateValue(inputRow?.date || getBillingProcessedAtValue(inputRow) || ''),
+        amount: inputRow?.amount ?? '',
+        status: String(inputRow?.status || '').trim(),
+        failureReason: String(inputRow?.failureReason || '').trim(),
+        processorReason: String(inputRow?.processorReason || '').trim(),
+        reason: String(inputRow?.reason || '').trim(),
+      }
+      if (!payload.date && !hasMeaningfulSessionValue(payload.amount)) return
+      const rowIdentity =
+        getBillingStripePaymentIntentIdValue(payload) ||
+        getBillingRowPersistenceKey(payload) ||
+        getBillingRowMatchKey(payload) ||
+        `${payload.date}|${String(payload.amount || '').trim()}|${rowIndex}`
+      const rowKeyBase = `${scope}|${rowIdentity}`
+      const occurrence = Number(rowCounts.get(rowKeyBase) || 0) + 1
+      rowCounts.set(rowKeyBase, occurrence)
+      const processedAtRaw = getBillingProcessedAtValue(payload)
+      const processedAt = processedAtRaw ? new Date(processedAtRaw) : null
+      projectionRows.push({
+        sessionCode: normalizedSessionCode,
+        contactId: String(contactId || '').trim(),
+        opportunityId: String(opportunityId || '').trim(),
+        billingScope: scope,
+        rowKey: `${rowKeyBase}|${occurrence}`,
+        scheduledDate: normalizeBillingDateValue(payload.date || processedAtRaw || ''),
+        amount: hasMeaningfulSessionValue(payload.amount) ? toNumberValue(payload.amount) : null,
+        statusTone: getBillingStatusTone(payload),
+        statusLabel: buildBillingProjectionStatusLabel(payload),
+        rawStatus: String(payload.status || '').trim(),
+        failureReason: String(payload.failureReason || '').trim(),
+        processorReason: String(payload.processorReason || '').trim(),
+        reason: String(payload.reason || '').trim(),
+        processedAt: processedAt && !Number.isNaN(processedAt.getTime()) ? processedAt : null,
+        stripePaymentIntentId: getBillingStripePaymentIntentIdValue(payload),
+        processedStripeCustomerId: String(payload?.processedStripeCustomerId || payload?.processed_stripe_customer_id || '').trim(),
+        processedStripePaymentMethodId: getBillingProcessedStripePaymentMethodIdValue(payload),
+        processedPaymentMethodBrand: getBillingProcessedPaymentMethodBrandValue(payload),
+        processedPaymentMethodLast4: getBillingProcessedPaymentMethodLast4Value(payload),
+        processedPaymentMethodType: String(payload?.processedPaymentMethodType || payload?.processed_payment_method_type || '').trim(),
+        payload,
+      })
+    })
+  })
+  return projectionRows
+}
+
+async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const rows = buildConsultationBillingProjectionRows({
+    sessionCode: normalizedSessionCode,
+    contactId,
+    opportunityId,
+    answers,
+  })
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    await client.query('delete from ti_billing_schedule_rows where session_code = $1', [normalizedSessionCode])
+    const now = new Date()
+    for (const row of rows) {
+      await client.query(
+        `
+        insert into ti_billing_schedule_rows(
+          session_code, ghl_contact_id, ghl_opportunity_id, billing_scope, row_key, scheduled_date, amount,
+          status_tone, status_label, raw_status, failure_reason, processor_reason, reason,
+          processed_at, stripe_payment_intent_id, processed_stripe_customer_id, processed_stripe_payment_method_id,
+          processed_payment_method_brand, processed_payment_method_last4, processed_payment_method_type,
+          payload, created_at, updated_at, actor_email
+        )
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+      `,
+        [
+          normalizedSessionCode,
+          row.contactId || null,
+          row.opportunityId || null,
+          row.billingScope || 'all',
+          row.rowKey,
+          row.scheduledDate || null,
+          row.amount,
+          row.statusTone || 'pending',
+          row.statusLabel || '',
+          row.rawStatus || '',
+          row.failureReason || '',
+          row.processorReason || '',
+          row.reason || '',
+          row.processedAt || null,
+          row.stripePaymentIntentId || '',
+          row.processedStripeCustomerId || '',
+          row.processedStripePaymentMethodId || '',
+          row.processedPaymentMethodBrand || '',
+          row.processedPaymentMethodLast4 || '',
+          row.processedPaymentMethodType || '',
+          row.payload && typeof row.payload === 'object' ? row.payload : {},
+          now,
+          now,
+          String(actorEmail || '').trim() || null,
+        ],
+      )
+    }
+    await client.query('commit')
+  } catch (error) {
+    await client.query('rollback').catch(() => {})
+    recordDbFailure('ti_billing_schedule_rows sync failed:', error, { sessionCode: normalizedSessionCode, rowCount: rows.length })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  } finally {
+    client.release()
+  }
+  return true
+}
+
+async function dbSyncConsultationRevenueProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  await dbReplaceConsultationBillingScheduleProjection({
+    sessionCode,
+    contactId,
+    opportunityId,
+    answers,
+    actorEmail,
+  })
+}
+
+async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
+  const normalizedCodes = Array.from(new Set((Array.isArray(sessionCodes) ? sessionCodes : []).map((value) => String(value || '').trim()).filter(Boolean)))
+  const result = new Map()
+  if (!pool || isDbCircuitOpen() || normalizedCodes.length === 0) return result
+  try {
+    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes] = await Promise.all([
+      pool.query(
+        `select session_code, payload
+           from ti_consultation_profiles
+          where session_code = any($1::text[])`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, payload
+           from ti_consultation_case_facts
+          where session_code = any($1::text[])`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select
+            session_code,
+            profile_complete,
+            current_step,
+            step_label,
+            completion_percent,
+            employment_status,
+            filing_status,
+            monthly_income,
+            monthly_expenses,
+            monthly_net,
+            total_assets,
+            last_saved_at,
+            payload,
+            draft_payload
+           from ti_consultation_financial_profiles
+          where session_code = any($1::text[])`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, billing_scope, payload
+           from ti_billing_schedule_rows
+          where session_code = any($1::text[])
+          order by session_code asc, billing_scope asc, scheduled_date asc nulls last, updated_at desc, id asc`,
+        [normalizedCodes],
+      ),
+    ])
+    for (const row of profileRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      result.set(sessionCode, {
+        ...(result.get(sessionCode) || {}),
+        profile: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+      })
+    }
+    for (const row of caseFactsRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      result.set(sessionCode, {
+        ...(result.get(sessionCode) || {}),
+        caseFacts: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+      })
+    }
+    for (const row of financialProfileRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      result.set(sessionCode, {
+        ...(result.get(sessionCode) || {}),
+        financialProfile: {
+          profileComplete: Boolean(row?.profile_complete),
+          currentStep: Math.max(0, Number(row?.current_step || 0)),
+          stepLabel: String(row?.step_label || '').trim(),
+          completionPercent: Number(row?.completion_percent || 0),
+          employmentStatus: String(row?.employment_status || '').trim(),
+          filingStatus: String(row?.filing_status || '').trim(),
+          monthlyIncome: row?.monthly_income === null || row?.monthly_income === undefined ? '' : String(row.monthly_income),
+          monthlyExpenses: row?.monthly_expenses === null || row?.monthly_expenses === undefined ? '' : String(row.monthly_expenses),
+          monthlyNet: row?.monthly_net === null || row?.monthly_net === undefined ? '' : String(row.monthly_net),
+          totalAssets: row?.total_assets === null || row?.total_assets === undefined ? '' : String(row.total_assets),
+          lastSavedAt: row?.last_saved_at ? new Date(row.last_saved_at).toISOString() : '',
+          payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+          draftPayload: row?.draft_payload && typeof row.draft_payload === 'object' ? row.draft_payload : null,
+        },
+      })
+    }
+    for (const row of billingRowsRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      const billingRows = Array.isArray(existing.billingRows) ? existing.billingRows.slice() : []
+      billingRows.push({
+        scope: String(row?.billing_scope || 'all').trim() || 'all',
+        payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+      })
+      result.set(sessionCode, {
+        ...existing,
+        billingRows,
+      })
+    }
+  } catch (error) {
+    recordDbFailure('consultation durable projection lookup failed:', error, { sessionCodeCount: normalizedCodes.length })
+  }
+  return result
+}
+
+async function dbGetConsultationDurableProjection(sessionCode = '') {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null }
+  const projectionMap = await dbGetConsultationDurableProjectionMap([normalizedSessionCode])
+  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null }
+}
+
+async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT) {
+  if (!pool || isDbCircuitOpen()) return 0
+  const normalizedLimit = Math.max(1, Math.min(20_000, Number(limit) || CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT))
+  try {
+    const res = await pool.query(
+      `select session_code, ghl_contact_id, ghl_opportunity_id, state
+         from ti_sessions
+        order by updated_at desc
+        limit $1`,
+      [normalizedLimit],
+    )
+    const rows = Array.isArray(res.rows) ? res.rows : []
+    if (!rows.length) return 0
+    const projectionMap = await dbGetConsultationDurableProjectionMap(rows.map((row) => row?.session_code))
+    let syncedCount = 0
+    for (const row of rows) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existingProjection = projectionMap.get(sessionCode) || {}
+      const expectedBillingRows = buildConsultationBillingProjectionRows({
+        sessionCode,
+        contactId: row?.ghl_contact_id || '',
+        opportunityId: row?.ghl_opportunity_id || '',
+        answers: row?.state?.answers || {},
+      })
+      const expectedFinancialProfile = normalizeConsultationFinancialProfileProjection(row?.state?.answers || {})
+      const hasDurableBillingProjection = Array.isArray(existingProjection.billingRows) && existingProjection.billingRows.length > 0
+      const hasDurableFinancialProjection = hasConsultationFinancialProfileProjectionData(existingProjection.financialProfile)
+      const expectsFinancialProjection = hasConsultationFinancialProfileProjectionData(expectedFinancialProfile)
+      if (
+        existingProjection.profile &&
+        existingProjection.caseFacts &&
+        (hasDurableBillingProjection || expectedBillingRows.length === 0) &&
+        (hasDurableFinancialProjection || !expectsFinancialProjection)
+      ) {
+        continue
+      }
+      await dbSyncConsultationDurableFields({
+        sessionCode,
+        contactId: row?.ghl_contact_id || '',
+        opportunityId: row?.ghl_opportunity_id || '',
+        answers: row?.state?.answers || {},
+        actorEmail: '',
+      })
+      await dbSyncConsultationRevenueProjection({
+        sessionCode,
+        contactId: row?.ghl_contact_id || '',
+        opportunityId: row?.ghl_opportunity_id || '',
+        answers: row?.state?.answers || {},
+        actorEmail: '',
+      })
+      syncedCount += 1
+    }
+    if (syncedCount > 0) {
+      console.log(`Backfilled durable profile/case/revenue projections for ${syncedCount} consultations`)
+    }
+    return syncedCount
+  } catch (error) {
+    recordDbFailure('durable projection backfill failed:', error, { limit: normalizedLimit })
+    return 0
+  }
+}
+
+function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProjection = null) {
+  const nextAnswers = answers && typeof answers === 'object' ? { ...answers } : {}
+  const profile = durableProjection?.profile && typeof durableProjection.profile === 'object' ? durableProjection.profile : null
+  const caseFacts = durableProjection?.caseFacts && typeof durableProjection.caseFacts === 'object' ? durableProjection.caseFacts : null
+  const financialProfile = durableProjection?.financialProfile && typeof durableProjection.financialProfile === 'object' ? durableProjection.financialProfile : null
+  const billingRows = Array.isArray(durableProjection?.billingRows) ? durableProjection.billingRows : []
+  const assignIfMissing = (keys, value) => {
+    if (!hasMeaningfulSessionValue(value)) return
+    keys.forEach((key) => {
+      if (!hasMeaningfulSessionValue(nextAnswers[key])) nextAnswers[key] = value
+    })
+  }
+
+  if (billingRows.length) {
+    const normalizeProjectedRows = (scope) =>
+      normalizeBillingScheduleRows(
+        billingRows
+          .filter((row) => String(row?.scope || '').trim() === scope)
+          .map((row) => (row?.payload && typeof row.payload === 'object' ? { ...row.payload } : null))
+          .filter(Boolean),
+      )
+    const allRows = normalizeProjectedRows('all')
+    const investigationRows = normalizeProjectedRows('investigation')
+    const resolutionRows = normalizeProjectedRows('resolution')
+    nextAnswers.billing_schedule = allRows.length ? allRows : mergeUniqueBillingScheduleRows(investigationRows, resolutionRows)
+    nextAnswers.investigation_billing_schedule = investigationRows
+    nextAnswers.resolution_billing_schedule = resolutionRows
+  }
+
+  if (profile) {
+    assignIfMissing(['full_name', 'name', 'client_name', 'clientName'], profile.clientName)
+    assignIfMissing(['first_name', 'firstName'], profile.firstName)
+    assignIfMissing(['last_name', 'lastName'], profile.lastName)
+    assignIfMissing(['email', 'email_address'], profile.email)
+    assignIfMissing(['phone', 'phone_number'], profile.phone)
+    assignIfMissing(['mailing_address', 'mailingAddress', 'mailing_street', 'mailingStreet', 'address', 'street', 'address1'], profile.addressLine1)
+    assignIfMissing(['mailing_city', 'mailingCity', 'city'], profile.city)
+    assignIfMissing(['mailing_state', 'mailingState', 'state', 'stateCode', 'expenseState', 'client_state'], profile.stateCode)
+    assignIfMissing(['mailing_zip', 'mailingZip', 'zip', 'zipCode', 'postalCode'], profile.postalCode)
+    assignIfMissing(['dob', 'date_of_birth', 'birthdate', 'birth_date', 'birthDate', 'client_dob', 'clientDob', 'client_birthdate'], profile.dateOfBirth)
+    assignIfMissing(['ssn', 'client_ssn', 'taxpayer_ssn'], profile.ssn)
+    assignIfMissing(['spouse_full_name', 'spouseFullName', 'spouse_name'], profile.spouseFullName)
+    assignIfMissing(['spouse_first_name', 'spouseFirstName'], profile.spouseFirstName)
+    assignIfMissing(['spouse_last_name', 'spouseLastName'], profile.spouseLastName)
+    assignIfMissing(['spouse_email', 'spouseEmail'], profile.spouseEmail)
+    assignIfMissing(['spouse_phone', 'spousePhone'], profile.spousePhone)
+    assignIfMissing(['spouse_dob', 'spouseDob', 'spouse_date_of_birth', 'spouseBirthDate'], profile.spouseDateOfBirth)
+    assignIfMissing(['spouse_ssn', 'spouseSsn'], profile.spouseSsn)
+  }
+
+  if (caseFacts) {
+    assignIfMissing(['taxType', 'tax_type', 'type', 'taxTypeValue', 'tax_type_value'], caseFacts.taxType)
+    assignIfMissing(['oweWho', 'owe', 'owe_who', 'taxAgency', 'tax_agency'], caseFacts.taxAgency)
+    assignIfMissing(['taxSituation', 'tax_situation', 'situation'], caseFacts.taxSituation)
+    assignIfMissing(['filingStatus', 'filing_status', 'tax_filing_status'], caseFacts.filingStatus)
+    assignIfMissing(['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount'], caseFacts.irsBalance)
+    assignIfMissing(['stateBalance', 'state_balance', 'stateTaxBalance', 'state_tax_balance'], caseFacts.stateBalance)
+    assignIfMissing(['taxLiability', 'tax_liability', 'totalLiability', 'total_liability', 'ghl_liability_value', 'ghl_opportunity_value'], caseFacts.totalLiability)
+    assignIfMissing(['oweYears', 'owe_years', 'years', 'yearsUnfiled', 'years_unfiled', 'tax_years_owed', 'years_unfiled_or_owed'], caseFacts.oweYears)
+  }
+
+  if (financialProfile) {
+    assignIfMissing(['client_portal_financial_profile_payload'], financialProfile.payload)
+    assignIfMissing(['client_portal_financial_profile_draft'], financialProfile.draftPayload)
+    assignIfMissing(['client_portal_financial_profile_complete'], financialProfile.profileComplete ? true : null)
+    assignIfMissing(['client_portal_financial_profile_step'], Number(financialProfile.currentStep || 0) > 0 ? Number(financialProfile.currentStep) : null)
+    assignIfMissing(['client_portal_financial_profile_step_label'], financialProfile.stepLabel)
+    assignIfMissing(
+      ['client_portal_financial_profile_completion_percent'],
+      Number(financialProfile.completionPercent || 0) > 0 ? Number(financialProfile.completionPercent) : null,
+    )
+    assignIfMissing(['client_portal_financial_profile_last_saved_at'], financialProfile.lastSavedAt)
+    assignIfMissing(['filingStatus', 'filing_status'], financialProfile.filingStatus)
+  }
+
+  return nextAnswers
 }
 
 async function dbUpsertDocumentReceiptRecord({ sessionCode, receipt, actorEmail = '' } = {}) {
@@ -1146,12 +1921,17 @@ function buildFallbackRow(entry) {
 }
 
 const MIRRORED_ANSWER_KEY_GROUPS = [
+  ['full_name', 'name', 'client_name', 'clientName'],
+  ['first_name', 'firstName'],
+  ['last_name', 'lastName'],
   ['email', 'email_address'],
   ['phone', 'phone_number'],
-  ['dob', 'date_of_birth', 'birthdate'],
-  ['address', 'street', 'address1'],
-  ['state', 'stateCode', 'expenseState'],
-  ['zip', 'postalCode'],
+  ['dob', 'date_of_birth', 'birthdate', 'birth_date', 'birthDate', 'client_dob', 'clientDob', 'client_birthdate'],
+  ['ssn', 'client_ssn', 'taxpayer_ssn'],
+  ['mailing_address', 'mailingAddress', 'mailing_street', 'mailingStreet', 'address', 'street', 'address1'],
+  ['mailing_city', 'mailingCity', 'city'],
+  ['mailing_state', 'mailingState', 'state', 'stateCode', 'expenseState', 'client_state'],
+  ['mailing_zip', 'mailingZip', 'zip', 'zipCode', 'postalCode'],
   ['spouse_dob', 'spouseDob', 'spouse_date_of_birth', 'spouseBirthDate'],
   ['spouse_ssn', 'spouseSsn'],
   ['spouse_phone', 'spousePhone'],
@@ -3536,6 +4316,61 @@ function getBillingTimingTone(value = '') {
   return normalized > today ? 'upcoming' : 'past'
 }
 
+function summarizeRevenueRows(rows = []) {
+  const summary = {
+    processedRevenue: 0,
+    pendingRevenue: 0,
+    failedRevenue: 0,
+    processedRowCount: 0,
+    pendingRowCount: 0,
+    failedRowCount: 0,
+    totalRowCount: 0,
+  }
+  const countedProcessedIntentIds = new Set()
+  const countedProcessedMatchKeys = new Set()
+  const countedPendingMatchKeys = new Set()
+  const countedFailedMatchKeys = new Set()
+  const todayKey = getTodayBillingDateValue()
+  normalizeBillingScheduleRows(Array.isArray(rows) ? rows : []).forEach((row) => {
+    const amount = toNumberValue(row?.amount)
+    const tone = getBillingStatusTone(row)
+    const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
+    const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
+    const paymentIntentId = getBillingStripePaymentIntentIdValue(row)
+    if (tone === 'processed') {
+      if (paymentIntentId) {
+        if (countedProcessedIntentIds.has(paymentIntentId)) return
+        countedProcessedIntentIds.add(paymentIntentId)
+      } else if (matchKey) {
+        if (countedProcessedMatchKeys.has(matchKey)) return
+        countedProcessedMatchKeys.add(matchKey)
+      }
+      summary.processedRevenue += amount
+      summary.processedRowCount += 1
+      summary.totalRowCount += 1
+      return
+    }
+    if (tone === 'failed') {
+      if (matchKey) {
+        if (countedFailedMatchKeys.has(matchKey)) return
+        countedFailedMatchKeys.add(matchKey)
+      }
+      summary.failedRevenue += amount
+      summary.failedRowCount += 1
+      summary.totalRowCount += 1
+      return
+    }
+    if (matchKey) {
+      if (countedPendingMatchKeys.has(matchKey)) return
+      countedPendingMatchKeys.add(matchKey)
+    }
+    summary.pendingRevenue += amount
+    summary.pendingRowCount += 1
+    summary.totalRowCount += 1
+  })
+  return summary
+}
+
 function isTrainingLeadItem(item = {}) {
   if (String(item.leadType || '').trim().toLowerCase() === 'training') return true
   if (String(item.isTrainingLead || '').trim().toLowerCase() === 'true') return true
@@ -4111,6 +4946,29 @@ function hasSignedResolutionDocuments(answers = {}) {
       return Boolean(String(entry?.signedAt || entry?.signed_at || '').trim())
     }) || Boolean(String(answers.boldsign_resolution_signed_at || '').trim())
   )
+}
+
+function getResolutionDocumentCodeCandidates(answers = {}) {
+  const candidates = new Set()
+  const direct = String(answers?.boldsign_resolution_document_id || '').trim()
+  if (direct) candidates.add(direct)
+  const pools = [
+    Array.isArray(answers?.document_receipts) ? answers.document_receipts : parseStoredObject(answers?.document_receipts, []),
+    Array.isArray(answers?.document_delivery_log) ? answers.document_delivery_log : parseStoredObject(answers?.document_delivery_log, []),
+  ]
+  pools.forEach((pool) => {
+    ;(Array.isArray(pool) ? pool : []).forEach((entry) => {
+      const normalizedName = String(entry?.name || '').trim().toLowerCase()
+      const isResolutionDoc =
+        normalizedName === 'resolution documents' ||
+        normalizedName.includes('resolution documents') ||
+        normalizedName.includes('resolution document')
+      if (!isResolutionDoc) return
+      const documentCode = String(entry?.documentCode || '').trim()
+      if (documentCode) candidates.add(documentCode)
+    })
+  })
+  return Array.from(candidates)
 }
 
 function hasSignedPendingRevenueDocuments(answers = {}) {
@@ -5891,8 +6749,8 @@ async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
 async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = {}) {
   const roomState = state || initialRoomState()
   const answers = roomState.answers || {}
-  let documentId = String(answers.boldsign_resolution_document_id || '').trim()
-  if (!documentId) {
+  let documentIds = getResolutionDocumentCodeCandidates(answers)
+  if (!documentIds.length) {
     const searchStampKey = 'boldsign_resolution_search_last_checked_at'
     if (!hasFreshBoldsignSearchCheck(answers?.[searchStampKey])) {
       answers[searchStampKey] = new Date().toISOString()
@@ -5907,30 +6765,38 @@ async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = 
       }
       if (found) {
         answers.boldsign_resolution_document_id = found
-        documentId = found
       }
       roomState.answers = answers
       await persist(roomState)
+      documentIds = getResolutionDocumentCodeCandidates(answers)
     }
   }
-  if (!documentId) return false
+  if (!documentIds.length) return false
   if (String(answers.boldsign_resolution_signed_at || '').trim()) return false
   if (hasFreshBoldsignReconcileCheck(answers.boldsign_resolution_last_checked_at)) return false
 
   try {
-    const properties = await getBoldsignDocumentProperties(documentId, {
-      onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
-    })
+    let completedDocumentId = ''
+    for (const documentId of documentIds) {
+      const properties = await getBoldsignDocumentProperties(documentId, {
+        onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
+      })
+      const status = String(properties?.status || '').trim().toLowerCase()
+      if (status === 'completed') {
+        completedDocumentId = documentId
+        break
+      }
+    }
     answers.boldsign_resolution_last_checked_at = new Date().toISOString()
-    const status = String(properties?.status || '').trim().toLowerCase()
-    if (status !== 'completed') {
+    if (!completedDocumentId) {
       roomState.answers = answers
       await persist(roomState)
       return false
     }
 
+    answers.boldsign_resolution_document_id = completedDocumentId
     answers.boldsign_resolution_signed_at = new Date().toISOString()
-    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
+    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, completedDocumentId)
     roomState.answers = answers
     await persist(roomState)
     emitDashboardRecordsUpdated({ reason: 'boldsign_reconciled_resolution_completed', roomCode, target: 'resolution' })
@@ -7561,7 +8427,12 @@ async function syncAllGhlOpportunitiesToDashboard() {
 
 function buildConsultationSummary(record) {
   const state = record?.state || {}
-  const answers = state?.answers || {}
+  const answers = mergeConsultationDurableProjectionIntoAnswers(state?.answers || {}, {
+    profile: record?.consultationProfile || null,
+    caseFacts: record?.consultationCaseFacts || null,
+    financialProfile: record?.consultationFinancialProfile || null,
+    billingRows: record?.consultationBillingRows || [],
+  })
   normalizePersistedSigned8821State(answers)
   const rawIrsBalance = toNumberValue(
     getPrimaryAnswer(answers, ['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount']),
@@ -9086,7 +9957,12 @@ function canEnrolledAgentAccessItem(item, account) {
 
 function buildConsultationDetail(record) {
   const state = record?.state || {}
-  const answers = state?.answers || {}
+  const answers = mergeConsultationDurableProjectionIntoAnswers(state?.answers || {}, {
+    profile: record?.consultationProfile || null,
+    caseFacts: record?.consultationCaseFacts || null,
+    financialProfile: record?.consultationFinancialProfile || null,
+    billingRows: record?.consultationBillingRows || [],
+  })
   normalizePersistedSigned8821State(answers)
   const summary = buildConsultationSummary(record)
   const links = buildExternalDocumentLinks(summary.sessionCode, record)
@@ -9271,6 +10147,83 @@ function initialRoomState() {
 }
 
 const CRITICAL_SESSION_ANSWER_KEYS = [
+  'name',
+  'full_name',
+  'client_name',
+  'clientName',
+  'first_name',
+  'last_name',
+  'email',
+  'email_address',
+  'phone',
+  'phone_number',
+  'address',
+  'street',
+  'address1',
+  'mailing_address',
+  'mailing_city',
+  'mailing_state',
+  'mailing_zip',
+  'city',
+  'state',
+  'stateCode',
+  'zip',
+  'zipCode',
+  'postalCode',
+  'dob',
+  'date_of_birth',
+  'birthdate',
+  'birth_date',
+  'birthDate',
+  'client_dob',
+  'clientDob',
+  'client_birthdate',
+  'ssn',
+  'client_ssn',
+  'taxpayer_ssn',
+  'spouse_name',
+  'spouse_full_name',
+  'spouse_first_name',
+  'spouse_last_name',
+  'spouse_email',
+  'spouse_phone',
+  'spouse_dob',
+  'spouse_date_of_birth',
+  'spouse_ssn',
+  'taxType',
+  'tax_type',
+  'type',
+  'owe',
+  'oweWho',
+  'owe_who',
+  'taxAgency',
+  'tax_agency',
+  'taxSituation',
+  'tax_situation',
+  'filingStatus',
+  'filing_status',
+  'tax_filing_status',
+  'irsBalance',
+  'irs_balance',
+  'federalBalance',
+  'federal_balance',
+  'stateBalance',
+  'state_balance',
+  'stateTaxBalance',
+  'state_tax_balance',
+  'taxLiability',
+  'tax_liability',
+  'totalLiability',
+  'total_liability',
+  'ghl_liability_value',
+  'ghl_opportunity_value',
+  'oweYears',
+  'owe_years',
+  'years',
+  'yearsUnfiled',
+  'years_unfiled',
+  'tax_years_owed',
+  'years_unfiled_or_owed',
   'billing_schedule',
   'investigation_billing_schedule',
   'resolution_billing_schedule',
@@ -9706,7 +10659,7 @@ async function dbGetSessionStrict(code) {
   }
 }
 
-async function dbUpsertSession({ code, contactId = null, opportunityId = null, state }) {
+async function dbUpsertSession({ code, contactId = null, opportunityId = null, state, actorEmail = '' }) {
   if (!pool || isDbCircuitOpen()) {
     if (STRICT_DB_MODE) {
       const error = new Error('Database is temporarily unavailable.')
@@ -9738,6 +10691,25 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
       state: nextState,
       previousState: existing?.state || null,
       reason: 'session_upsert',
+    })
+    await dbSyncConsultationDurableFields({
+      sessionCode: resolvedCode,
+      contactId: contactId ?? existing?.ghl_contact_id ?? '',
+      opportunityId: opportunityId ?? existing?.ghl_opportunity_id ?? '',
+      answers: nextState?.answers || {},
+      actorEmail,
+    })
+    await dbSyncDocumentReceiptsFromAnswers({
+      sessionCode: resolvedCode,
+      answers: nextState?.answers || {},
+      actorEmail,
+    })
+    await dbSyncConsultationRevenueProjection({
+      sessionCode: resolvedCode,
+      contactId: contactId ?? existing?.ghl_contact_id ?? '',
+      opportunityId: opportunityId ?? existing?.ghl_opportunity_id ?? '',
+      answers: nextState?.answers || {},
+      actorEmail,
     })
     invalidateDashboardAnalyticsCache()
   } catch (error) {
@@ -10270,6 +11242,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
       },
       { attempts: 6, delayMs: 1000 },
     )
+    const durableProjectionMap = await dbGetConsultationDurableProjectionMap((res.rows || []).map((row) => row?.session_code))
     const items = dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationSummary({
         sessionCode: row.session_code,
@@ -10278,6 +11251,10 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         state: row.state,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        consultationProfile: durableProjectionMap.get(String(row.session_code || ''))?.profile || null,
+        consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
+        consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
+        consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
       }),
     ))
     if (!hasSearch) return items
@@ -10336,6 +11313,7 @@ async function getConsultationRecordByCode(code) {
   if (!normalized) return null
   const row = await dbGetSession(normalized)
   if (row) {
+    const durableProjection = await dbGetConsultationDurableProjection(String(row.session_code || normalized))
     const repairKey = String(row.session_code || normalized).trim()
     const lastRepairAt = consultationIntegrityRepairTimestamps.get(repairKey) || 0
     if (Date.now() - lastRepairAt >= CONSULTATION_INTEGRITY_REPAIR_COOLDOWN_MS) {
@@ -10356,6 +11334,10 @@ async function getConsultationRecordByCode(code) {
       state: row.state,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      consultationProfile: durableProjection?.profile || null,
+      consultationCaseFacts: durableProjection?.caseFacts || null,
+      consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingRows: durableProjection?.billingRows || [],
     }))
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
@@ -10457,6 +11439,226 @@ app.get('/api/admin/diagnostics/data', async (req, res) => {
     return res.json({ ok: true, diagnostics })
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load diagnostics' })
+  }
+})
+
+app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const diagnostics = {
+      at: new Date().toISOString(),
+      dbReady: Boolean(pool) && !isDbCircuitOpen(),
+      startupBackfillLimit: CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT,
+      sessionCount: 0,
+      profileProjectionCount: 0,
+      caseFactsProjectionCount: 0,
+      billingProjectionRowCount: 0,
+      sessionsWithBillingProjectionCount: 0,
+      fullyProjectedCount: 0,
+      missingProfileCount: 0,
+      missingCaseFactsCount: 0,
+      missingEitherCount: 0,
+      sampleMissingSessionCodes: [],
+    }
+
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.', diagnostics })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open', diagnostics })
+
+    const [countsRes, sampleRes] = await Promise.all([
+      pool.query(
+        `select
+            (select count(*)::int from ti_sessions) as session_count,
+            (select count(*)::int from ti_consultation_profiles) as profile_projection_count,
+            (select count(*)::int from ti_consultation_case_facts) as case_facts_projection_count,
+            (select count(*)::int from ti_billing_schedule_rows) as billing_projection_row_count,
+            (select count(distinct session_code)::int from ti_billing_schedule_rows) as sessions_with_billing_projection_count,
+            (
+              select count(*)::int
+              from ti_sessions s
+              join ti_consultation_profiles p on p.session_code = s.session_code
+              join ti_consultation_case_facts c on c.session_code = s.session_code
+            ) as fully_projected_count,
+            (
+              select count(*)::int
+              from ti_sessions s
+              left join ti_consultation_profiles p on p.session_code = s.session_code
+              where p.session_code is null
+            ) as missing_profile_count,
+            (
+              select count(*)::int
+              from ti_sessions s
+              left join ti_consultation_case_facts c on c.session_code = s.session_code
+              where c.session_code is null
+            ) as missing_case_facts_count,
+            (
+              select count(*)::int
+              from ti_sessions s
+              left join ti_consultation_profiles p on p.session_code = s.session_code
+              left join ti_consultation_case_facts c on c.session_code = s.session_code
+              where p.session_code is null or c.session_code is null
+            ) as missing_either_count`,
+      ),
+      pool.query(
+        `select s.session_code
+           from ti_sessions s
+           left join ti_consultation_profiles p on p.session_code = s.session_code
+           left join ti_consultation_case_facts c on c.session_code = s.session_code
+          where p.session_code is null or c.session_code is null
+          order by s.updated_at desc
+          limit 25`,
+      ),
+    ])
+
+    diagnostics.sessionCount = countsRes.rows?.[0]?.session_count ?? 0
+    diagnostics.profileProjectionCount = countsRes.rows?.[0]?.profile_projection_count ?? 0
+    diagnostics.caseFactsProjectionCount = countsRes.rows?.[0]?.case_facts_projection_count ?? 0
+    diagnostics.billingProjectionRowCount = countsRes.rows?.[0]?.billing_projection_row_count ?? 0
+    diagnostics.sessionsWithBillingProjectionCount = countsRes.rows?.[0]?.sessions_with_billing_projection_count ?? 0
+    diagnostics.fullyProjectedCount = countsRes.rows?.[0]?.fully_projected_count ?? 0
+    diagnostics.missingProfileCount = countsRes.rows?.[0]?.missing_profile_count ?? 0
+    diagnostics.missingCaseFactsCount = countsRes.rows?.[0]?.missing_case_facts_count ?? 0
+    diagnostics.missingEitherCount = countsRes.rows?.[0]?.missing_either_count ?? 0
+    diagnostics.sampleMissingSessionCodes = Array.isArray(sampleRes.rows)
+      ? sampleRes.rows.map((row) => String(row?.session_code || '').trim()).filter(Boolean)
+      : []
+
+    return res.json({ ok: true, diagnostics })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load durable field diagnostics' })
+  }
+})
+
+app.get('/api/admin/diagnostics/revenue-integrity', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const diagnostics = {
+      at: new Date().toISOString(),
+      dbReady: Boolean(pool) && !isDbCircuitOpen(),
+      sessionCount: 0,
+      durableProcessedRevenueTotal: 0,
+      legacyProcessedRevenueTotal: 0,
+      durablePendingRevenueTotal: 0,
+      legacyPendingRevenueTotal: 0,
+      durableFailedRevenueTotal: 0,
+      legacyFailedRevenueTotal: 0,
+      durableProcessedRowCount: 0,
+      legacyProcessedRowCount: 0,
+      durablePendingRowCount: 0,
+      legacyPendingRowCount: 0,
+      durableFailedRowCount: 0,
+      legacyFailedRowCount: 0,
+      processedRevenueDelta: 0,
+      pendingRevenueDelta: 0,
+      failedRevenueDelta: 0,
+      mismatchedSessionCount: 0,
+      topMismatches: [],
+    }
+
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.', diagnostics })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open', diagnostics })
+
+    const [sessionsRes, billingRowsRes] = await Promise.all([
+      pool.query(
+        `select session_code, state
+           from ti_sessions
+          order by updated_at desc
+          limit $1`,
+        [CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT],
+      ),
+      pool.query(
+        `select session_code, payload
+           from ti_billing_schedule_rows
+          where billing_scope = 'all'
+          order by session_code asc, scheduled_date asc nulls last, updated_at desc, id asc`,
+      ),
+    ])
+
+    const sessionRows = Array.isArray(sessionsRes.rows) ? sessionsRes.rows : []
+    const durableRowsBySession = new Map()
+    for (const row of billingRowsRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const bucket = durableRowsBySession.get(sessionCode)
+      const payload = row?.payload && typeof row.payload === 'object' ? { ...row.payload } : {}
+      if (bucket) {
+        bucket.push(payload)
+      } else {
+        durableRowsBySession.set(sessionCode, [payload])
+      }
+    }
+
+    const mismatches = []
+    for (const row of sessionRows) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const answers = row?.state?.answers && typeof row.state.answers === 'object' ? row.state.answers : {}
+      const legacySummary = summarizeRevenueRows(getBillingScheduleRowsFromAnswers(answers))
+      const durableSummary = summarizeRevenueRows(durableRowsBySession.get(sessionCode) || [])
+      diagnostics.sessionCount += 1
+      diagnostics.legacyProcessedRevenueTotal += legacySummary.processedRevenue
+      diagnostics.durableProcessedRevenueTotal += durableSummary.processedRevenue
+      diagnostics.legacyPendingRevenueTotal += legacySummary.pendingRevenue
+      diagnostics.durablePendingRevenueTotal += durableSummary.pendingRevenue
+      diagnostics.legacyFailedRevenueTotal += legacySummary.failedRevenue
+      diagnostics.durableFailedRevenueTotal += durableSummary.failedRevenue
+      diagnostics.legacyProcessedRowCount += legacySummary.processedRowCount
+      diagnostics.durableProcessedRowCount += durableSummary.processedRowCount
+      diagnostics.legacyPendingRowCount += legacySummary.pendingRowCount
+      diagnostics.durablePendingRowCount += durableSummary.pendingRowCount
+      diagnostics.legacyFailedRowCount += legacySummary.failedRowCount
+      diagnostics.durableFailedRowCount += durableSummary.failedRowCount
+
+      const processedDelta = Number((durableSummary.processedRevenue - legacySummary.processedRevenue).toFixed(2))
+      const pendingDelta = Number((durableSummary.pendingRevenue - legacySummary.pendingRevenue).toFixed(2))
+      const failedDelta = Number((durableSummary.failedRevenue - legacySummary.failedRevenue).toFixed(2))
+      const rowCountDelta =
+        (durableSummary.processedRowCount - legacySummary.processedRowCount) +
+        (durableSummary.pendingRowCount - legacySummary.pendingRowCount) +
+        (durableSummary.failedRowCount - legacySummary.failedRowCount)
+      if (processedDelta || pendingDelta || failedDelta || rowCountDelta) {
+        mismatches.push({
+          sessionCode,
+          processedDelta,
+          pendingDelta,
+          failedDelta,
+          legacyProcessedRevenue: legacySummary.processedRevenue,
+          durableProcessedRevenue: durableSummary.processedRevenue,
+          legacyPendingRevenue: legacySummary.pendingRevenue,
+          durablePendingRevenue: durableSummary.pendingRevenue,
+          legacyFailedRevenue: legacySummary.failedRevenue,
+          durableFailedRevenue: durableSummary.failedRevenue,
+          legacyRowCount: legacySummary.totalRowCount,
+          durableRowCount: durableSummary.totalRowCount,
+        })
+      }
+    }
+
+    diagnostics.durableProcessedRevenueTotal = Number(diagnostics.durableProcessedRevenueTotal.toFixed(2))
+    diagnostics.legacyProcessedRevenueTotal = Number(diagnostics.legacyProcessedRevenueTotal.toFixed(2))
+    diagnostics.durablePendingRevenueTotal = Number(diagnostics.durablePendingRevenueTotal.toFixed(2))
+    diagnostics.legacyPendingRevenueTotal = Number(diagnostics.legacyPendingRevenueTotal.toFixed(2))
+    diagnostics.durableFailedRevenueTotal = Number(diagnostics.durableFailedRevenueTotal.toFixed(2))
+    diagnostics.legacyFailedRevenueTotal = Number(diagnostics.legacyFailedRevenueTotal.toFixed(2))
+    diagnostics.processedRevenueDelta = Number((diagnostics.durableProcessedRevenueTotal - diagnostics.legacyProcessedRevenueTotal).toFixed(2))
+    diagnostics.pendingRevenueDelta = Number((diagnostics.durablePendingRevenueTotal - diagnostics.legacyPendingRevenueTotal).toFixed(2))
+    diagnostics.failedRevenueDelta = Number((diagnostics.durableFailedRevenueTotal - diagnostics.legacyFailedRevenueTotal).toFixed(2))
+    diagnostics.mismatchedSessionCount = mismatches.length
+    diagnostics.topMismatches = mismatches
+      .sort((a, b) =>
+        Math.abs(Number(b.processedDelta || 0)) + Math.abs(Number(b.pendingDelta || 0)) + Math.abs(Number(b.failedDelta || 0)) -
+        (Math.abs(Number(a.processedDelta || 0)) + Math.abs(Number(a.pendingDelta || 0)) + Math.abs(Number(a.failedDelta || 0))),
+      )
+      .slice(0, 25)
+
+    return res.json({ ok: true, diagnostics })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load revenue integrity diagnostics' })
   }
 })
 
@@ -10771,6 +11973,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
         })
       },
     })
+    const durableProjection = await dbGetConsultationDurableProjection(String(row.session_code || req.params.code || ''))
     const item = await attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
       contactId: row.ghl_contact_id,
@@ -10778,6 +11981,10 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
       state: row.state,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      consultationProfile: durableProjection?.profile || null,
+      consultationCaseFacts: durableProjection?.caseFacts || null,
+      consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingRows: durableProjection?.billingRows || [],
     }))
     if (!item) return res.status(404).json({ error: 'Consultation record not found' })
     if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
@@ -13677,6 +14884,7 @@ async function listAllConsultationDetails() {
       },
       { attempts: 6, delayMs: 1000 },
     )
+    const durableProjectionMap = await dbGetConsultationDurableProjectionMap((res.rows || []).map((row) => row?.session_code))
     return dedupeConsultationRecords(res.rows.map((row) =>
       buildConsultationDetail({
         sessionCode: row.session_code,
@@ -13685,6 +14893,10 @@ async function listAllConsultationDetails() {
         state: row.state,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        consultationProfile: durableProjectionMap.get(String(row.session_code || ''))?.profile || null,
+        consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
+        consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
+        consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
       }),
     ))
   }
@@ -13746,8 +14958,19 @@ function buildConsultationAnalytics(items = [], account = null) {
         .trim()
         .toLowerCase()
       const isCancellationRequested = cancellationStatus.includes('cancel')
-      const docsSignedEligible = hasSignedPendingRevenueDocuments(answers)
-      const pendingRevenueEligible = docsSignedEligible && hasStoredPaymentMethodOnFile(answers)
+      const investigationDocumentsSigned = hasSignedPendingRevenueDocuments(answers)
+      const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
+      const hasStoredPaymentMethod = hasStoredPaymentMethodOnFile(answers)
+      const investigationScheduleRowKeys = new Set(
+        getScopedBillingScheduleRowsFromAnswers(answers, 'investigation')
+          .map((row) => getBillingRowMatchKey(row))
+          .filter(Boolean),
+      )
+      const resolutionScheduleRowKeys = new Set(
+        getScopedBillingScheduleRowsFromAnswers(answers, 'resolution')
+          .map((row) => getBillingRowMatchKey(row))
+          .filter(Boolean),
+      )
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
       if (!isCancellationRequested) {
         const hasAnyStripeSignal =
@@ -13768,13 +14991,26 @@ function buildConsultationAnalytics(items = [], account = null) {
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
-          if (tone === 'pending' && !docsSignedEligible) return
           const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
+          const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
+          const matchesInvestigationRow = Boolean(matchKey && investigationScheduleRowKeys.has(matchKey))
+          const matchesResolutionRow = Boolean(matchKey && resolutionScheduleRowKeys.has(matchKey))
+          let docsSignedEligible = investigationDocumentsSigned || resolutionDocumentsSigned
+          if (matchesResolutionRow && !matchesInvestigationRow) {
+            docsSignedEligible = resolutionDocumentsSigned
+          } else if (matchesInvestigationRow && !matchesResolutionRow) {
+            docsSignedEligible = investigationDocumentsSigned
+          } else if (matchesInvestigationRow || matchesResolutionRow) {
+            docsSignedEligible =
+              (matchesInvestigationRow && investigationDocumentsSigned) ||
+              (matchesResolutionRow && resolutionDocumentsSigned)
+          }
+          const pendingRevenueEligible = docsSignedEligible && hasStoredPaymentMethod
+          if (tone === 'pending' && !docsSignedEligible) return
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
           const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
-          const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
           const paymentIntentId = getBillingStripePaymentIntentIdValue(row)
           if (tone === 'processed') {
             if (paymentIntentId) {
@@ -13829,7 +15065,7 @@ function buildConsultationAnalytics(items = [], account = null) {
             failedRevenue += amount
             failedRevenueTotal += amount
             failedPayments.push(paymentScheduleEntry)
-          } else if (!isPastDuePending && pendingRevenueEligible) {
+          } else if (pendingRevenueEligible) {
             pendingRevenue += amount
             pendingRevenueTotal += amount
           }

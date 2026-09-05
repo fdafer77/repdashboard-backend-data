@@ -147,4 +147,120 @@ export async function ensureSchema(pool) {
   await pool.query(
     `create index if not exists ti_document_receipts_session_code_updated_at_idx on ti_document_receipts(session_code, updated_at desc);`,
   )
+
+  // Critical client profile fields as a durable projection separate from ti_sessions.state.answers.
+  await pool.query(`
+    create table if not exists ti_consultation_profiles (
+      session_code text primary key,
+      ghl_contact_id text,
+      ghl_opportunity_id text,
+      client_name text not null default '',
+      email text not null default '',
+      phone text not null default '',
+      state_code text not null default '',
+      postal_code text not null default '',
+      date_of_birth text not null default '',
+      ssn text not null default '',
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      actor_email text
+    );
+  `)
+  await pool.query(`create index if not exists ti_consultation_profiles_contact_id_idx on ti_consultation_profiles(ghl_contact_id);`)
+  await pool.query(`create index if not exists ti_consultation_profiles_opportunity_id_idx on ti_consultation_profiles(ghl_opportunity_id);`)
+  await pool.query(`create index if not exists ti_consultation_profiles_email_idx on ti_consultation_profiles(email);`)
+  await pool.query(`create index if not exists ti_consultation_profiles_phone_idx on ti_consultation_profiles(phone);`)
+  await pool.query(`create index if not exists ti_consultation_profiles_updated_at_idx on ti_consultation_profiles(updated_at desc);`)
+
+  // Critical case facts as a durable projection separate from ti_sessions.state.answers.
+  await pool.query(`
+    create table if not exists ti_consultation_case_facts (
+      session_code text primary key,
+      ghl_contact_id text,
+      ghl_opportunity_id text,
+      tax_type text not null default '',
+      tax_agency text not null default '',
+      tax_situation text not null default '',
+      filing_status text not null default '',
+      irs_balance numeric(12, 2),
+      state_balance numeric(12, 2),
+      total_liability numeric(12, 2),
+      owe_years text not null default '',
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      actor_email text
+    );
+  `)
+  await pool.query(`create index if not exists ti_consultation_case_facts_contact_id_idx on ti_consultation_case_facts(ghl_contact_id);`)
+  await pool.query(`create index if not exists ti_consultation_case_facts_opportunity_id_idx on ti_consultation_case_facts(ghl_opportunity_id);`)
+  await pool.query(`create index if not exists ti_consultation_case_facts_updated_at_idx on ti_consultation_case_facts(updated_at desc);`)
+
+  // Billing schedule rows as first-class durable records for stable revenue analytics.
+  await pool.query(`
+    create table if not exists ti_billing_schedule_rows (
+      id bigserial primary key,
+      session_code text not null,
+      ghl_contact_id text,
+      ghl_opportunity_id text,
+      billing_scope text not null default 'all',
+      row_key text not null,
+      scheduled_date date,
+      amount numeric(12, 2),
+      status_tone text not null default 'pending',
+      status_label text not null default '',
+      raw_status text not null default '',
+      failure_reason text not null default '',
+      processor_reason text not null default '',
+      reason text not null default '',
+      processed_at timestamptz,
+      stripe_payment_intent_id text not null default '',
+      processed_stripe_customer_id text not null default '',
+      processed_stripe_payment_method_id text not null default '',
+      processed_payment_method_brand text not null default '',
+      processed_payment_method_last4 text not null default '',
+      processed_payment_method_type text not null default '',
+      payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      actor_email text,
+      unique(session_code, row_key)
+    );
+  `)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_session_code_idx on ti_billing_schedule_rows(session_code);`)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_contact_id_idx on ti_billing_schedule_rows(ghl_contact_id);`)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_opportunity_id_idx on ti_billing_schedule_rows(ghl_opportunity_id);`)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_scope_date_idx on ti_billing_schedule_rows(billing_scope, scheduled_date);`)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_processed_at_idx on ti_billing_schedule_rows(processed_at desc);`)
+  await pool.query(`create index if not exists ti_billing_schedule_rows_payment_intent_idx on ti_billing_schedule_rows(stripe_payment_intent_id);`)
+
+  // Financial profile progression as a durable projection separate from ti_sessions.state.answers.
+  await pool.query(`
+    create table if not exists ti_consultation_financial_profiles (
+      session_code text primary key,
+      ghl_contact_id text,
+      ghl_opportunity_id text,
+      profile_complete boolean not null default false,
+      current_step integer not null default 0,
+      step_label text not null default '',
+      completion_percent numeric(5, 2) not null default 0,
+      employment_status text not null default '',
+      filing_status text not null default '',
+      monthly_income numeric(12, 2),
+      monthly_expenses numeric(12, 2),
+      monthly_net numeric(12, 2),
+      total_assets numeric(12, 2),
+      last_saved_at timestamptz,
+      payload jsonb not null default '{}'::jsonb,
+      draft_payload jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      actor_email text
+    );
+  `)
+  await pool.query(`create index if not exists ti_consultation_financial_profiles_contact_id_idx on ti_consultation_financial_profiles(ghl_contact_id);`)
+  await pool.query(`create index if not exists ti_consultation_financial_profiles_opportunity_id_idx on ti_consultation_financial_profiles(ghl_opportunity_id);`)
+  await pool.query(`create index if not exists ti_consultation_financial_profiles_complete_idx on ti_consultation_financial_profiles(profile_complete, updated_at desc);`)
+  await pool.query(`create index if not exists ti_consultation_financial_profiles_updated_at_idx on ti_consultation_financial_profiles(updated_at desc);`)
 }
