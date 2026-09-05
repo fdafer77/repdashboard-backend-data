@@ -4151,6 +4151,12 @@ function getBillingProcessedAtValue(row = {}) {
   )
 }
 
+function getBillingProcessedAtIsoForScheduledDate(scheduledDate = '', fallbackIso = '') {
+  const normalizedDate = normalizeBillingDateValue(scheduledDate)
+  if (!normalizedDate) return String(fallbackIso || '').trim()
+  return `${normalizedDate}T12:00:00.000Z`
+}
+
 function getBillingStripePaymentIntentIdValue(row = {}) {
   return (
     String(row?.stripePaymentIntentId || '').trim() ||
@@ -12695,7 +12701,7 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
           failureReason: '',
           processorReason: '',
           reason: '',
-          processedAt: getBillingProcessedAtValue(row) || nowIso,
+          processedAt: getBillingProcessedAtValue(row) || getBillingProcessedAtIsoForScheduledDate(normalizedDate, nowIso),
           processedManually: true,
           processedManualBy: actorEmail,
           processedManualAt: nowIso,
@@ -12809,7 +12815,7 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
         failureReason: '',
         processorReason: manualReason,
         reason: manualReason,
-        processedAt: getBillingProcessedAtValue(row) || nowIso,
+        processedAt: getBillingProcessedAtValue(row) || getBillingProcessedAtIsoForScheduledDate(normalizedDate, nowIso),
         processedManually: true,
         processedManualBy: actorEmail,
         processedManualAt: nowIso,
@@ -12827,7 +12833,7 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
         failureReason: '',
         processorReason: manualReason,
         reason: manualReason,
-        processedAt: nowIso,
+        processedAt: getBillingProcessedAtIsoForScheduledDate(normalizedDate, nowIso),
         processedManually: true,
         processedManualBy: actorEmail,
         processedManualAt: nowIso,
