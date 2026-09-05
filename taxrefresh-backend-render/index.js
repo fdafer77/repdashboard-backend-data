@@ -2669,6 +2669,12 @@ function getSavedResolutionFilename(answers = {}) {
   return `${safeClientName}-signed-2848.pdf`
 }
 
+function getSignedResolutionDocumentRecord(answers = {}) {
+  const eaDocuments = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  if (!Array.isArray(eaDocuments)) return null
+  return eaDocuments.find((doc) => doc && (doc.id === 'system_signed_resolution_form' || doc.category === 'IRS Form 2848')) || null
+}
+
 function getSigned8821DocumentRecord(answers = {}) {
   const eaDocuments = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   if (!Array.isArray(eaDocuments)) return null
@@ -2724,6 +2730,14 @@ function upsertSigned8821FirstPageDocumentRecord(answers = {}, documentRecord) {
   const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
   const nextDocuments = Array.isArray(current)
     ? current.filter((doc) => doc && doc.id !== 'system_signed_8821_first_page' && doc.category !== 'IRS Form 8821 First Page')
+    : []
+  answers.ea_documents = [documentRecord, ...nextDocuments]
+}
+
+function upsertSignedResolutionDocumentRecord(answers = {}, documentRecord) {
+  const current = Array.isArray(answers?.ea_documents) ? answers.ea_documents : parseStoredObject(answers?.ea_documents, [])
+  const nextDocuments = Array.isArray(current)
+    ? current.filter((doc) => doc && doc.id !== 'system_signed_resolution_form' && doc.category !== 'IRS Form 2848')
     : []
   answers.ea_documents = [documentRecord, ...nextDocuments]
 }
@@ -3156,6 +3170,38 @@ async function refreshSigned8821FirstPageStoredPdf(roomCode, room) {
     // ignore
   }
   return { buffer: pdfBuffer, mimeType: 'application/pdf' }
+}
+
+async function ensureSignedResolutionStoredOnRecord(roomCode, room) {
+  const normalizedRoomCode = String(roomCode || '').trim().toUpperCase()
+  if (!normalizedRoomCode || !room?.state?.answers) return false
+  const answers = room.state.answers || {}
+  const documentId = String(answers.boldsign_resolution_document_id || '').trim()
+  if (!documentId || !String(answers.boldsign_resolution_signed_at || '').trim()) return false
+
+  try {
+    const download = await boldsignDownloadDocument(documentId, {
+      onBehalfOf: String(answers.boldsign_resolution_sender_email || '').trim() || undefined,
+    })
+    if (!download?.fileBuffer?.length) return false
+    upsertSignedResolutionDocumentRecord(answers, {
+      id: 'system_signed_resolution_form',
+      name: getSavedResolutionFilename(answers),
+      category: 'IRS Form 2848',
+      mimeType: download.contentType || 'application/pdf',
+      size: download.fileBuffer.length,
+      uploadedAt: new Date().toISOString(),
+      uploadedBy: 'System',
+    })
+    answers.signed_resolution_saved_at = new Date().toISOString()
+    answers.signed_resolution_file_name = getSavedResolutionFilename(answers)
+    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, documentId)
+    room.state.updatedAt = Date.now()
+    await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
+    return true
+  } catch {
+    return false
+  }
 }
 
 function get8821PdfValues(answers = {}) {
@@ -3890,9 +3936,10 @@ async function buildSigned8821FirstPagePdfBuffer(answers = {}) {
   return Buffer.from(await outputPdf.save())
 }
 
-async function ensureSigned8821StoredOnRecord(roomCode, room) {
+async function ensureSigned8821StoredOnRecord(roomCode, room, options = {}) {
   const normalizedRoomCode = String(roomCode || '').trim().toUpperCase()
   if (!normalizedRoomCode) return false
+  const skipClientEmail = Boolean(options?.skipClientEmail)
   if (signed8821StoreInFlight.has(normalizedRoomCode)) {
     logMemoryDiagnostics('ensureSigned8821StoredOnRecord:skip-inflight', { roomCode: normalizedRoomCode })
     return signed8821StoreInFlight.get(normalizedRoomCode)
@@ -4000,9 +4047,11 @@ async function ensureSigned8821StoredOnRecord(roomCode, room) {
     pdfBytes: pdfBuffer?.length || 0,
     page1Bytes: firstPagePdfBuffer?.length || 0,
   })
-  void sendSigned8821CopyEmail({ roomCode: normalizedRoomCode, room }).catch((error) => {
-    console.error('Signed 8821 client email failed:', error)
-  })
+  if (!skipClientEmail) {
+    void sendSigned8821CopyEmail({ roomCode: normalizedRoomCode, room }).catch((error) => {
+      console.error('Signed 8821 client email failed:', error)
+    })
+  }
   return true
   })()
 
@@ -6769,6 +6818,225 @@ function hasFreshBoldsignReconcileCheck(value = '') {
   const timestamp = new Date(normalized).getTime()
   if (!Number.isFinite(timestamp) || timestamp <= 0) return false
   return Date.now() - timestamp < BOLDSIGN_RECONCILE_CACHE_MS
+}
+
+function normalizeManualBoldsignVerifyTarget(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'resolution') return 'resolution'
+  if (normalized === 'spouse') return 'spouse'
+  if (normalized === '8821' || normalized === 'client' || normalized === 'red') return '8821'
+  return 'auto'
+}
+
+function getBoldsignDocumentPropertiesTitle(properties = {}) {
+  return [
+    properties?.title,
+    properties?.documentTitle,
+    properties?.documentName,
+    properties?.name,
+    properties?.templateTitle,
+    properties?.messageTitle,
+    properties?.templateName,
+    properties?.fileName,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ')
+}
+
+function getBoldsignDocumentCompletedAt(properties = {}) {
+  const candidate = [
+    properties?.completedOn,
+    properties?.completedAt,
+    properties?.completedDate,
+    properties?.completionDate,
+    properties?.lastCompletedAt,
+    properties?.lastCompletedOn,
+  ]
+    .map((value) => String(value || '').trim())
+    .find(Boolean)
+  const timestamp = candidate ? new Date(candidate).getTime() : NaN
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : new Date().toISOString()
+}
+
+function getBoldsignSignerEmails(properties = {}) {
+  const candidates = []
+  const pushEmail = (value = '') => {
+    const normalized = String(value || '').trim().toLowerCase()
+    if (!normalized || candidates.includes(normalized)) return
+    candidates.push(normalized)
+  }
+
+  pushEmail(properties?.signerEmail)
+  const signerDetails = Array.isArray(properties?.signerDetails) ? properties.signerDetails : []
+  signerDetails.forEach((entry) => {
+    pushEmail(entry?.emailAddress || entry?.email)
+  })
+  return candidates
+}
+
+async function getBoldsignDocumentPropertiesWithFallback(documentId = '', senderCandidates = []) {
+  const normalizedDocumentId = String(documentId || '').trim()
+  if (!normalizedDocumentId) throw new Error('BoldSign document ID is required.')
+  const attempts = ['']
+  senderCandidates.forEach((value) => {
+    const normalized = String(value || '').trim()
+    if (normalized && !attempts.includes(normalized)) attempts.push(normalized)
+  })
+  let lastError = null
+  for (const senderEmail of attempts) {
+    try {
+      const properties = await getBoldsignDocumentProperties(normalizedDocumentId, {
+        onBehalfOf: senderEmail || undefined,
+      })
+      return { properties, senderEmail: senderEmail || '' }
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError || new Error('Unable to verify the BoldSign document.')
+}
+
+function inferManualBoldsignVerifyTarget({ requestedTarget = 'auto', documentId = '', answers = {}, properties = {} } = {}) {
+  const normalizedRequestedTarget = normalizeManualBoldsignVerifyTarget(requestedTarget)
+  if (normalizedRequestedTarget !== 'auto') return normalizedRequestedTarget
+
+  const normalizedDocumentId = String(documentId || '').trim()
+  if (!normalizedDocumentId) return ''
+  if (String(answers?.boldsign_resolution_document_id || '').trim() === normalizedDocumentId) return 'resolution'
+  if (String(answers?.boldsign_8821_spouse_document_id || '').trim() === normalizedDocumentId) return 'spouse'
+  if (String(answers?.boldsign_8821_document_id || '').trim() === normalizedDocumentId) return '8821'
+
+  const title = getBoldsignDocumentPropertiesTitle(properties).toLowerCase()
+  if (title.includes('2848') || title.includes('resolution')) return 'resolution'
+  if (title.includes('spouse')) return 'spouse'
+  if (title.includes('8821') || title.includes('r.e.d') || title.includes('red document')) return '8821'
+  return ''
+}
+
+function buildManualBoldsignVerifyPatches(answers = {}) {
+  return [
+    { type: 'setAnswer', questionId: 'boldsign_8821_document_id', value: answers.boldsign_8821_document_id || '' },
+    { type: 'setAnswer', questionId: 'boldsign_8821_spouse_document_id', value: answers.boldsign_8821_spouse_document_id || '' },
+    { type: 'setAnswer', questionId: 'boldsign_8821_sender_email', value: answers.boldsign_8821_sender_email || '' },
+    { type: 'setAnswer', questionId: 'boldsign_8821_last_checked_at', value: answers.boldsign_8821_last_checked_at || '' },
+    { type: 'setAnswer', questionId: 'boldsign_8821_search_last_checked_at', value: answers.boldsign_8821_search_last_checked_at || '' },
+    { type: 'setAnswer', questionId: 'boldsign_8821_signed_at', value: answers.boldsign_8821_signed_at || '' },
+    { type: 'setAnswer', questionId: 'boldsign_resolution_document_id', value: answers.boldsign_resolution_document_id || '' },
+    { type: 'setAnswer', questionId: 'boldsign_resolution_sender_email', value: answers.boldsign_resolution_sender_email || '' },
+    { type: 'setAnswer', questionId: 'boldsign_resolution_last_checked_at', value: answers.boldsign_resolution_last_checked_at || '' },
+    { type: 'setAnswer', questionId: 'boldsign_resolution_search_last_checked_at', value: answers.boldsign_resolution_search_last_checked_at || '' },
+    { type: 'setAnswer', questionId: 'boldsign_resolution_signed_at', value: answers.boldsign_resolution_signed_at || '' },
+    { type: 'setAnswer', questionId: 'form8821_status', value: answers.form8821_status || '' },
+    { type: 'setAnswer', questionId: 'form8821_spouse_status', value: answers.form8821_spouse_status || '' },
+    { type: 'setAnswer', questionId: 'onboarding_status', value: answers.onboarding_status || '' },
+    { type: 'setAnswer', questionId: 'completed_at', value: answers.completed_at || '' },
+    { type: 'setAnswer', questionId: 'active_8821_document_code', value: answers.active_8821_document_code || '' },
+    { type: 'setAnswer', questionId: 'current_8821_document_code', value: answers.current_8821_document_code || '' },
+    { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
+    { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
+    { type: 'setAnswer', questionId: 'ea_documents', value: answers.ea_documents },
+    { type: 'setAnswer', questionId: 'ea_activity_timeline', value: answers.ea_activity_timeline },
+    { type: 'setAnswer', questionId: 'signed_8821_saved_at', value: answers.signed_8821_saved_at || '' },
+    { type: 'setAnswer', questionId: 'signed_8821_file_name', value: answers.signed_8821_file_name || '' },
+    { type: 'setAnswer', questionId: 'signed_8821_first_page_saved_at', value: answers.signed_8821_first_page_saved_at || '' },
+    { type: 'setAnswer', questionId: 'signed_8821_first_page_file_name', value: answers.signed_8821_first_page_file_name || '' },
+    { type: 'setAnswer', questionId: 'signed_resolution_saved_at', value: answers.signed_resolution_saved_at || '' },
+    { type: 'setAnswer', questionId: 'signed_resolution_file_name', value: answers.signed_resolution_file_name || '' },
+  ]
+}
+
+async function applyManualBoldsignVerification({
+  roomCode,
+  room,
+  documentId = '',
+  requestedTarget = 'auto',
+  senderEmail = '',
+  properties = {},
+} = {}) {
+  const normalizedRoomCode = String(roomCode || '').trim().toUpperCase()
+  const normalizedDocumentId = String(documentId || '').trim()
+  if (!normalizedRoomCode || !room?.state?.answers || !normalizedDocumentId) {
+    throw new Error('A consultation code and BoldSign document ID are required.')
+  }
+
+  const answers = room.state.answers || {}
+  const resolvedTarget = inferManualBoldsignVerifyTarget({
+    requestedTarget,
+    documentId: normalizedDocumentId,
+    answers,
+    properties,
+  })
+  if (!resolvedTarget) {
+    throw new Error('Unable to determine which document to verify. Select the matching receipt first, then try again.')
+  }
+
+  const verifiedAt = new Date().toISOString()
+  const completedAt = getBoldsignDocumentCompletedAt(properties)
+  let restoredSignedAsset = false
+
+  if (resolvedTarget === 'resolution') {
+    answers.boldsign_resolution_document_id = normalizedDocumentId
+    answers.boldsign_resolution_sender_email = String(answers.boldsign_resolution_sender_email || senderEmail || '').trim()
+    answers.boldsign_resolution_last_checked_at = verifiedAt
+    answers.boldsign_resolution_search_last_checked_at = verifiedAt
+    answers.boldsign_resolution_signed_at = String(answers.boldsign_resolution_signed_at || '').trim() || completedAt
+    markSignedResolutionDeliveryEntries(answers, answers.boldsign_resolution_signed_at, normalizedDocumentId)
+    normalizePersistedResolutionSignedState(answers)
+    restoredSignedAsset = await ensureSignedResolutionStoredOnRecord(normalizedRoomCode, room).catch(() => false)
+    await persistRoomState(normalizedRoomCode, room, buildManualBoldsignVerifyPatches(answers))
+    emitDashboardRecordsUpdated({ reason: 'boldsign_manual_verify_completed', roomCode: normalizedRoomCode, target: 'resolution' })
+    return {
+      target: 'resolution',
+      completedAt: answers.boldsign_resolution_signed_at || completedAt,
+      restoredSignedAsset,
+    }
+  }
+
+  const completedDocumentCode = String(answers.active_8821_document_code || answers.current_8821_document_code || '').trim() || createDocumentInstanceCode('red')
+  answers.current_8821_document_code = answers.current_8821_document_code || completedDocumentCode
+  answers.active_8821_document_code = answers.active_8821_document_code || completedDocumentCode
+  answers.boldsign_8821_document_id = String(answers.boldsign_8821_document_id || '').trim() || normalizedDocumentId
+  if (resolvedTarget === 'spouse') {
+    answers.boldsign_8821_spouse_document_id = normalizedDocumentId
+    if (!String(answers.boldsign_8821_document_id || '').trim()) {
+      answers.boldsign_8821_document_id = normalizedDocumentId
+    }
+    if (isMarriedJointFilingAnswers(answers)) {
+      answers.form8821_status = 'completed'
+    }
+    answers.form8821_spouse_status = 'completed'
+  } else {
+    answers.form8821_status = 'completed'
+    if (!isMarriedJointFilingAnswers(answers)) {
+      answers.form8821_spouse_status = answers.form8821_spouse_status || 'not_required'
+    }
+  }
+  answers.boldsign_8821_sender_email = String(answers.boldsign_8821_sender_email || senderEmail || '').trim()
+  answers.boldsign_8821_last_checked_at = verifiedAt
+  answers.boldsign_8821_search_last_checked_at = verifiedAt
+
+  if (isForm8821FullySigned(answers)) {
+    answers.onboarding_status = 'documents_signed'
+    answers.completed_at = String(answers.completed_at || '').trim() || completedAt
+    answers.boldsign_8821_signed_at = String(answers.boldsign_8821_signed_at || '').trim() || completedAt
+    markSigned8821DeliveryEntries(answers, answers.boldsign_8821_signed_at, completedDocumentCode)
+    normalizePersistedSigned8821State(answers)
+    restoredSignedAsset = await ensureSigned8821StoredOnRecord(normalizedRoomCode, room, { skipClientEmail: true }).catch(() => false)
+  }
+
+  await persistRoomState(normalizedRoomCode, room, buildManualBoldsignVerifyPatches(answers))
+  emitDashboardRecordsUpdated({
+    reason: 'boldsign_manual_verify_completed',
+    roomCode: normalizedRoomCode,
+    target: resolvedTarget,
+    documentCode: completedDocumentCode,
+  })
+  return {
+    target: resolvedTarget === 'spouse' ? 'spouse' : '8821',
+    completedAt: answers.boldsign_8821_signed_at || completedAt,
+    restoredSignedAsset,
+  }
 }
 
 async function reconcileBoldsign8821Status({ roomCode, state, persist } = {}) {
@@ -14201,6 +14469,64 @@ app.post('/api/admin/consultations/:code/documents/refresh', async (req, res) =>
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
     }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to refresh document statuses' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/documents/verify', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const documentId = String(req.body?.documentId || '').trim()
+    const requestedTarget = normalizeManualBoldsignVerifyTarget(req.body?.target || 'auto')
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
+    if (!documentId) return res.status(400).json({ error: 'BoldSign document ID is required.' })
+
+    const currentItem = await getConsultationRecordByCode(roomCode)
+    if (!currentItem) return res.status(404).json({ error: 'Consultation record not found.' })
+    if (String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
+      if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+        return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+      }
+    }
+
+    const room = await ensureRoom(roomCode)
+    const answers = room?.state?.answers && typeof room.state.answers === 'object' ? room.state.answers : {}
+    const senderCandidates = [
+      String(answers.boldsign_resolution_sender_email || '').trim(),
+      String(answers.boldsign_8821_sender_email || '').trim(),
+      String(req.adminUser?.email || '').trim(),
+    ].filter(Boolean)
+    const { properties, senderEmail } = await getBoldsignDocumentPropertiesWithFallback(documentId, senderCandidates)
+    const status = String(properties?.status || '').trim().toLowerCase()
+    if (status !== 'completed') {
+      return res.status(409).json({
+        error: 'This BoldSign document is not completed yet.',
+        status: status || 'unknown',
+      })
+    }
+
+    const verificationResult = await applyManualBoldsignVerification({
+      roomCode,
+      room,
+      documentId,
+      requestedTarget,
+      senderEmail,
+      properties,
+    })
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({
+      ok: true,
+      item,
+      target: verificationResult.target,
+      completedAt: verificationResult.completedAt,
+      restoredSignedAsset: verificationResult.restoredSignedAsset,
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }),
+    })
+  } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to verify the BoldSign document.' })
   }
 })
 
