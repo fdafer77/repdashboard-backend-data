@@ -5791,13 +5791,8 @@ async function findBoldsignCompletedDocumentIdViaSearch({
   const sentBy = String(senderEmail || '').trim()
   const titleNeedles =
     kind === 'resolution'
-      ? [/resolution/i, /2848/i]
-      : [
-          /8821/i,
-          /\bred\b/i,
-          /service\s*agreement/i,
-          /\bagreement\b/i,
-        ]
+      ? [/resolution/i, /2848/i, /power\s*of\s*attorney/i, /\bpoa\b/i]
+      : [/8821/i, /\bred\b/i, /service\s*agreement/i, /\bagreement\b/i]
 
   const candidatePages = [1, 2]
   for (const page of candidatePages) {
@@ -5896,7 +5891,13 @@ async function reconcileBoldsignResolutionStatus({ roomCode, state, persist } = 
       answers[searchStampKey] = new Date().toISOString()
       const clientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
       const senderEmail = String(answers.boldsign_resolution_sender_email || answers.boldsign_8821_sender_email || '').trim()
-      const found = await findBoldsignCompletedDocumentIdViaSearch({ clientEmail, kind: 'resolution', senderEmail }).catch(() => '')
+      let found = await findBoldsignCompletedDocumentIdViaSearch({ clientEmail, kind: 'resolution', senderEmail }).catch(() => '')
+      if (!found) {
+        const spouseEmail = String(getPrimaryAnswer(answers, ['spouse_email', 'spouseEmail']) || '').trim()
+        if (spouseEmail) {
+          found = await findBoldsignCompletedDocumentIdViaSearch({ clientEmail: spouseEmail, kind: 'resolution', senderEmail }).catch(() => '')
+        }
+      }
       if (found) {
         answers.boldsign_resolution_document_id = found
         documentId = found
@@ -12856,6 +12857,8 @@ app.post('/api/admin/consultations/:code/documents/refresh', async (req, res) =>
     const answers = room?.state?.answers && typeof room.state.answers === 'object' ? room.state.answers : {}
     answers.boldsign_8821_last_checked_at = ''
     answers.boldsign_resolution_last_checked_at = ''
+    answers.boldsign_8821_search_last_checked_at = ''
+    answers.boldsign_resolution_search_last_checked_at = ''
     room.state.answers = answers
 
     const persistState = async (nextState) => {
