@@ -972,7 +972,7 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
   const result = new Map()
   if (!pool || isDbCircuitOpen() || normalizedCodes.length === 0) return result
   try {
-    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes] = await Promise.all([
+    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes, documentReceiptsRes] = await Promise.all([
       pool.query(
         `select session_code, payload
            from ti_consultation_profiles
@@ -1010,6 +1010,13 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
            from ti_billing_schedule_rows
           where session_code = any($1::text[])
           order by session_code asc, billing_scope asc, scheduled_date asc nulls last, updated_at desc, id asc`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, receipt_id, name, document_code, status, method, recipient_email, sent_at, signed_at, payload
+           from ti_document_receipts
+          where session_code = any($1::text[])
+          order by session_code asc, sent_at desc nulls last, updated_at desc, receipt_id asc`,
         [normalizedCodes],
       ),
     ])
@@ -1065,6 +1072,29 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
         billingRows,
       })
     }
+    for (const row of documentReceiptsRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      const documentReceipts = Array.isArray(existing.documentReceipts) ? existing.documentReceipts.slice() : []
+      documentReceipts.push(
+        normalizeDocumentReceiptValue({
+          id: String(row?.receipt_id || '').trim(),
+          name: row?.name,
+          documentCode: row?.document_code,
+          status: row?.status,
+          method: row?.method,
+          recipientEmail: row?.recipient_email,
+          sentAt: row?.sent_at ? new Date(row.sent_at).toISOString() : '',
+          signedAt: row?.signed_at ? new Date(row.signed_at).toISOString() : '',
+          payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+        }),
+      )
+      result.set(sessionCode, {
+        ...existing,
+        documentReceipts: documentReceipts.filter(Boolean),
+      })
+    }
   } catch (error) {
     recordDbFailure('consultation durable projection lookup failed:', error, { sessionCodeCount: normalizedCodes.length })
   }
@@ -1073,9 +1103,9 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
 
 async function dbGetConsultationDurableProjection(sessionCode = '') {
   const normalizedSessionCode = String(sessionCode || '').trim()
-  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null }
+  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [] }
   const projectionMap = await dbGetConsultationDurableProjectionMap([normalizedSessionCode])
-  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null }
+  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [] }
 }
 
 async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT) {
@@ -1104,14 +1134,18 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
         answers: row?.state?.answers || {},
       })
       const expectedFinancialProfile = normalizeConsultationFinancialProfileProjection(row?.state?.answers || {})
+      const expectedDocumentReceipts = normalizeDocumentReceiptsValue(row?.state?.answers?.document_receipts)
       const hasDurableBillingProjection = Array.isArray(existingProjection.billingRows) && existingProjection.billingRows.length > 0
       const hasDurableFinancialProjection = hasConsultationFinancialProfileProjectionData(existingProjection.financialProfile)
+      const hasDurableDocumentReceipts = Array.isArray(existingProjection.documentReceipts) && existingProjection.documentReceipts.length > 0
+      const expectsDocumentReceipts = expectedDocumentReceipts.length > 0
       const expectsFinancialProjection = hasConsultationFinancialProfileProjectionData(expectedFinancialProfile)
       if (
         existingProjection.profile &&
         existingProjection.caseFacts &&
         (hasDurableBillingProjection || expectedBillingRows.length === 0) &&
-        (hasDurableFinancialProjection || !expectsFinancialProjection)
+        (hasDurableFinancialProjection || !expectsFinancialProjection) &&
+        (hasDurableDocumentReceipts || !expectsDocumentReceipts)
       ) {
         continue
       }
@@ -1129,10 +1163,15 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
         answers: row?.state?.answers || {},
         actorEmail: '',
       })
+      await dbSyncDocumentReceiptsFromAnswers({
+        sessionCode,
+        answers: row?.state?.answers || {},
+        actorEmail: '',
+      })
       syncedCount += 1
     }
     if (syncedCount > 0) {
-      console.log(`Backfilled durable profile/case/revenue projections for ${syncedCount} consultations`)
+      console.log(`Backfilled durable profile/case/revenue/receipt projections for ${syncedCount} consultations`)
     }
     return syncedCount
   } catch (error) {
@@ -1147,11 +1186,16 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
   const caseFacts = durableProjection?.caseFacts && typeof durableProjection.caseFacts === 'object' ? durableProjection.caseFacts : null
   const financialProfile = durableProjection?.financialProfile && typeof durableProjection.financialProfile === 'object' ? durableProjection.financialProfile : null
   const billingRows = Array.isArray(durableProjection?.billingRows) ? durableProjection.billingRows : []
+  const documentReceipts = normalizeDocumentReceiptsValue(durableProjection?.documentReceipts)
   const assignIfMissing = (keys, value) => {
     if (!hasMeaningfulSessionValue(value)) return
     keys.forEach((key) => {
       if (!hasMeaningfulSessionValue(nextAnswers[key])) nextAnswers[key] = value
     })
+  }
+
+  if (documentReceipts.length) {
+    nextAnswers.document_receipts = upsertDocumentReceipts(nextAnswers.document_receipts, documentReceipts)
   }
 
   if (billingRows.length) {
@@ -8464,6 +8508,7 @@ function buildConsultationSummary(record) {
     caseFacts: record?.consultationCaseFacts || null,
     financialProfile: record?.consultationFinancialProfile || null,
     billingRows: record?.consultationBillingRows || [],
+    documentReceipts: record?.consultationDocumentReceipts || [],
   })
   normalizePersistedSigned8821State(answers)
   const rawIrsBalance = toNumberValue(
@@ -9994,6 +10039,7 @@ function buildConsultationDetail(record) {
     caseFacts: record?.consultationCaseFacts || null,
     financialProfile: record?.consultationFinancialProfile || null,
     billingRows: record?.consultationBillingRows || [],
+    documentReceipts: record?.consultationDocumentReceipts || [],
   })
   normalizePersistedSigned8821State(answers)
   const summary = buildConsultationSummary(record)
@@ -11287,6 +11333,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
+        consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
       }),
     ))
     if (!hasSearch) return items
@@ -11370,6 +11417,7 @@ async function getConsultationRecordByCode(code) {
       consultationCaseFacts: durableProjection?.caseFacts || null,
       consultationFinancialProfile: durableProjection?.financialProfile || null,
       consultationBillingRows: durableProjection?.billingRows || [],
+      consultationDocumentReceipts: durableProjection?.documentReceipts || [],
     }))
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
@@ -11486,6 +11534,8 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
       caseFactsProjectionCount: 0,
       billingProjectionRowCount: 0,
       sessionsWithBillingProjectionCount: 0,
+      documentReceiptProjectionCount: 0,
+      sessionsWithDocumentReceiptProjectionCount: 0,
       fullyProjectedCount: 0,
       missingProfileCount: 0,
       missingCaseFactsCount: 0,
@@ -11504,6 +11554,8 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
             (select count(*)::int from ti_consultation_case_facts) as case_facts_projection_count,
             (select count(*)::int from ti_billing_schedule_rows) as billing_projection_row_count,
             (select count(distinct session_code)::int from ti_billing_schedule_rows) as sessions_with_billing_projection_count,
+            (select count(*)::int from ti_document_receipts) as document_receipt_projection_count,
+            (select count(distinct session_code)::int from ti_document_receipts) as sessions_with_document_receipt_projection_count,
             (
               select count(*)::int
               from ti_sessions s
@@ -11546,6 +11598,8 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
     diagnostics.caseFactsProjectionCount = countsRes.rows?.[0]?.case_facts_projection_count ?? 0
     diagnostics.billingProjectionRowCount = countsRes.rows?.[0]?.billing_projection_row_count ?? 0
     diagnostics.sessionsWithBillingProjectionCount = countsRes.rows?.[0]?.sessions_with_billing_projection_count ?? 0
+    diagnostics.documentReceiptProjectionCount = countsRes.rows?.[0]?.document_receipt_projection_count ?? 0
+    diagnostics.sessionsWithDocumentReceiptProjectionCount = countsRes.rows?.[0]?.sessions_with_document_receipt_projection_count ?? 0
     diagnostics.fullyProjectedCount = countsRes.rows?.[0]?.fully_projected_count ?? 0
     diagnostics.missingProfileCount = countsRes.rows?.[0]?.missing_profile_count ?? 0
     diagnostics.missingCaseFactsCount = countsRes.rows?.[0]?.missing_case_facts_count ?? 0
@@ -12017,6 +12071,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
       consultationCaseFacts: durableProjection?.caseFacts || null,
       consultationFinancialProfile: durableProjection?.financialProfile || null,
       consultationBillingRows: durableProjection?.billingRows || [],
+      consultationDocumentReceipts: durableProjection?.documentReceipts || [],
     }))
     if (!item) return res.status(404).json({ error: 'Consultation record not found' })
     if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
@@ -14929,6 +14984,7 @@ async function listAllConsultationDetails() {
         consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
+        consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
       }),
     ))
   }

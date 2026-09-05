@@ -25,6 +25,25 @@ create index if not exists ti_session_backups_session_code_idx on ti_session_bac
 create index if not exists ti_session_backups_created_at_idx on ti_session_backups(created_at desc);
 create index if not exists ti_session_backups_session_code_created_at_idx on ti_session_backups(session_code, created_at desc);
 
+create table if not exists ti_document_receipts (
+  receipt_id text primary key,
+  session_code text not null,
+  name text not null default '',
+  document_code text not null default '',
+  status text not null default '',
+  method text not null default '',
+  recipient_email text not null default '',
+  sent_at timestamptz,
+  signed_at timestamptz,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  actor_email text
+);
+
+create index if not exists ti_document_receipts_session_code_idx on ti_document_receipts(session_code);
+create index if not exists ti_document_receipts_session_code_updated_at_idx on ti_document_receipts(session_code, updated_at desc);
+
 create table if not exists ti_consultation_profiles (
   session_code text primary key,
   ghl_contact_id text,
