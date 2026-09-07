@@ -15436,17 +15436,18 @@ function buildConsultationAnalytics(items = [], account = null) {
       let failedRevenue = 0
       if (!isCancellationRequested) {
         const countedProcessedIntentIds = new Set()
-        const countedProcessedMatchKeys = new Set()
-        const countedPendingMatchKeys = new Set()
-        const countedFailedMatchKeys = new Set()
+        const countedProcessedScheduleKeys = new Set()
+        const countedPendingScheduleKeys = new Set()
+        const countedFailedScheduleKeys = new Set()
         scheduleRows.forEach((row, rowIndex) => {
           const amount = toNumberValue(row?.amount)
           const tone = getBillingStatusTone(row)
+          const scheduledDateKey = normalizeBillingDateValue(row?.date || '')
           const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
-          const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
-          const matchesInvestigationRow = Boolean(matchKey && investigationScheduleRowKeys.has(matchKey))
-          const matchesResolutionRow = Boolean(matchKey && resolutionScheduleRowKeys.has(matchKey))
+          const rowMatchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
+          const matchesInvestigationRow = Boolean(rowMatchKey && investigationScheduleRowKeys.has(rowMatchKey))
+          const matchesResolutionRow = Boolean(rowMatchKey && resolutionScheduleRowKeys.has(rowMatchKey))
           let docsSignedEligible = investigationDocumentsSigned || resolutionDocumentsSigned
           if (matchesResolutionRow && !matchesInvestigationRow) {
             docsSignedEligible = resolutionDocumentsSigned
@@ -15463,29 +15464,34 @@ function buildConsultationAnalytics(items = [], account = null) {
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
           const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
           const paymentIntentId = getBillingStripePaymentIntentIdValue(row)
+          // Stable per-row key for analytics:
+          // - keeps legit duplicates within one schedule (same day + same amount) separate via rowIndex
+          // - collapses duplicates across session variants when schedules have the same shape/order
+          const scheduleRowKey = `${scheduledDateKey}|${Math.round(amount * 100)}|${rowIndex}`
           if (tone === 'processed') {
             if (paymentIntentId) {
               if (countedProcessedIntentIds.has(paymentIntentId)) return
               countedProcessedIntentIds.add(paymentIntentId)
-            } else if (matchKey) {
-              // Some schedule representations can duplicate a processed payment without storing the payment_intent.
-              // When we don't have an intent id, collapse by date+amount to prevent double counting.
-              if (countedProcessedMatchKeys.has(matchKey)) return
-              countedProcessedMatchKeys.add(matchKey)
+            } else if (scheduleRowKey) {
+              // When we don't have an intent id, collapse by the schedule row key (NOT date+amount),
+              // so split payments due the same day still count as separate rows.
+              if (countedProcessedScheduleKeys.has(scheduleRowKey)) return
+              countedProcessedScheduleKeys.add(scheduleRowKey)
             }
           } else if (tone === 'failed') {
-            if (matchKey) {
-              if (countedFailedMatchKeys.has(matchKey)) return
-              countedFailedMatchKeys.add(matchKey)
+            if (scheduleRowKey) {
+              if (countedFailedScheduleKeys.has(scheduleRowKey)) return
+              countedFailedScheduleKeys.add(scheduleRowKey)
             }
           } else if (!isPastDuePending && pendingRevenueEligible) {
-            if (matchKey) {
-              if (countedPendingMatchKeys.has(matchKey)) return
-              countedPendingMatchKeys.add(matchKey)
+            if (scheduleRowKey) {
+              if (countedPendingScheduleKeys.has(scheduleRowKey)) return
+              countedPendingScheduleKeys.add(scheduleRowKey)
             }
           }
           const paymentScheduleEntry = {
             id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
+            scheduleRowKey,
             sessionCode: String(item.sessionCode || '').trim(),
             clientName: String(item.clientName || 'Unknown client').trim() || 'Unknown client',
             pipelineName: String(item.pipelineName || 'No pipeline').trim() || 'No pipeline',
