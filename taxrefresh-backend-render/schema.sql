@@ -25,6 +25,79 @@ create index if not exists ti_session_backups_session_code_idx on ti_session_bac
 create index if not exists ti_session_backups_created_at_idx on ti_session_backups(created_at desc);
 create index if not exists ti_session_backups_session_code_created_at_idx on ti_session_backups(session_code, created_at desc);
 
+create table if not exists ti_notes (
+  note_id text primary key,
+  session_code text not null,
+  body text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  archived_at timestamptz,
+  actor_email text
+);
+
+create index if not exists ti_notes_session_code_idx on ti_notes(session_code);
+create index if not exists ti_notes_session_code_updated_at_idx on ti_notes(session_code, updated_at desc);
+create index if not exists ti_notes_session_code_archived_at_idx on ti_notes(session_code, archived_at);
+
+create table if not exists ti_ea_documents (
+  document_id text primary key,
+  session_code text not null,
+  name text not null default '',
+  category text not null default '',
+  mime_type text not null default '',
+  size_bytes bigint,
+  uploaded_at timestamptz,
+  uploaded_by text,
+  archived_at timestamptz,
+  actor_email text,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists ti_ea_documents_session_code_idx on ti_ea_documents(session_code);
+create index if not exists ti_ea_documents_session_code_archived_at_idx on ti_ea_documents(session_code, archived_at);
+create index if not exists ti_ea_documents_session_code_uploaded_at_idx on ti_ea_documents(session_code, uploaded_at desc);
+
+create table if not exists ti_ea_activity_timeline (
+  entry_id text primary key,
+  session_code text not null,
+  entry_type text not null default '',
+  title text not null default '',
+  description text not null default '',
+  created_at timestamptz,
+  archived_at timestamptz,
+  actor_email text,
+  payload jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists ti_ea_activity_timeline_session_code_idx on ti_ea_activity_timeline(session_code);
+create index if not exists ti_ea_activity_timeline_session_code_archived_at_idx on ti_ea_activity_timeline(session_code, archived_at);
+create index if not exists ti_ea_activity_timeline_session_code_created_at_idx on ti_ea_activity_timeline(session_code, created_at desc);
+
+create table if not exists ti_ea_case_state (
+  session_code text primary key,
+  ea_case_status text not null default '',
+  ea_due_date text not null default '',
+  ea_priority text not null default '',
+  ea_handled_years text not null default '',
+  ea_wage_income_years text not null default '',
+  ea_account_transcript_years text not null default '',
+  ea_transcripts_ready_for_client boolean not null default false,
+  ea_transcripts_submitted_at timestamptz,
+  ea_client_transcript_snapshot jsonb not null default '{}'::jsonb,
+  ea_resolution_recommendation text not null default '',
+  ea_important_deadlines jsonb not null default '[]'::jsonb,
+  ea_tasks jsonb not null default '[]'::jsonb,
+  payload jsonb not null default '{}'::jsonb,
+  actor_email text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists ti_ea_case_state_updated_at_idx on ti_ea_case_state(updated_at desc);
+
 create table if not exists ti_document_receipts (
   receipt_id text primary key,
   session_code text not null,

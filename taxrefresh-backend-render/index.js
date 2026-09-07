@@ -285,6 +285,122 @@ function normalizeConsultationNotesValue(value) {
     .filter((note) => note.id && (note.title || note.content))
 }
 
+function normalizeEaDocumentValue(value) {
+  if (!value || typeof value !== 'object') return null
+  const name = String(value.name || '').trim()
+  const category = String(value.category || '').trim()
+  if (!name || !category) return null
+  const uploadedAt = String(value.uploadedAt || '').trim()
+  const id =
+    String(value.id || '').trim() ||
+    buildDeterministicId('ea_doc', `${name}|${category}|${uploadedAt}|${String(value.uploadedBy || '').trim()}`)
+  return {
+    ...(value && typeof value === 'object' ? value : {}),
+    id,
+    name,
+    category,
+    mimeType: String(value.mimeType || '').trim(),
+    size: value.size === undefined || value.size === null || value.size === '' ? undefined : Number(value.size || 0),
+    uploadedAt,
+    uploadedBy: String(value.uploadedBy || '').trim(),
+  }
+}
+
+function normalizeEaDocumentsValue(value) {
+  const list = parseStoredObject(value, [])
+  if (!Array.isArray(list)) return []
+  return list.map((entry) => normalizeEaDocumentValue(entry)).filter(Boolean)
+}
+
+function normalizeEaActivityEntryValue(value) {
+  if (!value || typeof value !== 'object') return null
+  const title = String(value.title || '').trim()
+  const description = String(value.description || '').trim()
+  if (!title || !description) return null
+  const createdAt = String(value.createdAt || '').trim()
+  const id =
+    String(value.id || '').trim() ||
+    buildDeterministicId('ea_activity', `${String(value.type || '').trim()}|${title}|${createdAt}|${description}`)
+  return {
+    ...(value && typeof value === 'object' ? value : {}),
+    id,
+    type: String(value.type || '').trim(),
+    title,
+    description,
+    createdAt,
+    actor: String(value.actor || '').trim(),
+    statusLabel: String(value.statusLabel || '').trim(),
+  }
+}
+
+function normalizeEaActivityTimelineValue(value) {
+  const list = parseStoredObject(value, [])
+  if (!Array.isArray(list)) return []
+  return list.map((entry) => normalizeEaActivityEntryValue(entry)).filter(Boolean)
+}
+
+function normalizeEaCaseStateProjection(answers = {}) {
+  const safeAnswers = answers && typeof answers === 'object' ? answers : {}
+  return {
+    eaCaseStatus: String(safeAnswers.ea_case_status || '').trim(),
+    eaDueDate: String(safeAnswers.ea_due_date || '').trim(),
+    eaPriority: String(safeAnswers.ea_priority || '').trim(),
+    eaHandledYears: String(safeAnswers.ea_handled_years || '').trim(),
+    eaWageIncomeYears: String(safeAnswers.ea_wage_income_years || '').trim(),
+    eaAccountTranscriptYears: String(safeAnswers.ea_account_transcript_years || '').trim(),
+    eaTranscriptsReadyForClient:
+      safeAnswers.ea_transcripts_ready_for_client === true ||
+      String(safeAnswers.ea_transcripts_ready_for_client || '').trim().toLowerCase() === 'true',
+    eaTranscriptsSubmittedAt: String(safeAnswers.ea_transcripts_submitted_at || '').trim(),
+    eaClientTranscriptSnapshot:
+      safeAnswers.ea_client_transcript_snapshot && typeof safeAnswers.ea_client_transcript_snapshot === 'object'
+        ? safeAnswers.ea_client_transcript_snapshot
+        : parseStoredObject(safeAnswers.ea_client_transcript_snapshot, {}),
+    eaResolutionRecommendation: String(safeAnswers.ea_resolution_recommendation || '').trim(),
+    eaImportantDeadlines:
+      safeAnswers.ea_important_deadlines && typeof safeAnswers.ea_important_deadlines === 'object'
+        ? safeAnswers.ea_important_deadlines
+        : parseStoredObject(safeAnswers.ea_important_deadlines, []),
+    eaTasks: Array.isArray(safeAnswers.ea_tasks) ? safeAnswers.ea_tasks : parseStoredObject(safeAnswers.ea_tasks, []),
+  }
+}
+
+function hasEaCaseStateProjectionData(value = null) {
+  if (!value || typeof value !== 'object') return false
+  return Boolean(
+    String(value.eaCaseStatus || '').trim() ||
+      String(value.eaDueDate || '').trim() ||
+      String(value.eaPriority || '').trim() ||
+      String(value.eaHandledYears || '').trim() ||
+      String(value.eaWageIncomeYears || '').trim() ||
+      String(value.eaAccountTranscriptYears || '').trim() ||
+      value.eaTranscriptsReadyForClient === true ||
+      String(value.eaTranscriptsSubmittedAt || '').trim() ||
+      String(value.eaResolutionRecommendation || '').trim() ||
+      (value.eaClientTranscriptSnapshot && Object.keys(value.eaClientTranscriptSnapshot || {}).length) ||
+      (Array.isArray(value.eaTasks) && value.eaTasks.length) ||
+      (Array.isArray(value.eaImportantDeadlines) && value.eaImportantDeadlines.length),
+  )
+}
+
+function mergeNormalizedRecordsById(existing = [], durable = [], { sortBy = 'updatedAt' } = {}) {
+  const merged = new Map()
+  ;[...(Array.isArray(existing) ? existing : []), ...(Array.isArray(durable) ? durable : [])].forEach((entry) => {
+    if (!entry || typeof entry !== 'object') return
+    const id = String(entry.id || '').trim()
+    if (!id) return
+    const previous = merged.get(id)
+    if (!previous) {
+      merged.set(id, entry)
+      return
+    }
+    const previousAt = String(previous?.[sortBy] || previous?.createdAt || '').trim()
+    const nextAt = String(entry?.[sortBy] || entry?.createdAt || '').trim()
+    if (nextAt.localeCompare(previousAt) >= 0) merged.set(id, entry)
+  })
+  return Array.from(merged.values())
+}
+
 async function dbUpsertNoteRecord({ sessionCode, note, actorEmail = '' } = {}) {
   if (!pool || isDbCircuitOpen()) {
     if (STRICT_DB_MODE) {
@@ -423,6 +539,390 @@ async function dbSyncConsultationNotes({ sessionCode, previousNotes = [], nextNo
     })
     if (!ok && STRICT_DB_MODE) throw new Error('Failed to insert note_archived event.')
   }
+}
+
+async function dbUpsertEaDocumentRecord({ sessionCode, document, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedDocument = normalizeEaDocumentValue(document)
+  if (!normalizedSessionCode || !normalizedDocument?.id) return false
+  const uploadedAt = normalizedDocument.uploadedAt ? new Date(normalizedDocument.uploadedAt) : new Date()
+  try {
+    await pool.query(
+      `
+      insert into ti_ea_documents(document_id, session_code, name, category, mime_type, size_bytes, uploaded_at, uploaded_by, archived_at, actor_email, payload)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, null, $9, $10)
+      on conflict (document_id) do update
+        set session_code = excluded.session_code,
+            name = excluded.name,
+            category = excluded.category,
+            mime_type = excluded.mime_type,
+            size_bytes = excluded.size_bytes,
+            uploaded_at = excluded.uploaded_at,
+            uploaded_by = excluded.uploaded_by,
+            archived_at = null,
+            actor_email = excluded.actor_email,
+            payload = excluded.payload
+    `,
+      [
+        normalizedDocument.id,
+        normalizedSessionCode,
+        normalizedDocument.name,
+        normalizedDocument.category,
+        normalizedDocument.mimeType || '',
+        Number.isFinite(Number(normalizedDocument.size)) ? Number(normalizedDocument.size) : null,
+        Number.isNaN(uploadedAt.getTime()) ? new Date() : uploadedAt,
+        normalizedDocument.uploadedBy || '',
+        String(actorEmail || '').trim() || null,
+        normalizedDocument,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_ea_documents upsert failed:', error, { sessionCode: normalizedSessionCode, documentId: normalizedDocument.id })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbArchiveEaDocumentRecord({ sessionCode, documentId, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedDocumentId = String(documentId || '').trim()
+  if (!normalizedSessionCode || !normalizedDocumentId) return false
+  try {
+    await pool.query(
+      `
+      update ti_ea_documents
+         set archived_at = now(),
+             actor_email = $1
+       where session_code = $2 and document_id = $3
+    `,
+      [String(actorEmail || '').trim() || null, normalizedSessionCode, normalizedDocumentId],
+    )
+  } catch (error) {
+    recordDbFailure('ti_ea_documents archive failed:', error, { sessionCode: normalizedSessionCode, documentId: normalizedDocumentId })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbListEaDocumentRecords(sessionCode = '') {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return []
+  try {
+    const res = await pool.query(
+      `select payload from ti_ea_documents where session_code = $1 and archived_at is null order by uploaded_at desc nulls last, document_id asc`,
+      [normalizedSessionCode],
+    )
+    return (res.rows || []).map((row) => normalizeEaDocumentValue(row?.payload)).filter(Boolean)
+  } catch (error) {
+    recordDbFailure('ti_ea_documents lookup failed:', error, { sessionCode: normalizedSessionCode })
+    return []
+  }
+}
+
+async function dbSyncEaDocumentsFromAnswers({ sessionCode, answers = {}, actorEmail = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const nextDocuments = normalizeEaDocumentsValue(answers?.ea_documents)
+  const currentDocuments = await dbListEaDocumentRecords(normalizedSessionCode)
+  const currentById = new Map(currentDocuments.map((entry) => [entry.id, entry]))
+  const nextById = new Map(nextDocuments.map((entry) => [entry.id, entry]))
+  for (const entry of nextDocuments) {
+    await dbUpsertEaDocumentRecord({ sessionCode: normalizedSessionCode, document: entry, actorEmail })
+  }
+  for (const previous of currentDocuments) {
+    if (nextById.has(previous.id)) continue
+    await dbArchiveEaDocumentRecord({ sessionCode: normalizedSessionCode, documentId: previous.id, actorEmail })
+  }
+  return currentById.size > 0 || nextById.size > 0
+}
+
+async function dbUpsertEaActivityEntryRecord({ sessionCode, entry, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedEntry = normalizeEaActivityEntryValue(entry)
+  if (!normalizedSessionCode || !normalizedEntry?.id) return false
+  const createdAt = normalizedEntry.createdAt ? new Date(normalizedEntry.createdAt) : new Date()
+  try {
+    await pool.query(
+      `
+      insert into ti_ea_activity_timeline(entry_id, session_code, entry_type, title, description, created_at, actor_email, archived_at, payload)
+      values ($1, $2, $3, $4, $5, $6, $7, null, $8)
+      on conflict (entry_id) do update
+        set session_code = excluded.session_code,
+            entry_type = excluded.entry_type,
+            title = excluded.title,
+            description = excluded.description,
+            created_at = excluded.created_at,
+            actor_email = excluded.actor_email,
+            archived_at = null,
+            payload = excluded.payload
+    `,
+      [
+        normalizedEntry.id,
+        normalizedSessionCode,
+        normalizedEntry.type || '',
+        normalizedEntry.title,
+        normalizedEntry.description,
+        Number.isNaN(createdAt.getTime()) ? new Date() : createdAt,
+        String(actorEmail || '').trim() || normalizedEntry.actor || null,
+        normalizedEntry,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_ea_activity_timeline upsert failed:', error, { sessionCode: normalizedSessionCode, entryId: normalizedEntry.id })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbArchiveEaActivityEntryRecord({ sessionCode, entryId, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const normalizedEntryId = String(entryId || '').trim()
+  if (!normalizedSessionCode || !normalizedEntryId) return false
+  try {
+    await pool.query(
+      `
+      update ti_ea_activity_timeline
+         set archived_at = now(),
+             actor_email = $1
+       where session_code = $2 and entry_id = $3
+    `,
+      [String(actorEmail || '').trim() || null, normalizedSessionCode, normalizedEntryId],
+    )
+  } catch (error) {
+    recordDbFailure('ti_ea_activity_timeline archive failed:', error, { sessionCode: normalizedSessionCode, entryId: normalizedEntryId })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbListEaActivityEntryRecords(sessionCode = '') {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return []
+  try {
+    const res = await pool.query(
+      `select payload from ti_ea_activity_timeline where session_code = $1 and archived_at is null order by created_at desc nulls last, entry_id asc`,
+      [normalizedSessionCode],
+    )
+    return (res.rows || []).map((row) => normalizeEaActivityEntryValue(row?.payload)).filter(Boolean)
+  } catch (error) {
+    recordDbFailure('ti_ea_activity_timeline lookup failed:', error, { sessionCode: normalizedSessionCode })
+    return []
+  }
+}
+
+async function dbSyncEaActivityTimelineFromAnswers({ sessionCode, answers = {}, actorEmail = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const nextTimeline = normalizeEaActivityTimelineValue(answers?.ea_activity_timeline)
+  const currentTimeline = await dbListEaActivityEntryRecords(normalizedSessionCode)
+  const nextById = new Map(nextTimeline.map((entry) => [entry.id, entry]))
+  for (const entry of nextTimeline) {
+    await dbUpsertEaActivityEntryRecord({ sessionCode: normalizedSessionCode, entry, actorEmail })
+  }
+  for (const previous of currentTimeline) {
+    if (nextById.has(previous.id)) continue
+    await dbArchiveEaActivityEntryRecord({ sessionCode: normalizedSessionCode, entryId: previous.id, actorEmail })
+  }
+  return currentTimeline.length > 0 || nextTimeline.length > 0
+}
+
+async function dbUpsertEaCaseStateProjection({ sessionCode, answers = {}, actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) {
+    if (STRICT_DB_MODE) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  const projection = normalizeEaCaseStateProjection(answers)
+  if (!normalizedSessionCode) return false
+  const submittedAt = projection.eaTranscriptsSubmittedAt ? new Date(projection.eaTranscriptsSubmittedAt) : null
+  try {
+    await pool.query(
+      `
+      insert into ti_ea_case_state(
+        session_code,
+        ea_case_status,
+        ea_due_date,
+        ea_priority,
+        ea_handled_years,
+        ea_wage_income_years,
+        ea_account_transcript_years,
+        ea_transcripts_ready_for_client,
+        ea_transcripts_submitted_at,
+        ea_client_transcript_snapshot,
+        ea_resolution_recommendation,
+        ea_important_deadlines,
+        ea_tasks,
+        payload,
+        updated_at,
+        actor_email
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now(), $15)
+      on conflict (session_code) do update
+        set ea_case_status = excluded.ea_case_status,
+            ea_due_date = excluded.ea_due_date,
+            ea_priority = excluded.ea_priority,
+            ea_handled_years = excluded.ea_handled_years,
+            ea_wage_income_years = excluded.ea_wage_income_years,
+            ea_account_transcript_years = excluded.ea_account_transcript_years,
+            ea_transcripts_ready_for_client = excluded.ea_transcripts_ready_for_client,
+            ea_transcripts_submitted_at = excluded.ea_transcripts_submitted_at,
+            ea_client_transcript_snapshot = excluded.ea_client_transcript_snapshot,
+            ea_resolution_recommendation = excluded.ea_resolution_recommendation,
+            ea_important_deadlines = excluded.ea_important_deadlines,
+            ea_tasks = excluded.ea_tasks,
+            payload = excluded.payload,
+            updated_at = now(),
+            actor_email = excluded.actor_email
+    `,
+      [
+        normalizedSessionCode,
+        projection.eaCaseStatus,
+        projection.eaDueDate,
+        projection.eaPriority,
+        projection.eaHandledYears,
+        projection.eaWageIncomeYears,
+        projection.eaAccountTranscriptYears,
+        projection.eaTranscriptsReadyForClient ? true : false,
+        submittedAt && !Number.isNaN(submittedAt.getTime()) ? submittedAt : null,
+        projection.eaClientTranscriptSnapshot || {},
+        projection.eaResolutionRecommendation,
+        projection.eaImportantDeadlines || [],
+        projection.eaTasks || [],
+        projection,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_ea_case_state upsert failed:', error, { sessionCode: normalizedSessionCode })
+    if (STRICT_DB_MODE) {
+      if (isTransientDbConnectionError(error)) {
+        const wrapped = new Error('Database is temporarily unavailable.')
+        wrapped.isTransientDb = true
+        throw wrapped
+      }
+      throw error
+    }
+    return false
+  }
+  return true
+}
+
+async function dbDeleteEaCaseStateProjection(sessionCode = '') {
+  if (!pool || isDbCircuitOpen()) return false
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  try {
+    await pool.query(`delete from ti_ea_case_state where session_code = $1`, [normalizedSessionCode])
+  } catch (error) {
+    recordDbFailure('ti_ea_case_state delete failed:', error, { sessionCode: normalizedSessionCode })
+    return false
+  }
+  return true
+}
+
+async function dbSyncEaDurableFieldsFromAnswers({ sessionCode, answers = {}, actorEmail = '', changedKeys = [] } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!normalizedSessionCode) return false
+  const changedKeySet = new Set((Array.isArray(changedKeys) ? changedKeys : []).map((value) => String(value || '').trim()).filter(Boolean))
+  const syncAll = changedKeySet.size === 0
+  const shouldSyncDocuments = syncAll || changedKeySet.has('ea_documents')
+  const shouldSyncTimeline = syncAll || changedKeySet.has('ea_activity_timeline')
+  const shouldSyncCaseState =
+    syncAll ||
+    Array.from(changedKeySet).some((key) =>
+      [
+        'ea_case_status',
+        'ea_due_date',
+        'ea_priority',
+        'ea_handled_years',
+        'ea_wage_income_years',
+        'ea_account_transcript_years',
+        'ea_transcripts_ready_for_client',
+        'ea_transcripts_submitted_at',
+        'ea_client_transcript_snapshot',
+        'ea_resolution_recommendation',
+        'ea_important_deadlines',
+        'ea_tasks',
+      ].includes(key),
+    )
+  if (shouldSyncDocuments) await dbSyncEaDocumentsFromAnswers({ sessionCode: normalizedSessionCode, answers, actorEmail })
+  if (shouldSyncTimeline) await dbSyncEaActivityTimelineFromAnswers({ sessionCode: normalizedSessionCode, answers, actorEmail })
+  if (shouldSyncCaseState) {
+    if (hasEaCaseStateProjectionData(normalizeEaCaseStateProjection(answers))) {
+      await dbUpsertEaCaseStateProjection({ sessionCode: normalizedSessionCode, answers, actorEmail })
+    } else {
+      await dbDeleteEaCaseStateProjection(normalizedSessionCode)
+    }
+  }
+  return shouldSyncDocuments || shouldSyncTimeline || shouldSyncCaseState
 }
 
 function normalizeDocumentReceiptValue(value) {
@@ -972,7 +1472,8 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
   const result = new Map()
   if (!pool || isDbCircuitOpen() || normalizedCodes.length === 0) return result
   try {
-    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes, documentReceiptsRes] = await Promise.all([
+    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes, documentReceiptsRes, notesRes, eaDocumentsRes, eaActivityRes, eaCaseStateRes] =
+      await Promise.all([
       pool.query(
         `select session_code, payload
            from ti_consultation_profiles
@@ -1017,6 +1518,49 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
            from ti_document_receipts
           where session_code = any($1::text[])
           order by session_code asc, sent_at desc nulls last, updated_at desc, receipt_id asc`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, note_id, body, created_at, updated_at, archived_at
+           from ti_notes
+          where session_code = any($1::text[])
+            and archived_at is null
+          order by session_code asc, updated_at desc nulls last, note_id asc`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, payload
+           from ti_ea_documents
+          where session_code = any($1::text[])
+            and archived_at is null
+          order by session_code asc, uploaded_at desc nulls last, document_id asc`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code, payload
+           from ti_ea_activity_timeline
+          where session_code = any($1::text[])
+            and archived_at is null
+          order by session_code asc, created_at desc nulls last, entry_id asc`,
+        [normalizedCodes],
+      ),
+      pool.query(
+        `select session_code,
+                ea_case_status,
+                ea_due_date,
+                ea_priority,
+                ea_handled_years,
+                ea_wage_income_years,
+                ea_account_transcript_years,
+                ea_transcripts_ready_for_client,
+                ea_transcripts_submitted_at,
+                ea_client_transcript_snapshot,
+                ea_resolution_recommendation,
+                ea_important_deadlines,
+                ea_tasks,
+                payload
+           from ti_ea_case_state
+          where session_code = any($1::text[])`,
         [normalizedCodes],
       ),
     ])
@@ -1095,6 +1639,81 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
         documentReceipts: documentReceipts.filter(Boolean),
       })
     }
+    for (const row of notesRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      const notes = Array.isArray(existing.notes) ? existing.notes.slice() : []
+      const body = row?.body && typeof row.body === 'object' ? row.body : parseStoredObject(row?.body, {})
+      notes.push(
+        ...normalizeConsultationNotesValue([
+          {
+            id: String(row?.note_id || '').trim(),
+            title: String(body?.title || '').trim(),
+            content: String(body?.content || '').trim(),
+            author: String(body?.author || '').trim(),
+            ownerKey: String(body?.ownerKey || '').trim(),
+            createdAt: row?.created_at ? new Date(row.created_at).toISOString() : '',
+            updatedAt: row?.updated_at ? new Date(row.updated_at).toISOString() : '',
+          },
+        ]),
+      )
+      result.set(sessionCode, {
+        ...existing,
+        notes,
+      })
+    }
+    for (const row of eaDocumentsRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      const eaDocuments = Array.isArray(existing.eaDocuments) ? existing.eaDocuments.slice() : []
+      const normalizedDocument = normalizeEaDocumentValue(row?.payload)
+      if (normalizedDocument) eaDocuments.push(normalizedDocument)
+      result.set(sessionCode, {
+        ...existing,
+        eaDocuments,
+      })
+    }
+    for (const row of eaActivityRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      const eaActivityTimeline = Array.isArray(existing.eaActivityTimeline) ? existing.eaActivityTimeline.slice() : []
+      const normalizedEntry = normalizeEaActivityEntryValue(row?.payload)
+      if (normalizedEntry) eaActivityTimeline.push(normalizedEntry)
+      result.set(sessionCode, {
+        ...existing,
+        eaActivityTimeline,
+      })
+    }
+    for (const row of eaCaseStateRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      result.set(sessionCode, {
+        ...existing,
+        eaCaseState: {
+          eaCaseStatus: String(row?.ea_case_status || '').trim(),
+          eaDueDate: String(row?.ea_due_date || '').trim(),
+          eaPriority: String(row?.ea_priority || '').trim(),
+          eaHandledYears: String(row?.ea_handled_years || '').trim(),
+          eaWageIncomeYears: String(row?.ea_wage_income_years || '').trim(),
+          eaAccountTranscriptYears: String(row?.ea_account_transcript_years || '').trim(),
+          eaTranscriptsReadyForClient: Boolean(row?.ea_transcripts_ready_for_client),
+          eaTranscriptsSubmittedAt: row?.ea_transcripts_submitted_at ? new Date(row.ea_transcripts_submitted_at).toISOString() : '',
+          eaClientTranscriptSnapshot:
+            row?.ea_client_transcript_snapshot && typeof row.ea_client_transcript_snapshot === 'object'
+              ? row.ea_client_transcript_snapshot
+              : {},
+          eaResolutionRecommendation: String(row?.ea_resolution_recommendation || '').trim(),
+          eaImportantDeadlines:
+            row?.ea_important_deadlines && typeof row.ea_important_deadlines === 'object' ? row.ea_important_deadlines : [],
+          eaTasks: row?.ea_tasks && typeof row.ea_tasks === 'object' ? row.ea_tasks : [],
+          payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
+        },
+      })
+    }
   } catch (error) {
     recordDbFailure('consultation durable projection lookup failed:', error, { sessionCodeCount: normalizedCodes.length })
   }
@@ -1103,9 +1722,9 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
 
 async function dbGetConsultationDurableProjection(sessionCode = '') {
   const normalizedSessionCode = String(sessionCode || '').trim()
-  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [] }
+  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [], notes: [], eaDocuments: [], eaActivityTimeline: [], eaCaseState: null }
   const projectionMap = await dbGetConsultationDurableProjectionMap([normalizedSessionCode])
-  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [] }
+  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [], notes: [], eaDocuments: [], eaActivityTimeline: [], eaCaseState: null }
 }
 
 async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT) {
@@ -1127,6 +1746,10 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       const sessionCode = String(row?.session_code || '').trim()
       if (!sessionCode) continue
       const existingProjection = projectionMap.get(sessionCode) || {}
+      const expectedNotes = normalizeConsultationNotesValue(row?.state?.answers?.consultation_notes)
+      const expectedEaDocuments = normalizeEaDocumentsValue(row?.state?.answers?.ea_documents)
+      const expectedEaActivityTimeline = normalizeEaActivityTimelineValue(row?.state?.answers?.ea_activity_timeline)
+      const expectedEaCaseState = normalizeEaCaseStateProjection(row?.state?.answers || {})
       const expectedBillingRows = buildConsultationBillingProjectionRows({
         sessionCode,
         contactId: row?.ghl_contact_id || '',
@@ -1138,14 +1761,26 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       const hasDurableBillingProjection = Array.isArray(existingProjection.billingRows) && existingProjection.billingRows.length > 0
       const hasDurableFinancialProjection = hasConsultationFinancialProfileProjectionData(existingProjection.financialProfile)
       const hasDurableDocumentReceipts = Array.isArray(existingProjection.documentReceipts) && existingProjection.documentReceipts.length > 0
+      const hasDurableNotes = Array.isArray(existingProjection.notes) && existingProjection.notes.length > 0
+      const hasDurableEaDocuments = Array.isArray(existingProjection.eaDocuments) && existingProjection.eaDocuments.length > 0
+      const hasDurableEaActivityTimeline = Array.isArray(existingProjection.eaActivityTimeline) && existingProjection.eaActivityTimeline.length > 0
+      const hasDurableEaCaseState = hasEaCaseStateProjectionData(existingProjection.eaCaseState)
       const expectsDocumentReceipts = expectedDocumentReceipts.length > 0
       const expectsFinancialProjection = hasConsultationFinancialProfileProjectionData(expectedFinancialProfile)
+      const expectsNotes = expectedNotes.length > 0
+      const expectsEaDocuments = expectedEaDocuments.length > 0
+      const expectsEaActivityTimeline = expectedEaActivityTimeline.length > 0
+      const expectsEaCaseState = hasEaCaseStateProjectionData(expectedEaCaseState)
       if (
         existingProjection.profile &&
         existingProjection.caseFacts &&
         (hasDurableBillingProjection || expectedBillingRows.length === 0) &&
         (hasDurableFinancialProjection || !expectsFinancialProjection) &&
-        (hasDurableDocumentReceipts || !expectsDocumentReceipts)
+        (hasDurableDocumentReceipts || !expectsDocumentReceipts) &&
+        (hasDurableNotes || !expectsNotes) &&
+        (hasDurableEaDocuments || !expectsEaDocuments) &&
+        (hasDurableEaActivityTimeline || !expectsEaActivityTimeline) &&
+        (hasDurableEaCaseState || !expectsEaCaseState)
       ) {
         continue
       }
@@ -1168,10 +1803,22 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
         answers: row?.state?.answers || {},
         actorEmail: '',
       })
+      await dbSyncConsultationNotes({
+        sessionCode,
+        previousNotes: existingProjection.notes || [],
+        nextNotes: row?.state?.answers?.consultation_notes || [],
+        actorEmail: '',
+        requestId: '',
+      })
+      await dbSyncEaDurableFieldsFromAnswers({
+        sessionCode,
+        answers: row?.state?.answers || {},
+        actorEmail: '',
+      })
       syncedCount += 1
     }
     if (syncedCount > 0) {
-      console.log(`Backfilled durable profile/case/revenue/receipt projections for ${syncedCount} consultations`)
+      console.log(`Backfilled durable profile/case/revenue/receipt/EA projections for ${syncedCount} consultations`)
     }
     return syncedCount
   } catch (error) {
@@ -1187,6 +1834,10 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
   const financialProfile = durableProjection?.financialProfile && typeof durableProjection.financialProfile === 'object' ? durableProjection.financialProfile : null
   const billingRows = Array.isArray(durableProjection?.billingRows) ? durableProjection.billingRows : []
   const documentReceipts = normalizeDocumentReceiptsValue(durableProjection?.documentReceipts)
+  const notes = normalizeConsultationNotesValue(durableProjection?.notes)
+  const eaDocuments = normalizeEaDocumentsValue(durableProjection?.eaDocuments)
+  const eaActivityTimeline = normalizeEaActivityTimelineValue(durableProjection?.eaActivityTimeline)
+  const eaCaseState = durableProjection?.eaCaseState && typeof durableProjection.eaCaseState === 'object' ? durableProjection.eaCaseState : null
   const assignIfMissing = (keys, value) => {
     if (!hasMeaningfulSessionValue(value)) return
     keys.forEach((key) => {
@@ -1196,6 +1847,28 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
 
   if (documentReceipts.length) {
     nextAnswers.document_receipts = upsertDocumentReceipts(nextAnswers.document_receipts, documentReceipts)
+  }
+
+  if (notes.length) {
+    nextAnswers.consultation_notes = mergeNormalizedRecordsById(
+      normalizeConsultationNotesValue(nextAnswers.consultation_notes),
+      notes,
+      { sortBy: 'updatedAt' },
+    )
+  }
+
+  if (eaDocuments.length) {
+    nextAnswers.ea_documents = mergeNormalizedRecordsById(normalizeEaDocumentsValue(nextAnswers.ea_documents), eaDocuments, {
+      sortBy: 'uploadedAt',
+    })
+  }
+
+  if (eaActivityTimeline.length) {
+    nextAnswers.ea_activity_timeline = mergeNormalizedRecordsById(
+      normalizeEaActivityTimelineValue(nextAnswers.ea_activity_timeline),
+      eaActivityTimeline,
+      { sortBy: 'createdAt' },
+    )
   }
 
   if (billingRows.length) {
@@ -1269,6 +1942,21 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
     )
     assignIfMissing(['client_portal_financial_profile_last_saved_at'], financialProfile.lastSavedAt)
     assignIfMissing(['filingStatus', 'filing_status'], financialProfile.filingStatus)
+  }
+
+  if (eaCaseState) {
+    assignIfMissing(['ea_case_status'], eaCaseState.eaCaseStatus)
+    assignIfMissing(['ea_due_date'], eaCaseState.eaDueDate)
+    assignIfMissing(['ea_priority'], eaCaseState.eaPriority)
+    assignIfMissing(['ea_handled_years'], eaCaseState.eaHandledYears)
+    assignIfMissing(['ea_wage_income_years'], eaCaseState.eaWageIncomeYears)
+    assignIfMissing(['ea_account_transcript_years'], eaCaseState.eaAccountTranscriptYears)
+    assignIfMissing(['ea_transcripts_ready_for_client'], eaCaseState.eaTranscriptsReadyForClient ? true : null)
+    assignIfMissing(['ea_transcripts_submitted_at'], eaCaseState.eaTranscriptsSubmittedAt)
+    assignIfMissing(['ea_client_transcript_snapshot'], eaCaseState.eaClientTranscriptSnapshot)
+    assignIfMissing(['ea_resolution_recommendation'], eaCaseState.eaResolutionRecommendation)
+    assignIfMissing(['ea_important_deadlines'], eaCaseState.eaImportantDeadlines)
+    assignIfMissing(['ea_tasks'], eaCaseState.eaTasks)
   }
 
   return nextAnswers
@@ -10864,10 +11552,42 @@ async function persistRoomState(roomCode, room, patches = []) {
   if (patches.length) io.to(roomCode).emit('room_state', room.state)
   await schedulePersistRoomState(roomCode, room)
 
+  const changedAnswerKeys = patches
+    .filter((patch) => patch?.type === 'setAnswer')
+    .map((patch) => String(patch?.questionId || '').trim())
+    .filter(Boolean)
+
   // If document receipts were updated, also persist a durable projection to ti_document_receipts.
   // This prevents "receipts vanished" feelings due to mixed sources or session overwrites.
-  if (patches.some((patch) => patch?.type === 'setAnswer' && String(patch?.questionId || '').trim() === 'document_receipts')) {
+  if (changedAnswerKeys.includes('document_receipts')) {
     await dbSyncDocumentReceiptsFromAnswers({ sessionCode: roomCode, answers: room?.state?.answers || {}, actorEmail: '' })
+  }
+  if (
+    changedAnswerKeys.some((key) =>
+      [
+        'ea_documents',
+        'ea_activity_timeline',
+        'ea_case_status',
+        'ea_due_date',
+        'ea_priority',
+        'ea_handled_years',
+        'ea_wage_income_years',
+        'ea_account_transcript_years',
+        'ea_transcripts_ready_for_client',
+        'ea_transcripts_submitted_at',
+        'ea_client_transcript_snapshot',
+        'ea_resolution_recommendation',
+        'ea_important_deadlines',
+        'ea_tasks',
+      ].includes(key),
+    )
+  ) {
+    await dbSyncEaDurableFieldsFromAnswers({
+      sessionCode: roomCode,
+      answers: room?.state?.answers || {},
+      actorEmail: '',
+      changedKeys: changedAnswerKeys,
+    })
   }
 }
 
