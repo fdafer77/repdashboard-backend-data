@@ -13800,6 +13800,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     const paymentMethodId = String(req.body?.paymentMethodId || '').trim()
     const scheduledDate = String(req.body?.scheduledDate || '').trim()
     const scheduledAmount = Number(req.body?.scheduledAmount)
+    const rowKey = String(req.body?.rowKey || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     if (!Number.isInteger(scheduleIndex) || scheduleIndex < 0) return res.status(400).json({ error: 'A valid scheduleIndex is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
@@ -13830,6 +13831,22 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     const rows = Array.isArray(schedule) ? schedule.map((row) => ({ ...(row || {}) })) : []
     let targetRow = rows[scheduleIndex]
     let targetScheduleIndex = scheduleIndex
+
+    const buildRunPaymentRowKey = (row = {}, index = -1) => {
+      const normalizedDate = normalizeBillingDateValue(row?.date || '')
+      const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+      if (!normalizedDate && normalizedAmount === '0.00') return ''
+      return `${normalizedDate}|${normalizedAmount}|${index}`
+    }
+
+    if (rowKey) {
+      const matchedIndex = rows.findIndex((row, index) => buildRunPaymentRowKey(row, index) === rowKey)
+      if (matchedIndex >= 0) {
+        targetScheduleIndex = matchedIndex
+        targetRow = rows[matchedIndex]
+      }
+    }
+
     if (
       (!targetRow || (scheduledDate && String(targetRow?.date || '').trim() !== scheduledDate) || (Number.isFinite(scheduledAmount) && Number(targetRow?.amount || 0) !== scheduledAmount)) &&
       (scheduledDate || Number.isFinite(scheduledAmount))
