@@ -13707,6 +13707,73 @@ app.post('/api/admin/consultations/:code/notes', async (req, res) => {
   }
 })
 
+app.delete('/api/admin/consultations/:code/notes/:noteId', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    const noteId = String(req.params.noteId || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+    if (!noteId) return res.status(400).json({ error: 'Note id is required' })
+
+    const room = await ensureRoom(roomCode)
+    if (String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
+      const currentItem = await getConsultationRecordByCode(roomCode)
+      if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+        return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+      }
+    }
+
+    const previousNotes = normalizeConsultationNotesValue(room.state?.answers?.consultation_notes)
+    const existingNote = previousNotes.find((note) => note.id === noteId) || null
+    if (!existingNote) {
+      const item = await getConsultationRecordByCode(roomCode)
+      return res.json({
+        ok: true,
+        deleted: false,
+        item,
+        snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }),
+      })
+    }
+
+    const actorEmail = String(req.adminUser?.email || '').trim().toLowerCase()
+    const nextNotes = previousNotes.filter((note) => note.id !== noteId)
+    room.state.answers.consultation_notes = nextNotes
+    mirrorAnswerAliases(room.state.answers, 'consultation_notes', nextNotes)
+
+    await adminPersistRoomStateAndLog({
+      req,
+      roomCode,
+      room,
+      patches: [{ type: 'setAnswer', questionId: 'consultation_notes', value: room.state.answers.consultation_notes }],
+      eventType: 'consultation_note_deleted',
+      domain: 'notes',
+      actorEmail,
+      payload: {
+        noteId,
+        title: existingNote.title,
+        action: 'deleted',
+        at: new Date().toISOString(),
+      },
+      previousNotes,
+      nextNotes,
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({
+      ok: true,
+      deleted: true,
+      item,
+      noteId,
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }),
+    })
+  } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete note' })
+  }
+})
+
 app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
