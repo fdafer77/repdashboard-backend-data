@@ -13922,6 +13922,26 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       processedStripeCustomerId: customerId,
       processedPaymentMethodType: String(paymentMethod?.type || '').trim(),
     }
+
+    // Safety: if the UI ever saved duplicate "today" rows as Processed without Stripe evidence,
+    // make sure we only keep the processed state on the row that actually received the Stripe intent.
+    const normalizedTargetDate = normalizeBillingDateValue(rows[targetScheduleIndex]?.date || scheduledDate || '')
+    const normalizedTargetAmount = Number(toNumberValue(rows[targetScheduleIndex]?.amount || 0)).toFixed(2)
+    rows.forEach((row, index) => {
+      if (!row || index === targetScheduleIndex) return
+      const rowDate = normalizeBillingDateValue(row?.date || '')
+      const rowAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+      if (!rowDate || rowDate !== normalizedTargetDate) return
+      if (rowAmount !== normalizedTargetAmount) return
+      const rawStatus = String(row?.status || '').trim().toLowerCase()
+      const looksProcessed = ['processed', 'paid', 'succeeded', 'successful', 'complete', 'completed'].includes(rawStatus)
+      if (!looksProcessed) return
+      if (hasBillingProcessingEvidence(row)) return
+      row.status = ''
+      row.failureReason = ''
+      row.processorReason = ''
+      row.reason = ''
+    })
     room.state.answers[scheduleFieldKey] = rows
     const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: rows }]
     if (billingMode === 'investigation') {
