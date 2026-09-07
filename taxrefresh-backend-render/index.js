@@ -9465,6 +9465,10 @@ function buildConsultationSummary(record) {
     financialProfile: record?.consultationFinancialProfile || null,
     billingRows: record?.consultationBillingRows || [],
     documentReceipts: record?.consultationDocumentReceipts || [],
+    notes: record?.consultationNotes || [],
+    eaDocuments: record?.consultationEaDocuments || [],
+    eaActivityTimeline: record?.consultationEaActivityTimeline || [],
+    eaCaseState: record?.consultationEaCaseState || null,
   })
   normalizePersistedSigned8821State(answers)
   const rawIrsBalance = toNumberValue(
@@ -10996,6 +11000,10 @@ function buildConsultationDetail(record) {
     financialProfile: record?.consultationFinancialProfile || null,
     billingRows: record?.consultationBillingRows || [],
     documentReceipts: record?.consultationDocumentReceipts || [],
+    notes: record?.consultationNotes || [],
+    eaDocuments: record?.consultationEaDocuments || [],
+    eaActivityTimeline: record?.consultationEaActivityTimeline || [],
+    eaCaseState: record?.consultationEaCaseState || null,
   })
   normalizePersistedSigned8821State(answers)
   const summary = buildConsultationSummary(record)
@@ -12322,6 +12330,10 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
         consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
+        consultationNotes: durableProjectionMap.get(String(row.session_code || ''))?.notes || [],
+        consultationEaDocuments: durableProjectionMap.get(String(row.session_code || ''))?.eaDocuments || [],
+        consultationEaActivityTimeline: durableProjectionMap.get(String(row.session_code || ''))?.eaActivityTimeline || [],
+        consultationEaCaseState: durableProjectionMap.get(String(row.session_code || ''))?.eaCaseState || null,
       }),
     ))
     if (!hasSearch) return items
@@ -12406,6 +12418,10 @@ async function getConsultationRecordByCode(code) {
       consultationFinancialProfile: durableProjection?.financialProfile || null,
       consultationBillingRows: durableProjection?.billingRows || [],
       consultationDocumentReceipts: durableProjection?.documentReceipts || [],
+      consultationNotes: durableProjection?.notes || [],
+      consultationEaDocuments: durableProjection?.eaDocuments || [],
+      consultationEaActivityTimeline: durableProjection?.eaActivityTimeline || [],
+      consultationEaCaseState: durableProjection?.eaCaseState || null,
     }))
   }
   const room = rooms.get(normalized) || rooms.get(normalized.toUpperCase()) || rooms.get(normalized.toLowerCase())
@@ -13060,6 +13076,10 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
       consultationFinancialProfile: durableProjection?.financialProfile || null,
       consultationBillingRows: durableProjection?.billingRows || [],
       consultationDocumentReceipts: durableProjection?.documentReceipts || [],
+      consultationNotes: durableProjection?.notes || [],
+      consultationEaDocuments: durableProjection?.eaDocuments || [],
+      consultationEaActivityTimeline: durableProjection?.eaActivityTimeline || [],
+      consultationEaCaseState: durableProjection?.eaCaseState || null,
     }))
     if (!item) return res.status(404).json({ error: 'Consultation record not found' })
     if (!canEnrolledAgentAccessItem(item, req.adminUser)) {
@@ -13588,6 +13608,102 @@ app.patch('/api/admin/consultations/:code/answers/:key', async (req, res) => {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
     }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update consultation field' })
+  }
+})
+
+app.post('/api/admin/consultations/:code/notes', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const roomCode = String(req.params.code || '').trim()
+    if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
+
+    const room = await ensureRoom(roomCode)
+    if (String(req.adminUser?.designatedPosition || '').trim() === 'Enrolled Agent') {
+      const currentItem = await getConsultationRecordByCode(roomCode)
+      if (!canEnrolledAgentAccessItem(currentItem, req.adminUser)) {
+        return res.status(403).json({ error: 'You do not have access to this consultation record.' })
+      }
+    }
+
+    const previousNotes = normalizeConsultationNotesValue(room.state?.answers?.consultation_notes)
+    const incomingNote = normalizeConsultationNotesValue([req.body?.note])[0] || null
+    if (!incomingNote?.title || !incomingNote?.content) {
+      return res.status(400).json({ error: 'A note title and content are required.' })
+    }
+
+    const now = new Date().toISOString()
+    const existingNote = previousNotes.find((note) => note.id === incomingNote.id) || null
+    const actorName = String(req.adminUser?.name || req.adminUser?.email || 'EA').trim() || 'EA'
+    const actorEmail = String(req.adminUser?.email || '').trim().toLowerCase()
+    const nextNote = {
+      id: String(incomingNote.id || existingNote?.id || `note_${Date.now()}`).trim(),
+      title: String(incomingNote.title || existingNote?.title || '').trim(),
+      content: String(incomingNote.content || existingNote?.content || '').trim(),
+      author: String(incomingNote.author || existingNote?.author || actorName).trim() || actorName,
+      ownerKey: String(incomingNote.ownerKey || existingNote?.ownerKey || actorEmail).trim().toLowerCase(),
+      archived: Boolean(incomingNote.archived || existingNote?.archived),
+      createdAt: String(existingNote?.createdAt || incomingNote.createdAt || now).trim() || now,
+      updatedAt: String(incomingNote.updatedAt || now).trim() || now,
+    }
+    if (!nextNote.id || !nextNote.title || !nextNote.content) {
+      return res.status(400).json({ error: 'The note payload is invalid.' })
+    }
+
+    const nextNotes = [nextNote, ...previousNotes.filter((note) => note.id !== nextNote.id)]
+    const previousTimeline = normalizeEaActivityTimelineValue(room.state?.answers?.ea_activity_timeline)
+    const providedActivityEntry = normalizeEaActivityEntryValue(req.body?.activityEntry)
+    const nextActivityEntry =
+      providedActivityEntry ||
+      normalizeEaActivityEntryValue({
+        id: `ea_activity_note_${Date.now()}`,
+        type: 'note',
+        title: existingNote ? 'Internal note updated' : 'Internal note added',
+        description: `"${nextNote.title}" was ${existingNote ? 'updated' : 'added'} to the case notes.`,
+        createdAt: now,
+        actor: actorName,
+      })
+    const nextActivityTimeline = nextActivityEntry
+      ? [nextActivityEntry, ...previousTimeline.filter((entry) => entry.id !== nextActivityEntry.id)]
+      : previousTimeline
+
+    room.state.answers.consultation_notes = nextNotes
+    mirrorAnswerAliases(room.state.answers, 'consultation_notes', nextNotes)
+    room.state.answers.ea_activity_timeline = nextActivityTimeline
+    mirrorAnswerAliases(room.state.answers, 'ea_activity_timeline', nextActivityTimeline)
+
+    await adminPersistRoomStateAndLog({
+      req,
+      roomCode,
+      room,
+      patches: [
+        { type: 'setAnswer', questionId: 'consultation_notes', value: room.state.answers.consultation_notes },
+        { type: 'setAnswer', questionId: 'ea_activity_timeline', value: room.state.answers.ea_activity_timeline },
+      ],
+      eventType: existingNote ? 'consultation_note_updated' : 'consultation_note_created',
+      domain: 'notes',
+      actorEmail,
+      payload: {
+        noteId: nextNote.id,
+        title: nextNote.title,
+        action: existingNote ? 'updated' : 'created',
+        at: now,
+      },
+      previousNotes,
+      nextNotes,
+    })
+
+    const item = await getConsultationRecordByCode(roomCode)
+    return res.json({
+      ok: true,
+      item,
+      note: nextNote,
+      snapshot: buildSnapshotMeta({ source: 'db', updatedAt: item?.updatedAt || null }),
+    })
+  } catch (error) {
+    if (error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save note' })
   }
 })
 
@@ -16068,6 +16184,10 @@ async function listAllConsultationDetails() {
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
         consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
+        consultationNotes: durableProjectionMap.get(String(row.session_code || ''))?.notes || [],
+        consultationEaDocuments: durableProjectionMap.get(String(row.session_code || ''))?.eaDocuments || [],
+        consultationEaActivityTimeline: durableProjectionMap.get(String(row.session_code || ''))?.eaActivityTimeline || [],
+        consultationEaCaseState: durableProjectionMap.get(String(row.session_code || ''))?.eaCaseState || null,
       }),
     ))
   }
