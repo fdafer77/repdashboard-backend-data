@@ -12091,6 +12091,15 @@ async function getSessionStateForCode(code) {
 async function findLatestSessionByEmail(email = '') {
   const normalized = String(email || '').trim().toLowerCase()
   if (!normalized) return null
+  const rankPortalCandidateRows = (rows = []) =>
+    (Array.isArray(rows) ? rows : [])
+      .filter(Boolean)
+      .sort((a, b) => {
+        const aAuthorized = isPortalAuthorizedForAnswers(a?.state?.answers || {}) ? 1 : 0
+        const bAuthorized = isPortalAuthorizedForAnswers(b?.state?.answers || {}) ? 1 : 0
+        if (aAuthorized !== bAuthorized) return bAuthorized - aAuthorized
+        return String(b?.updated_at || '').localeCompare(String(a?.updated_at || ''))
+      })
 
   if (pool) {
     const query = `
@@ -12100,26 +12109,25 @@ async function findLatestSessionByEmail(email = '') {
         lower(coalesce(state->'answers'->>'email', '')) = $1
         or lower(coalesce(state->'answers'->>'email_address', '')) = $1
       order by updated_at desc
-      limit 1
+      limit 25
     `
     const res = await pool.query(query, [normalized])
-    return res.rows?.[0] || null
+    return rankPortalCandidateRows(res.rows)[0] || null
   }
 
   const persistedRows = await fallbackListSessions()
-  const candidates = persistedRows
+  const candidates = rankPortalCandidateRows(persistedRows
     .map((row) => {
       const answers = row?.state?.answers || {}
       const rowEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
       if (!rowEmail || rowEmail !== normalized) return null
       return row
     })
-    .filter(Boolean)
-    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+    .filter(Boolean))
 
   if (candidates[0]) return candidates[0]
 
-  const liveCandidates = Array.from(rooms.entries())
+  const liveCandidates = rankPortalCandidateRows(Array.from(rooms.entries())
     .map(([sessionCode, room]) => {
       const answers = room?.state?.answers || {}
       const rowEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
@@ -12133,8 +12141,7 @@ async function findLatestSessionByEmail(email = '') {
         updated_at: new Date(Number(room?.state?.updatedAt) || Date.now()),
       }
     })
-    .filter(Boolean)
-    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+    .filter(Boolean))
 
   return liveCandidates[0] || null
 }
@@ -12158,6 +12165,15 @@ function maskPortalPhoneNumber(value = '') {
 async function findLatestSessionByPhone(phone = '') {
   const normalizedDigits = getPortalPhoneDigits(phone)
   if (normalizedDigits.length !== 10) return null
+  const rankPortalCandidateRows = (rows = []) =>
+    (Array.isArray(rows) ? rows : [])
+      .filter(Boolean)
+      .sort((a, b) => {
+        const aAuthorized = isPortalAuthorizedForAnswers(a?.state?.answers || {}) ? 1 : 0
+        const bAuthorized = isPortalAuthorizedForAnswers(b?.state?.answers || {}) ? 1 : 0
+        if (aAuthorized !== bAuthorized) return bAuthorized - aAuthorized
+        return String(b?.updated_at || '').localeCompare(String(a?.updated_at || ''))
+      })
 
   if (pool) {
     const query = `
@@ -12171,26 +12187,25 @@ async function findLatestSessionByPhone(phone = '') {
         or right(regexp_replace(coalesce(state->'answers'->>'cell', ''), '[^0-9]', '', 'g'), 10) = $1
         or right(regexp_replace(coalesce(state->'answers'->>'cell_phone', ''), '[^0-9]', '', 'g'), 10) = $1
       order by updated_at desc
-      limit 1
+      limit 25
     `
     const res = await pool.query(query, [normalizedDigits])
-    return res.rows?.[0] || null
+    return rankPortalCandidateRows(res.rows)[0] || null
   }
 
   const persistedRows = await fallbackListSessions()
-  const candidates = persistedRows
+  const candidates = rankPortalCandidateRows(persistedRows
     .map((row) => {
       const answers = row?.state?.answers || {}
       const rowDigits = getPortalPhoneDigits(getDashboardPhoneForPortal(answers))
       if (!rowDigits || rowDigits !== normalizedDigits) return null
       return row
     })
-    .filter(Boolean)
-    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+    .filter(Boolean))
 
   if (candidates[0]) return candidates[0]
 
-  const liveCandidates = Array.from(rooms.entries())
+  const liveCandidates = rankPortalCandidateRows(Array.from(rooms.entries())
     .map(([sessionCode, room]) => {
       const answers = room?.state?.answers || {}
       const rowDigits = getPortalPhoneDigits(getDashboardPhoneForPortal(answers))
@@ -12204,8 +12219,7 @@ async function findLatestSessionByPhone(phone = '') {
         updated_at: new Date(Number(room?.state?.updatedAt) || Date.now()),
       }
     })
-    .filter(Boolean)
-    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+    .filter(Boolean))
 
   return liveCandidates[0] || null
 }
