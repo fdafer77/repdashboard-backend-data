@@ -3567,12 +3567,14 @@ function normalizePersistedResolutionSignedState(answers = {}) {
   if (!String(answers?.boldsign_resolution_signed_at || '').trim() && !hasSignedResolutionDocuments(answers)) return false
   const signedAt = String(answers?.boldsign_resolution_signed_at || '').trim() || new Date().toISOString()
   const documentCode = String(answers?.boldsign_resolution_document_id || '').trim()
+  const beforeSignedAt = String(answers?.boldsign_resolution_signed_at || '').trim()
   const beforeDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
   const beforeReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
+  answers.boldsign_resolution_signed_at = signedAt
   markSignedResolutionDeliveryEntries(answers, signedAt, documentCode)
   const afterDelivery = JSON.stringify(parseStoredObject(answers?.document_delivery_log, []))
   const afterReceipts = JSON.stringify(parseStoredObject(answers?.document_receipts, []))
-  return beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
+  return beforeSignedAt !== signedAt || beforeDelivery !== afterDelivery || beforeReceipts !== afterReceipts
 }
 
 function maybeTrackExperienceDocumentRoute(roomCode, room, nextRoute = '', previousRoute = '') {
@@ -13426,11 +13428,12 @@ app.get('/api/admin/consultations/:code/signed-resolution', async (req, res) => 
     }
 
     const answers = item.answers || {}
+    normalizePersistedResolutionSignedState(answers)
     const documentId = String(answers.boldsign_resolution_document_id || '').trim()
     if (!documentId) {
       return res.status(404).json({ error: 'No signed Form 2848 document is available for this client yet.' })
     }
-    if (!String(answers.boldsign_resolution_signed_at || '').trim()) {
+    if (!String(answers.boldsign_resolution_signed_at || '').trim() && !hasSignedResolutionDocuments(answers)) {
       return res.status(409).json({ error: 'Form 2848 is not fully signed yet.' })
     }
 
