@@ -14956,8 +14956,11 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     if (!['8821 Document', 'Resolution Documents'].includes(documentType)) {
       return res.status(400).json({ error: 'A supported document type is required.' })
     }
-    if (OUTBOUND_EMAILS_DISABLED) {
-      return res.status(503).json({ error: 'Outbound client emails are temporarily disabled.' })
+    // NOTE: Resolution documents are sent via BoldSign as part of the EA/resolution workflow.
+    // We keep the safety kill-switch for 8821 (which historically caused runaway sends),
+    // but still allow Resolution Documents to go out even when general outbound emails are paused.
+    if (documentType === '8821 Document' && OUTBOUND_8821_EMAILS_DISABLED) {
+      return res.status(503).json({ error: 'Outbound 8821 emails are temporarily disabled.' })
     }
 
     const room = await ensureRoom(roomCode)
@@ -15241,8 +15244,8 @@ app.post('/api/admin/consultations/:code/release-spouse-document-email', async (
   try {
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required.' })
-    if (OUTBOUND_EMAILS_DISABLED) {
-      return res.status(503).json({ error: 'Outbound client emails are temporarily disabled.' })
+    if (OUTBOUND_8821_EMAILS_DISABLED) {
+      return res.status(503).json({ error: 'Outbound 8821 emails are temporarily disabled.' })
     }
 
     const room = await ensureRoom(roomCode)
