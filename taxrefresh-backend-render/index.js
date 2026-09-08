@@ -2391,6 +2391,14 @@ function getSessionBackupChecksum(payload = {}) {
   return crypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex')
 }
 
+function buildDocumentReceiptKeySlug(input = '') {
+  return String(input || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
 async function dbInsertSessionBackup({ sessionCode, contactId = '', opportunityId = '', state, previousState = null, reason = 'session_upsert' } = {}) {
   if (!pool) return false
   if (isDbCircuitOpen()) return false
@@ -14992,6 +15000,11 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         ? answers.hidden_document_receipt_names
         : parseStoredObject(answers.hidden_document_receipt_names, [])
     ).filter((name) => typeof name === 'string' && name.trim())
+    const hiddenDocumentReceiptKeys = (
+      Array.isArray(answers.hidden_document_receipt_keys)
+        ? answers.hidden_document_receipt_keys
+        : parseStoredObject(answers.hidden_document_receipt_keys, [])
+    ).filter((key) => typeof key === 'string' && key.trim())
     const sentAt = new Date().toISOString()
     const nextReceipts = []
     const logEntries = []
@@ -15072,7 +15085,15 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         form8821SpouseLink: '',
       }
 
-      nextReceipts.push({ name: '8821 Document', documentCode, status: 'Sent' })
+      nextReceipts.push({
+        name: '8821 Document',
+        documentCode,
+        status: 'Sent',
+        method: 'BoldSign Email',
+        sentAt,
+        recipientEmail: resolvedRecipientEmail,
+        sentBy: String(req.adminUser?.email || '').trim(),
+      })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_client`,
         documentType: '8821 Document',
@@ -15113,7 +15134,15 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
         persistDocument: true,
       })
       const resolutionDocumentCode = String(answers.boldsign_resolution_document_id || '').trim()
-      nextReceipts.push({ name: 'Resolution Documents', documentCode: resolutionDocumentCode, status: 'Sent' })
+      nextReceipts.push({
+        name: 'Resolution Documents',
+        documentCode: resolutionDocumentCode,
+        status: 'Sent',
+        method: 'BoldSign Email',
+        sentAt,
+        recipientEmail: resolvedRecipientEmail,
+        sentBy: String(req.adminUser?.email || '').trim(),
+      })
       logEntries.push({
         id: `doc_email_${Date.now().toString(36)}_resolution`,
         documentType: 'Resolution Documents',
@@ -15136,8 +15165,20 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     }
 
     const resentNames = new Set(nextReceipts.map((receipt) => String(receipt?.name || '').trim()).filter(Boolean))
+    const resentKeySlugs = new Set(
+      Array.from(resentNames)
+        .map((name) => buildDocumentReceiptKeySlug(name))
+        .filter(Boolean),
+    )
     answers.document_receipts = upsertDocumentReceipts(answers.document_receipts, nextReceipts)
     answers.hidden_document_receipt_names = hiddenDocumentReceiptNames.filter((name) => !resentNames.has(String(name || '').trim()))
+    // If a document type was previously deleted/hidden via a storage key, clear those keys on resend
+    // so the new receipt can re-appear (especially older receipts that lacked sentAt/recipient fields).
+    answers.hidden_document_receipt_keys = hiddenDocumentReceiptKeys.filter((key) => {
+      const normalized = String(key || '').trim().toLowerCase()
+      if (!normalized) return false
+      return !Array.from(resentKeySlugs).some((slug) => slug && (normalized.startsWith(`${slug}__`) || normalized.includes(slug)))
+    })
     answers.document_email_log = [...logEntries, ...(Array.isArray(documentEmailLog) ? documentEmailLog : [])]
     answers.document_delivery_log = [...deliveryEntries, ...(Array.isArray(documentDeliveryLog) ? documentDeliveryLog : [])]
     answers.last_document_email_sent_at = sentAt
@@ -15146,6 +15187,7 @@ app.post('/api/admin/consultations/:code/send-document-email', async (req, res) 
     await persistRoomState(roomCode, room, [
       { type: 'setAnswer', questionId: 'document_receipts', value: answers.document_receipts },
       { type: 'setAnswer', questionId: 'hidden_document_receipt_names', value: answers.hidden_document_receipt_names },
+      { type: 'setAnswer', questionId: 'hidden_document_receipt_keys', value: answers.hidden_document_receipt_keys },
       { type: 'setAnswer', questionId: 'document_email_log', value: answers.document_email_log },
       { type: 'setAnswer', questionId: 'document_delivery_log', value: answers.document_delivery_log },
       { type: 'setAnswer', questionId: 'last_document_email_sent_at', value: sentAt },
