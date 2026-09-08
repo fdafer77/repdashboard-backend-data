@@ -9496,11 +9496,13 @@ function buildConsultationSummary(record) {
   const hasProcessedPayment = processedPaymentCount > 0
   const investigationBillingSchedule = getScopedBillingScheduleRowsFromAnswers(answers, 'investigation')
   const investigationBillingInvoiceAmount = getBillingInvoiceAmountFromAnswers(answers, 'investigation')
+  const investigationBillingScheduleTotal = investigationBillingSchedule.reduce((sum, row) => sum + toNumberValue(row?.amount), 0)
   const investigationProcessedAmount = investigationBillingSchedule
     .filter((row) => getBillingStatusTone(row) === 'processed')
     .reduce((sum, row) => sum + toNumberValue(row?.amount), 0)
+  const investigationBillingTargetAmount = investigationBillingInvoiceAmount > 0 ? investigationBillingInvoiceAmount : investigationBillingScheduleTotal
   const investigationBillingPaidInFull = Boolean(
-    investigationBillingInvoiceAmount > 0 && investigationProcessedAmount >= investigationBillingInvoiceAmount,
+    investigationBillingTargetAmount > 0 && investigationProcessedAmount >= investigationBillingTargetAmount,
   )
   const nextOutstandingBillingRow =
     getOutstandingBillingRows(billingSchedule).sort((a, b) => String(a?.date || '9999-12-31').localeCompare(String(b?.date || '9999-12-31')))[0] || null
