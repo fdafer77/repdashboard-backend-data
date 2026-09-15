@@ -69,6 +69,24 @@ services:
         sync: false
       - key: EXPERIAN_SOFT_PULL_API_KEY_HEADER
         value: x-api-key
+      - key: CANOPY_SYNC_ENABLED
+        value: "0"
+      - key: CANOPY_SYNC_TARGET_URL
+        sync: false
+      - key: CANOPY_SYNC_AUTH_TOKEN
+        sync: false
+      - key: CANOPY_SYNC_AUTH_HEADER
+        value: authorization
+      - key: CANOPY_SYNC_AUTH_SCHEME
+        value: Bearer
+      - key: CANOPY_SYNC_POLL_MS
+        value: "60000"
+      - key: CANOPY_SYNC_MAX_ATTEMPTS
+        value: "6"
+      - key: CANOPY_SYNC_STARTUP_BACKFILL
+        value: "0"
+      - key: CANOPY_SYNC_ACTIVE_EA_STATUSES
+        value: Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program
 
 databases:
   - name: taxrefresh-postgres

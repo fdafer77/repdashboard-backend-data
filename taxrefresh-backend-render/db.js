@@ -325,4 +325,39 @@ export async function ensureSchema(pool) {
   await pool.query(`create index if not exists ti_consultation_financial_profiles_opportunity_id_idx on ti_consultation_financial_profiles(ghl_opportunity_id);`)
   await pool.query(`create index if not exists ti_consultation_financial_profiles_complete_idx on ti_consultation_financial_profiles(profile_complete, updated_at desc);`)
   await pool.query(`create index if not exists ti_consultation_financial_profiles_updated_at_idx on ti_consultation_financial_profiles(updated_at desc);`)
+
+  // Canopy mirror state for EA-active client sync.
+  await pool.query(`
+    create table if not exists ti_canopy_client_sync (
+      session_code text primary key,
+      canopy_client_id text,
+      sync_state text not null default 'pending',
+      last_synced_at timestamptz,
+      last_payload_hash text not null default '',
+      last_error text not null default '',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `)
+  await pool.query(`create index if not exists ti_canopy_client_sync_updated_at_idx on ti_canopy_client_sync(updated_at desc);`)
+  await pool.query(`create index if not exists ti_canopy_client_sync_state_idx on ti_canopy_client_sync(sync_state, updated_at desc);`)
+
+  await pool.query(`
+    create table if not exists ti_canopy_sync_jobs (
+      id bigserial primary key,
+      session_code text not null,
+      job_type text not null default 'upsert_client',
+      trigger_reason text not null default '',
+      status text not null default 'pending',
+      attempt_count integer not null default 0,
+      run_after timestamptz not null default now(),
+      response_snapshot jsonb not null default '{}'::jsonb,
+      error_message text not null default '',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `)
+  await pool.query(`create index if not exists ti_canopy_sync_jobs_session_code_idx on ti_canopy_sync_jobs(session_code);`)
+  await pool.query(`create index if not exists ti_canopy_sync_jobs_status_run_after_idx on ti_canopy_sync_jobs(status, run_after asc, updated_at asc);`)
+  await pool.query(`create index if not exists ti_canopy_sync_jobs_created_at_idx on ti_canopy_sync_jobs(created_at desc);`)
 }

@@ -37,6 +37,18 @@ Optional, only if you use them:
 - `GHL_SYNC_WEBHOOK_URL`
 - `GHL_SYNC_WEBHOOK_SECRET`
 
+Canopy sync, only when you are ready to push EA-active clients into Canopy:
+
+- `CANOPY_SYNC_ENABLED`
+- `CANOPY_SYNC_TARGET_URL`
+- `CANOPY_SYNC_AUTH_TOKEN`
+- `CANOPY_SYNC_AUTH_HEADER`
+- `CANOPY_SYNC_AUTH_SCHEME`
+- `CANOPY_SYNC_POLL_MS`
+- `CANOPY_SYNC_MAX_ATTEMPTS`
+- `CANOPY_SYNC_STARTUP_BACKFILL`
+- `CANOPY_SYNC_ACTIVE_EA_STATUSES`
+
 ## Render deploy steps
 
 1. Create a new GitHub repo for this backend package.
@@ -59,6 +71,47 @@ These are already set in `render.yaml`:
 - `PUBLIC_BASE_URL=https://secure.taxrefresh.us`
 - `EXPERIENCE_BASE_URL=https://secure.taxrefresh.us`
 - `BOLDSIGN_8821_PDF_PATH=./assets/f8821.pdf`
+
+Canopy sync defaults are also included in `render.yaml`, but they start in a safe disabled state:
+
+- `CANOPY_SYNC_ENABLED=0`
+- `CANOPY_SYNC_AUTH_HEADER=authorization`
+- `CANOPY_SYNC_AUTH_SCHEME=Bearer`
+- `CANOPY_SYNC_POLL_MS=60000`
+- `CANOPY_SYNC_MAX_ATTEMPTS=6`
+- `CANOPY_SYNC_STARTUP_BACKFILL=0`
+- `CANOPY_SYNC_ACTIVE_EA_STATUSES=Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program`
+
+You still need to provide these Canopy secrets in Render before enabling the worker:
+
+- `CANOPY_SYNC_TARGET_URL`
+- `CANOPY_SYNC_AUTH_TOKEN`
+
+## Canopy rollout order
+
+Use this order so the dashboard stays untouched while you validate the mirror path.
+
+1. Deploy the backend with `CANOPY_SYNC_ENABLED=0`.
+2. Add `CANOPY_SYNC_TARGET_URL` and `CANOPY_SYNC_AUTH_TOKEN` in Render.
+3. Redeploy and confirm the backend is healthy at `/health`.
+4. Flip `CANOPY_SYNC_ENABLED=1` and keep `CANOPY_SYNC_STARTUP_BACKFILL=0`.
+5. Create or update one EA-active test client in the dashboard and verify the client appears correctly in Canopy.
+6. If that single-client test succeeds, call the admin backfill endpoint `POST /api/admin/canopy/backfill-active-clients` to queue the current EA-active clients.
+7. Only after the backfill looks correct should you consider turning on `CANOPY_SYNC_STARTUP_BACKFILL=1`.
+
+## Recommended initial values
+
+These are the safest first values in Render:
+
+- `CANOPY_SYNC_ENABLED=0` for the first deploy, then `1` after the target is verified
+- `CANOPY_SYNC_TARGET_URL=<your Canopy upsert endpoint or your proxy endpoint>`
+- `CANOPY_SYNC_AUTH_TOKEN=<secret token>`
+- `CANOPY_SYNC_AUTH_HEADER=authorization`
+- `CANOPY_SYNC_AUTH_SCHEME=Bearer`
+- `CANOPY_SYNC_POLL_MS=60000`
+- `CANOPY_SYNC_MAX_ATTEMPTS=6`
+- `CANOPY_SYNC_STARTUP_BACKFILL=0`
+- `CANOPY_SYNC_ACTIVE_EA_STATUSES=Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program`
 
 ## BoldSign branding control
 

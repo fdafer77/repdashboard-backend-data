@@ -36,6 +36,32 @@ const GHL_API_BASE_URL = String(process.env.GHL_API_BASE_URL || 'https://service
 const GHL_PRIVATE_INTEGRATION_TOKEN = String(process.env.GHL_PRIVATE_INTEGRATION_TOKEN || '').trim()
 const GHL_LOCATION_ID = String(process.env.GHL_LOCATION_ID || '').trim()
 const GHL_INSECURE_SSL = String(process.env.GHL_INSECURE_SSL || '').trim() === '1'
+const CANOPY_SYNC_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.CANOPY_SYNC_ENABLED || '').trim().toLowerCase())
+const CANOPY_SYNC_TARGET_URL = String(
+  process.env.CANOPY_SYNC_TARGET_URL ||
+    process.env.CANOPY_CLIENT_UPSERT_URL ||
+    process.env.CANOPY_API_UPSERT_URL ||
+    '',
+).trim()
+const CANOPY_SYNC_AUTH_TOKEN = String(process.env.CANOPY_SYNC_AUTH_TOKEN || process.env.CANOPY_API_TOKEN || '').trim()
+const CANOPY_SYNC_AUTH_HEADER = String(process.env.CANOPY_SYNC_AUTH_HEADER || 'authorization').trim() || 'authorization'
+const CANOPY_SYNC_AUTH_SCHEME = String(process.env.CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
+const CANOPY_SYNC_POLL_MS = Math.max(10_000, Number(process.env.CANOPY_SYNC_POLL_MS || 60_000) || 60_000)
+const CANOPY_SYNC_MAX_ATTEMPTS = Math.max(1, Math.min(20, Number(process.env.CANOPY_SYNC_MAX_ATTEMPTS || 6) || 6))
+const CANOPY_SYNC_STARTUP_BACKFILL_ENABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.CANOPY_SYNC_STARTUP_BACKFILL || '').trim().toLowerCase(),
+)
+const CANOPY_SYNC_ACTIVE_EA_STATUSES = Array.from(
+  new Set(
+    String(
+      process.env.CANOPY_SYNC_ACTIVE_EA_STATUSES ||
+        'Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program',
+    )
+      .split(',')
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean),
+  ),
+)
 
 if (GHL_INSECURE_SSL) {
   // Local dev workaround for environments missing the correct certificate chain.
@@ -97,6 +123,8 @@ let calendlyIdentityCache = {
   fetchedAt: 0,
   resource: null,
 }
+let canopySyncWorkerTimer = null
+let canopySyncWorkerRunning = false
 
 const DEFAULT_GHL_CONTACT_FIELDS = [
   { slug: 'portal_session_code', name: 'Portal Session Code' },
@@ -120,7 +148,13 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null
 if (pool) {
   // eslint-disable-next-line no-console
   ensureSchema(pool)
-    .then(() => seedConsultationDurableProjectionBackfill().catch((error) => console.error('Durable projection backfill failed:', error)))
+    .then(async () => {
+      await seedConsultationDurableProjectionBackfill().catch((error) => console.error('Durable projection backfill failed:', error))
+      if (CANOPY_SYNC_STARTUP_BACKFILL_ENABLED) {
+        await enqueueCanopySyncBackfill({ reason: 'startup_backfill' }).catch((error) => console.error('Canopy startup backfill failed:', error))
+      }
+      startCanopySyncWorker()
+    })
     .catch((e) => console.error('DB schema init failed:', e))
 }
 
@@ -914,6 +948,12 @@ async function dbSyncEaDurableFieldsFromAnswers({ sessionCode, answers = {}, act
   if (shouldSyncCaseState) {
     if (hasEaCaseStateProjectionData(normalizeEaCaseStateProjection(answers))) {
       await dbUpsertEaCaseStateProjection({ sessionCode: normalizedSessionCode, answers, actorEmail })
+      await queueCanopySyncIfEligible({
+        sessionCode: normalizedSessionCode,
+        answers,
+        actorEmail,
+        reason: syncAll ? 'ea_case_state_sync' : 'ea_case_state_changed',
+      })
     } else {
       await dbDeleteEaCaseStateProjection(normalizedSessionCode)
     }
@@ -1300,6 +1340,573 @@ async function dbSyncConsultationDurableFields({ sessionCode, contactId = '', op
     answers: sourceAnswers,
     actorEmail,
   })
+  await queueCanopySyncIfEligible({
+    sessionCode: normalizedSessionCode,
+    answers: sourceAnswers,
+    actorEmail,
+    reason: 'durable_projection_sync',
+  })
+}
+
+function normalizeCanopyEaStatus(value = '') {
+  return String(value || '').trim().toLowerCase()
+}
+
+function isCanopyEligibleEaStatus(status = '') {
+  const normalizedStatus = normalizeCanopyEaStatus(status)
+  return Boolean(normalizedStatus) && CANOPY_SYNC_ACTIVE_EA_STATUSES.includes(normalizedStatus)
+}
+
+function buildCanopyPayloadHash(payload = {}) {
+  return crypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex')
+}
+
+function getCanopyBackoffMs(attemptCount = 1) {
+  const baseDelay = Math.max(30_000, CANOPY_SYNC_POLL_MS)
+  const exponent = Math.max(0, Number(attemptCount || 1) - 1)
+  return Math.min(6 * 60 * 60 * 1000, baseDelay * (2 ** exponent))
+}
+
+function extractCanopyClientId(responseBody = {}) {
+  if (!responseBody || typeof responseBody !== 'object') return ''
+  return String(
+    responseBody?.canopyClientId ||
+      responseBody?.clientId ||
+      responseBody?.id ||
+      responseBody?.client?.id ||
+      responseBody?.data?.id ||
+      '',
+  ).trim()
+}
+
+function buildCanopySyncPayloadFromDetail(detail) {
+  if (!detail) return { eligible: false, status: '', payload: null, payloadHash: '', reason: 'missing_detail' }
+  const answers = detail?.answers && typeof detail.answers === 'object' ? detail.answers : {}
+  const profile = normalizeConsultationProfileProjection(answers)
+  const caseFacts = normalizeConsultationCaseFactsProjection(answers)
+  const financialProfile = normalizeConsultationFinancialProfileProjection(answers)
+  const eaCaseState = normalizeEaCaseStateProjection(answers)
+  const normalizedEaStatus = String(eaCaseState?.eaCaseStatus || '').trim()
+  if (!isCanopyEligibleEaStatus(normalizedEaStatus)) {
+    return {
+      eligible: false,
+      status: normalizedEaStatus,
+      payload: null,
+      payloadHash: '',
+      reason: 'ea_status_not_eligible',
+    }
+  }
+  const payload = {
+    sourceSystem: 'taxrefresh',
+    sourceUpdatedAt: String(detail?.updatedAt || '').trim() || new Date().toISOString(),
+    externalId: String(detail?.sessionCode || '').trim(),
+    client: {
+      name: profile.clientName,
+      firstName: profile.firstName,
+      lastName: profile.lastName,
+      email: profile.email,
+      phone: profile.phone,
+      dateOfBirth: profile.dateOfBirth,
+      addressLine1: profile.addressLine1,
+      city: profile.city,
+      stateCode: profile.stateCode,
+      postalCode: profile.postalCode,
+      spouseFullName: profile.spouseFullName,
+      spouseFirstName: profile.spouseFirstName,
+      spouseLastName: profile.spouseLastName,
+      spouseEmail: profile.spouseEmail,
+      spousePhone: profile.spousePhone,
+      spouseDateOfBirth: profile.spouseDateOfBirth,
+    },
+    taxProfile: {
+      filingStatus: caseFacts.filingStatus,
+      taxType: caseFacts.taxType,
+      taxAgency: caseFacts.taxAgency,
+      taxSituation: caseFacts.taxSituation,
+      oweYears: caseFacts.oweYears,
+      irsBalance: toNumberValue(caseFacts.irsBalance),
+      stateBalance: toNumberValue(caseFacts.stateBalance),
+      totalLiability: toNumberValue(caseFacts.totalLiability),
+    },
+    financialProfile: {
+      profileComplete: Boolean(financialProfile.profileComplete),
+      currentStep: Number(financialProfile.currentStep || 0) || 0,
+      completionPercent: Number(financialProfile.completionPercent || 0) || 0,
+      monthlyIncome: toNumberValue(financialProfile.monthlyIncome),
+      monthlyExpenses: toNumberValue(financialProfile.monthlyExpenses),
+      monthlyNet: toNumberValue(financialProfile.monthlyNet),
+      totalAssets: toNumberValue(financialProfile.totalAssets),
+    },
+    eaCase: {
+      status: normalizedEaStatus,
+      dueDate: eaCaseState.eaDueDate,
+      priority: eaCaseState.eaPriority,
+      handledYears: eaCaseState.eaHandledYears,
+      wageIncomeYears: eaCaseState.eaWageIncomeYears,
+      accountTranscriptYears: eaCaseState.eaAccountTranscriptYears,
+      transcriptsReadyForClient: Boolean(eaCaseState.eaTranscriptsReadyForClient),
+      transcriptsSubmittedAt: eaCaseState.eaTranscriptsSubmittedAt,
+      resolutionRecommendation: eaCaseState.eaResolutionRecommendation,
+    },
+    customFields: {
+      taxrefresh_session_code: String(detail?.sessionCode || '').trim(),
+      taxrefresh_contact_id: String(detail?.contactId || '').trim(),
+      taxrefresh_opportunity_id: String(detail?.opportunityId || '').trim(),
+      taxrefresh_pipeline_name: String(detail?.pipelineName || '').trim(),
+      taxrefresh_stage_name: String(detail?.stageName || '').trim(),
+      taxrefresh_assigned_ea_name: String(detail?.assignedEaName || getPrimaryAnswer(answers, ['assigned_ea_name', 'assignedEaName']) || '').trim(),
+      taxrefresh_assigned_ea_email: String(detail?.assignedEaEmail || getPrimaryAnswer(answers, ['assigned_ea_email', 'assignedEaEmail']) || '').trim(),
+      taxrefresh_client_status: normalizedEaStatus,
+    },
+  }
+  return {
+    eligible: true,
+    status: normalizedEaStatus,
+    payload,
+    payloadHash: buildCanopyPayloadHash(payload),
+    reason: '',
+  }
+}
+
+async function dbGetCanopySyncState(sessionCode = '') {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return null
+  try {
+    const res = await pool.query(
+      `select session_code, canopy_client_id, sync_state, last_synced_at, last_payload_hash, last_error
+         from ti_canopy_client_sync
+        where session_code = $1
+        limit 1`,
+      [normalizedSessionCode],
+    )
+    return res?.rows?.[0] || null
+  } catch (error) {
+    recordDbFailure('canopy sync state lookup failed:', error, { sessionCode: normalizedSessionCode })
+    return null
+  }
+}
+
+async function dbUpsertCanopySyncState({
+  sessionCode = '',
+  canopyClientId = '',
+  syncState = 'pending',
+  lastPayloadHash = '',
+  lastError = '',
+  syncedAt = null,
+} = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return false
+  try {
+    await pool.query(
+      `
+      insert into ti_canopy_client_sync(session_code, canopy_client_id, sync_state, last_synced_at, last_payload_hash, last_error, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6, now(), now())
+      on conflict (session_code) do update
+        set canopy_client_id = coalesce(excluded.canopy_client_id, ti_canopy_client_sync.canopy_client_id),
+            sync_state = excluded.sync_state,
+            last_synced_at = excluded.last_synced_at,
+            last_payload_hash = excluded.last_payload_hash,
+            last_error = excluded.last_error,
+            updated_at = now()
+    `,
+      [
+        normalizedSessionCode,
+        String(canopyClientId || '').trim() || null,
+        String(syncState || 'pending').trim() || 'pending',
+        syncedAt ? new Date(syncedAt) : null,
+        String(lastPayloadHash || '').trim(),
+        String(lastError || '').trim(),
+      ],
+    )
+    return true
+  } catch (error) {
+    recordDbFailure('canopy sync state upsert failed:', error, { sessionCode: normalizedSessionCode })
+    return false
+  }
+}
+
+async function dbGetCanopySyncSnapshot(sessionCode = '') {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return null
+  try {
+    const sessionRes = await pool.query(
+      `select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+         from ti_sessions
+        where session_code = $1
+        limit 1`,
+      [normalizedSessionCode],
+    )
+    const row = sessionRes?.rows?.[0]
+    if (!row) return null
+    const durableProjection = await dbGetConsultationDurableProjection(normalizedSessionCode)
+    return buildConsultationDetail({
+      sessionCode: row.session_code,
+      contactId: row.ghl_contact_id,
+      opportunityId: row.ghl_opportunity_id,
+      state: row.state,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      consultationProfile: durableProjection?.profile || null,
+      consultationCaseFacts: durableProjection?.caseFacts || null,
+      consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingRows: durableProjection?.billingRows || [],
+      consultationDocumentReceipts: durableProjection?.documentReceipts || [],
+      consultationNotes: durableProjection?.notes || [],
+      consultationEaDocuments: durableProjection?.eaDocuments || [],
+      consultationEaActivityTimeline: durableProjection?.eaActivityTimeline || [],
+      consultationEaCaseState: durableProjection?.eaCaseState || null,
+    })
+  } catch (error) {
+    recordDbFailure('canopy sync snapshot lookup failed:', error, { sessionCode: normalizedSessionCode })
+    return null
+  }
+}
+
+async function dbQueueCanopySyncJob({ sessionCode = '', triggerReason = '', actorEmail = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return { queued: false, reason: 'db_unavailable' }
+  try {
+    const existingJobRes = await pool.query(
+      `select id
+         from ti_canopy_sync_jobs
+        where session_code = $1
+          and status in ('pending', 'processing')
+        order by created_at desc
+        limit 1`,
+      [normalizedSessionCode],
+    )
+    const existingJobId = Number(existingJobRes?.rows?.[0]?.id || 0) || 0
+    if (existingJobId > 0) {
+      await pool.query(
+        `update ti_canopy_sync_jobs
+            set trigger_reason = case
+                  when coalesce(trigger_reason, '') = '' then $2
+                  when position($2 in trigger_reason) > 0 then trigger_reason
+                  else trigger_reason || ', ' || $2
+                end,
+                updated_at = now(),
+                error_message = case when status = 'pending' then '' else error_message end,
+                response_snapshot = case when status = 'pending' then '{}'::jsonb else response_snapshot end,
+                run_after = case when status = 'pending' then now() else run_after end
+          where id = $1`,
+        [existingJobId, String(triggerReason || '').trim() || 'update'],
+      )
+      await dbUpsertCanopySyncState({
+        sessionCode: normalizedSessionCode,
+        syncState: 'pending',
+        lastError: '',
+      })
+      return { queued: true, deduped: true, jobId: existingJobId }
+    }
+    const insertRes = await pool.query(
+      `
+      insert into ti_canopy_sync_jobs(session_code, job_type, trigger_reason, status, attempt_count, run_after, response_snapshot, error_message, created_at, updated_at)
+      values ($1, 'upsert_client', $2, 'pending', 0, now(), jsonb_build_object('requestedBy', $3), '', now(), now())
+      returning id
+    `,
+      [
+        normalizedSessionCode,
+        String(triggerReason || '').trim() || 'update',
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+    await dbUpsertCanopySyncState({
+      sessionCode: normalizedSessionCode,
+      syncState: 'pending',
+      lastError: '',
+    })
+    return { queued: true, deduped: false, jobId: Number(insertRes?.rows?.[0]?.id || 0) || 0 }
+  } catch (error) {
+    recordDbFailure('canopy sync queue insert failed:', error, { sessionCode: normalizedSessionCode })
+    return { queued: false, reason: 'queue_insert_failed' }
+  }
+}
+
+async function queueCanopySyncIfEligible({ sessionCode = '', answers = {}, actorEmail = '', reason = '' } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!CANOPY_SYNC_ENABLED || !pool || !normalizedSessionCode) return false
+  const normalizedAnswers = answers && typeof answers === 'object' ? answers : {}
+  const eaCaseState = normalizeEaCaseStateProjection(normalizedAnswers)
+  if (!isCanopyEligibleEaStatus(eaCaseState?.eaCaseStatus || '')) return false
+  const queueResult = await dbQueueCanopySyncJob({
+    sessionCode: normalizedSessionCode,
+    triggerReason: String(reason || 'eligible_update').trim() || 'eligible_update',
+    actorEmail,
+  })
+  return Boolean(queueResult?.queued)
+}
+
+async function enqueueCanopySyncBackfill({ reason = 'manual_backfill', actorEmail = '' } = {}) {
+  if (!pool || isDbCircuitOpen()) return { ok: false, queued: 0, skipped: 0, reason: 'db_unavailable' }
+  const eligibleStatuses = CANOPY_SYNC_ACTIVE_EA_STATUSES
+  if (eligibleStatuses.length === 0) return { ok: false, queued: 0, skipped: 0, reason: 'no_eligible_statuses' }
+  const res = await pool.query(
+    `select session_code, ea_case_status
+       from ti_ea_case_state
+      where lower(trim(ea_case_status)) = any($1::text[])
+      order by updated_at desc`,
+    [eligibleStatuses],
+  )
+  let queued = 0
+  let skipped = 0
+  for (const row of res.rows || []) {
+    const queueResult = await dbQueueCanopySyncJob({
+      sessionCode: String(row?.session_code || '').trim(),
+      triggerReason: String(reason || 'manual_backfill').trim() || 'manual_backfill',
+      actorEmail,
+    })
+    if (queueResult?.queued) queued += 1
+    else skipped += 1
+  }
+  return { ok: true, queued, skipped, total: (res.rows || []).length }
+}
+
+async function dbClaimNextCanopySyncJob() {
+  if (!pool || isDbCircuitOpen()) return null
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    const res = await client.query(
+      `select id, session_code, job_type, trigger_reason, status, attempt_count, run_after
+         from ti_canopy_sync_jobs
+        where status = 'pending'
+          and run_after <= now()
+        order by run_after asc, created_at asc
+        limit 1
+        for update skip locked`,
+    )
+    const row = res?.rows?.[0]
+    if (!row) {
+      await client.query('commit')
+      return null
+    }
+    const updateRes = await client.query(
+      `update ti_canopy_sync_jobs
+          set status = 'processing',
+              attempt_count = attempt_count + 1,
+              updated_at = now()
+        where id = $1
+        returning id, session_code, job_type, trigger_reason, status, attempt_count, run_after`,
+      [row.id],
+    )
+    await client.query('commit')
+    return updateRes?.rows?.[0] || row
+  } catch (error) {
+    await client.query('rollback').catch(() => {})
+    recordDbFailure('claim canopy sync job failed:', error, {})
+    return null
+  } finally {
+    client.release()
+  }
+}
+
+async function dbMarkCanopySyncJobSkipped(jobId, { sessionCode = '', reason = '', responseSnapshot = {} } = {}) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !jobId) return false
+  try {
+    await pool.query(
+      `update ti_canopy_sync_jobs
+          set status = 'skipped',
+              error_message = $2,
+              response_snapshot = $3,
+              updated_at = now()
+        where id = $1`,
+      [jobId, String(reason || '').trim(), responseSnapshot && typeof responseSnapshot === 'object' ? responseSnapshot : { value: responseSnapshot }],
+    )
+    if (normalizedSessionCode) {
+      await dbUpsertCanopySyncState({
+        sessionCode: normalizedSessionCode,
+        syncState: 'skipped',
+        lastError: String(reason || '').trim(),
+      })
+    }
+    return true
+  } catch (error) {
+    recordDbFailure('mark canopy sync job skipped failed:', error, { jobId, sessionCode: normalizedSessionCode })
+    return false
+  }
+}
+
+async function dbMarkCanopySyncJobSucceeded(
+  jobId,
+  { sessionCode = '', canopyClientId = '', payloadHash = '', responseSnapshot = {} } = {},
+) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !jobId || !normalizedSessionCode) return false
+  try {
+    await pool.query(
+      `update ti_canopy_sync_jobs
+          set status = 'succeeded',
+              error_message = '',
+              response_snapshot = $2,
+              updated_at = now()
+        where id = $1`,
+      [jobId, responseSnapshot && typeof responseSnapshot === 'object' ? responseSnapshot : { value: responseSnapshot }],
+    )
+    await dbUpsertCanopySyncState({
+      sessionCode: normalizedSessionCode,
+      canopyClientId,
+      syncState: 'succeeded',
+      lastPayloadHash: payloadHash,
+      lastError: '',
+      syncedAt: new Date().toISOString(),
+    })
+    return true
+  } catch (error) {
+    recordDbFailure('mark canopy sync job succeeded failed:', error, { jobId, sessionCode: normalizedSessionCode })
+    return false
+  }
+}
+
+async function dbMarkCanopySyncJobFailed(
+  jobId,
+  { sessionCode = '', attemptCount = 1, errorMessage = '', responseSnapshot = {} } = {},
+) {
+  const normalizedSessionCode = String(sessionCode || '').trim()
+  if (!pool || isDbCircuitOpen() || !jobId) return false
+  const normalizedAttemptCount = Math.max(1, Number(attemptCount || 1) || 1)
+  const terminalFailure = normalizedAttemptCount >= CANOPY_SYNC_MAX_ATTEMPTS
+  const backoffMs = getCanopyBackoffMs(normalizedAttemptCount)
+  try {
+    await pool.query(
+      `update ti_canopy_sync_jobs
+          set status = $2,
+              error_message = $3,
+              response_snapshot = $4,
+              run_after = case when $2 = 'pending' then now() + ($5::text || ' milliseconds')::interval else run_after end,
+              updated_at = now()
+        where id = $1`,
+      [
+        jobId,
+        terminalFailure ? 'failed' : 'pending',
+        String(errorMessage || '').trim(),
+        responseSnapshot && typeof responseSnapshot === 'object' ? responseSnapshot : { value: responseSnapshot },
+        backoffMs,
+      ],
+    )
+    if (normalizedSessionCode) {
+      await dbUpsertCanopySyncState({
+        sessionCode: normalizedSessionCode,
+        syncState: terminalFailure ? 'failed' : 'pending',
+        lastError: String(errorMessage || '').trim(),
+      })
+    }
+    return true
+  } catch (error) {
+    recordDbFailure('mark canopy sync job failed failed:', error, { jobId, sessionCode: normalizedSessionCode })
+    return false
+  }
+}
+
+async function canopySyncUpsertClient(payload = {}) {
+  if (!CANOPY_SYNC_TARGET_URL) {
+    const error = new Error('CANOPY_SYNC_TARGET_URL is not configured.')
+    error.noRetry = true
+    throw error
+  }
+  const headers = {
+    accept: 'application/json',
+    'content-type': 'application/json',
+  }
+  if (CANOPY_SYNC_AUTH_TOKEN) {
+    headers[CANOPY_SYNC_AUTH_HEADER] = CANOPY_SYNC_AUTH_SCHEME
+      ? `${CANOPY_SYNC_AUTH_SCHEME} ${CANOPY_SYNC_AUTH_TOKEN}`.trim()
+      : CANOPY_SYNC_AUTH_TOKEN
+  }
+  const response = await fetch(CANOPY_SYNC_TARGET_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload || {}),
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const message =
+      String(data?.message || data?.error || response.statusText || 'Canopy sync failed').trim() ||
+      'Canopy sync failed'
+    const error = new Error(message)
+    error.status = response.status
+    error.noRetry = response.status >= 400 && response.status < 500 && response.status !== 429
+    error.responseBody = data
+    throw error
+  }
+  return {
+    canopyClientId: extractCanopyClientId(data),
+    responseBody: data,
+  }
+}
+
+async function runCanopySyncWorkerTick() {
+  if (!CANOPY_SYNC_ENABLED || !pool || canopySyncWorkerRunning) return false
+  if (!CANOPY_SYNC_TARGET_URL) return false
+  canopySyncWorkerRunning = true
+  let activeJob = null
+  let activeSessionCode = ''
+  try {
+    const job = await dbClaimNextCanopySyncJob()
+    if (!job) return false
+    activeJob = job
+    const sessionCode = String(job?.session_code || '').trim()
+    activeSessionCode = sessionCode
+    const syncSnapshot = await dbGetCanopySyncSnapshot(sessionCode)
+    if (!syncSnapshot) {
+      await dbMarkCanopySyncJobSkipped(job?.id, {
+        sessionCode,
+        reason: 'session_not_found',
+        responseSnapshot: { reason: 'session_not_found' },
+      })
+      return true
+    }
+    const payloadInfo = buildCanopySyncPayloadFromDetail(syncSnapshot)
+    if (!payloadInfo.eligible || !payloadInfo.payload) {
+      await dbMarkCanopySyncJobSkipped(job?.id, {
+        sessionCode,
+        reason: payloadInfo.reason || 'not_eligible',
+        responseSnapshot: { reason: payloadInfo.reason || 'not_eligible', status: payloadInfo.status || '' },
+      })
+      return true
+    }
+    const syncState = await dbGetCanopySyncState(sessionCode)
+    if (String(syncState?.last_payload_hash || '').trim() === payloadInfo.payloadHash && String(syncState?.sync_state || '').trim() === 'succeeded') {
+      await dbMarkCanopySyncJobSkipped(job?.id, {
+        sessionCode,
+        reason: 'unchanged_payload',
+        responseSnapshot: { reason: 'unchanged_payload' },
+      })
+      return true
+    }
+    const syncResponse = await canopySyncUpsertClient(payloadInfo.payload)
+    await dbMarkCanopySyncJobSucceeded(job?.id, {
+      sessionCode,
+      canopyClientId: syncResponse.canopyClientId || String(syncState?.canopy_client_id || '').trim(),
+      payloadHash: payloadInfo.payloadHash,
+      responseSnapshot: syncResponse.responseBody || {},
+    })
+    return true
+  } catch (error) {
+    const jobId = Number(activeJob?.id || 0) || 0
+    if (jobId > 0) {
+      await dbMarkCanopySyncJobFailed(jobId, {
+        sessionCode: activeSessionCode,
+        attemptCount: Number(activeJob?.attempt_count || 1) || 1,
+        errorMessage: String(error instanceof Error ? error.message : error || 'Canopy sync failed'),
+        responseSnapshot: error?.responseBody && typeof error.responseBody === 'object' ? error.responseBody : {},
+      })
+    } else {
+      console.error('Canopy sync worker tick failed:', error)
+    }
+    return false
+  } finally {
+    canopySyncWorkerRunning = false
+  }
+}
+
+function startCanopySyncWorker() {
+  if (!CANOPY_SYNC_ENABLED || !pool || canopySyncWorkerTimer || !CANOPY_SYNC_TARGET_URL) return
+  canopySyncWorkerTimer = setInterval(() => {
+    runCanopySyncWorkerTick().catch((error) => console.error('Canopy sync worker failed:', error))
+  }, CANOPY_SYNC_POLL_MS)
+  if (typeof canopySyncWorkerTimer?.unref === 'function') canopySyncWorkerTimer.unref()
+  runCanopySyncWorkerTick().catch((error) => console.error('Canopy sync worker bootstrap failed:', error))
 }
 
 function buildBillingProjectionStatusLabel(row = {}) {
@@ -12621,6 +13228,36 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
     }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load durable field diagnostics' })
+  }
+})
+
+app.post('/api/admin/canopy/backfill-active-clients', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    if (!CANOPY_SYNC_ENABLED) {
+      return res.status(400).json({
+        error: 'Canopy sync is disabled. Set CANOPY_SYNC_ENABLED=1 to use this backfill endpoint.',
+      })
+    }
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.' })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open' })
+    const result = await enqueueCanopySyncBackfill({
+      reason: String(req.body?.reason || 'admin_backfill').trim() || 'admin_backfill',
+      actorEmail: String(req.adminUser?.email || '').trim(),
+    })
+    return res.json({
+      ok: true,
+      queued: Number(result?.queued || 0) || 0,
+      skipped: Number(result?.skipped || 0) || 0,
+      total: Number(result?.total || 0) || 0,
+      workerEnabled: CANOPY_SYNC_ENABLED,
+      targetConfigured: Boolean(CANOPY_SYNC_TARGET_URL),
+    })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to queue Canopy backfill' })
   }
 })
 
