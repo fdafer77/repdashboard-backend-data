@@ -87,6 +87,28 @@ services:
         value: "0"
       - key: CANOPY_SYNC_ACTIVE_EA_STATUSES
         value: Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program
+      - key: CANOPY_OAUTH_APP_URL
+        value: https://app.canopytax.com
+      - key: CANOPY_OAUTH_API_URL
+        value: https://api.canopytax.com
+      - key: CANOPY_OAUTH_TOKEN_URL
+        value: https://api.canopytax.com/public/v3/token
+      - key: CANOPY_OAUTH_CLIENT_ID
+        sync: false
+      - key: CANOPY_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: CANOPY_OAUTH_REDIRECT_URL
+        value: https://api.taxrefresh.com/api/canopy/callback
+      - key: CANOPY_OAUTH_SCOPE
+        value: contacts:read
+      - key: CANOPY_OAUTH_ENCRYPTION_KEY
+        sync: false
+      - key: CANOPY_OAUTH_STATE_SECRET
+        sync: false
+      - key: CANOPY_OAUTH_SUCCESS_REDIRECT
+        sync: false
+      - key: CANOPY_OAUTH_FAILURE_REDIRECT
+        sync: false
 
 databases:
   - name: taxrefresh-postgres

@@ -360,4 +360,21 @@ export async function ensureSchema(pool) {
   await pool.query(`create index if not exists ti_canopy_sync_jobs_session_code_idx on ti_canopy_sync_jobs(session_code);`)
   await pool.query(`create index if not exists ti_canopy_sync_jobs_status_run_after_idx on ti_canopy_sync_jobs(status, run_after asc, updated_at asc);`)
   await pool.query(`create index if not exists ti_canopy_sync_jobs_created_at_idx on ti_canopy_sync_jobs(created_at desc);`)
+
+  await pool.query(`
+    create table if not exists ti_canopy_oauth_tokens (
+      provider text primary key,
+      access_token_encrypted text not null default '',
+      refresh_token_encrypted text not null default '',
+      token_type text not null default 'bearer',
+      scope text not null default '',
+      expires_at timestamptz,
+      last_refreshed_at timestamptz,
+      authorized_by_email text not null default '',
+      raw_payload jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `)
+  await pool.query(`create index if not exists ti_canopy_oauth_tokens_updated_at_idx on ti_canopy_oauth_tokens(updated_at desc);`)
 }

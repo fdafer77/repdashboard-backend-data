@@ -49,6 +49,20 @@ Canopy sync, only when you are ready to push EA-active clients into Canopy:
 - `CANOPY_SYNC_STARTUP_BACKFILL`
 - `CANOPY_SYNC_ACTIVE_EA_STATUSES`
 
+Canopy OAuth, when you want the backend to hold a saved bearer token from Canopy:
+
+- `CANOPY_OAUTH_APP_URL`
+- `CANOPY_OAUTH_API_URL`
+- `CANOPY_OAUTH_TOKEN_URL`
+- `CANOPY_OAUTH_CLIENT_ID`
+- `CANOPY_OAUTH_CLIENT_SECRET`
+- `CANOPY_OAUTH_REDIRECT_URL`
+- `CANOPY_OAUTH_SCOPE`
+- `CANOPY_OAUTH_ENCRYPTION_KEY`
+- `CANOPY_OAUTH_STATE_SECRET`
+- `CANOPY_OAUTH_SUCCESS_REDIRECT`
+- `CANOPY_OAUTH_FAILURE_REDIRECT`
+
 ## Render deploy steps
 
 1. Create a new GitHub repo for this backend package.
@@ -87,6 +101,13 @@ You still need to provide these Canopy secrets in Render before enabling the wor
 - `CANOPY_SYNC_TARGET_URL`
 - `CANOPY_SYNC_AUTH_TOKEN`
 
+If you are using Canopy OAuth instead of a static sync token, also provide:
+
+- `CANOPY_OAUTH_CLIENT_ID`
+- `CANOPY_OAUTH_CLIENT_SECRET`
+- `CANOPY_OAUTH_ENCRYPTION_KEY`
+- `CANOPY_OAUTH_STATE_SECRET`
+
 ## Canopy rollout order
 
 Use this order so the dashboard stays untouched while you validate the mirror path.
@@ -112,6 +133,27 @@ These are the safest first values in Render:
 - `CANOPY_SYNC_MAX_ATTEMPTS=6`
 - `CANOPY_SYNC_STARTUP_BACKFILL=0`
 - `CANOPY_SYNC_ACTIVE_EA_STATUSES=Pending EA Review,Ready for Resolution Review,Ready for Resolution,Resolution In Progress,Awaiting Program`
+
+Recommended Canopy OAuth values:
+
+- `CANOPY_OAUTH_APP_URL=https://app.canopytax.com`
+- `CANOPY_OAUTH_API_URL=https://api.canopytax.com`
+- `CANOPY_OAUTH_TOKEN_URL=https://api.canopytax.com/public/v3/token`
+- `CANOPY_OAUTH_REDIRECT_URL=https://api.taxrefresh.com/api/canopy/callback`
+- `CANOPY_OAUTH_SCOPE=contacts:read`
+- `CANOPY_OAUTH_ENCRYPTION_KEY=<32+ char secret stored only in Render>`
+- `CANOPY_OAUTH_STATE_SECRET=<separate secret stored only in Render>`
+
+## Canopy OAuth endpoints
+
+Once deployed, these backend routes are available:
+
+- `GET /api/admin/canopy/oauth/start`
+- `GET /api/admin/canopy/oauth/status`
+- `POST /api/admin/canopy/oauth/refresh`
+- `GET /api/canopy/callback`
+
+Use the admin `start` route to generate or redirect to the Canopy authorization URL. The callback route exchanges the returned code for tokens, stores them in Postgres in encrypted form, and the sync worker will automatically prefer the saved bearer token over `CANOPY_SYNC_AUTH_TOKEN` when present.
 
 ## BoldSign branding control
 

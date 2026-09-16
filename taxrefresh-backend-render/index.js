@@ -46,6 +46,19 @@ const CANOPY_SYNC_TARGET_URL = String(
 const CANOPY_SYNC_AUTH_TOKEN = String(process.env.CANOPY_SYNC_AUTH_TOKEN || process.env.CANOPY_API_TOKEN || '').trim()
 const CANOPY_SYNC_AUTH_HEADER = String(process.env.CANOPY_SYNC_AUTH_HEADER || 'authorization').trim() || 'authorization'
 const CANOPY_SYNC_AUTH_SCHEME = String(process.env.CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
+const CANOPY_OAUTH_APP_URL = String(process.env.CANOPY_OAUTH_APP_URL || 'https://app.canopytax.com').trim().replace(/\/+$/, '')
+const CANOPY_OAUTH_API_URL = String(process.env.CANOPY_OAUTH_API_URL || 'https://api.canopytax.com').trim().replace(/\/+$/, '')
+const CANOPY_OAUTH_TOKEN_URL = String(process.env.CANOPY_OAUTH_TOKEN_URL || `${CANOPY_OAUTH_API_URL}/public/v3/token`)
+  .trim()
+  .replace(/\/+$/, '')
+const CANOPY_OAUTH_CLIENT_ID = String(process.env.CANOPY_OAUTH_CLIENT_ID || '').trim()
+const CANOPY_OAUTH_CLIENT_SECRET = String(process.env.CANOPY_OAUTH_CLIENT_SECRET || '').trim()
+const CANOPY_OAUTH_REDIRECT_URL = String(process.env.CANOPY_OAUTH_REDIRECT_URL || '').trim()
+const CANOPY_OAUTH_SCOPE = String(process.env.CANOPY_OAUTH_SCOPE || 'contacts:read').trim() || 'contacts:read'
+const CANOPY_OAUTH_SUCCESS_REDIRECT = String(process.env.CANOPY_OAUTH_SUCCESS_REDIRECT || '').trim()
+const CANOPY_OAUTH_FAILURE_REDIRECT = String(process.env.CANOPY_OAUTH_FAILURE_REDIRECT || '').trim()
+const CANOPY_OAUTH_ENCRYPTION_SECRET = String(process.env.CANOPY_OAUTH_ENCRYPTION_KEY || REP_JWT_SECRET || '').trim()
+const CANOPY_OAUTH_STATE_SECRET = String(process.env.CANOPY_OAUTH_STATE_SECRET || REP_JWT_SECRET || CANOPY_OAUTH_CLIENT_SECRET || '').trim()
 const CANOPY_SYNC_POLL_MS = Math.max(10_000, Number(process.env.CANOPY_SYNC_POLL_MS || 60_000) || 60_000)
 const CANOPY_SYNC_MAX_ATTEMPTS = Math.max(1, Math.min(20, Number(process.env.CANOPY_SYNC_MAX_ATTEMPTS || 6) || 6))
 const CANOPY_SYNC_STARTUP_BACKFILL_ENABLED = ['1', 'true', 'yes', 'on'].includes(
@@ -122,6 +135,15 @@ let experianOAuthTokenCache = {
 let calendlyIdentityCache = {
   fetchedAt: 0,
   resource: null,
+}
+let canopyOauthTokenCache = {
+  accessToken: '',
+  refreshToken: '',
+  tokenType: 'bearer',
+  scope: '',
+  expiresAt: 0,
+  authorizedByEmail: '',
+  loadedAt: 0,
 }
 let canopySyncWorkerTimer = null
 let canopySyncWorkerRunning = false
@@ -1379,6 +1401,382 @@ function extractCanopyClientId(responseBody = {}) {
   ).trim()
 }
 
+function normalizeAbsoluteUrl(value = '') {
+  const normalized = String(value || '').trim()
+  if (!normalized) return ''
+  try {
+    return new URL(normalized).toString()
+  } catch {
+    return ''
+  }
+}
+
+function getCanopyOauthRedirectUrl(fallback = '') {
+  const explicit = normalizeAbsoluteUrl(CANOPY_OAUTH_REDIRECT_URL)
+  if (explicit) return explicit
+  const base = getBackendBaseUrl(fallback) || getPublicBaseUrl(fallback)
+  if (!base) return ''
+  try {
+    return new URL('/api/canopy/callback', base).toString()
+  } catch {
+    return ''
+  }
+}
+
+function isCanopyOauthConfigured(fallback = '') {
+  return Boolean(CANOPY_OAUTH_CLIENT_ID && CANOPY_OAUTH_CLIENT_SECRET && getCanopyOauthRedirectUrl(fallback))
+}
+
+function getCanopyOauthCipherKey() {
+  if (!CANOPY_OAUTH_ENCRYPTION_SECRET) return null
+  return crypto.createHash('sha256').update(CANOPY_OAUTH_ENCRYPTION_SECRET).digest()
+}
+
+function encryptCanopyOauthValue(value = '') {
+  const plain = String(value || '')
+  if (!plain) return ''
+  const key = getCanopyOauthCipherKey()
+  if (!key) throw new Error('CANOPY_OAUTH_ENCRYPTION_KEY or REP_JWT_SECRET is required to persist Canopy OAuth tokens.')
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return `v1.${iv.toString('base64url')}.${tag.toString('base64url')}.${encrypted.toString('base64url')}`
+}
+
+function decryptCanopyOauthValue(value = '') {
+  const encoded = String(value || '').trim()
+  if (!encoded) return ''
+  const key = getCanopyOauthCipherKey()
+  if (!key) return ''
+  const parts = encoded.split('.')
+  if (parts.length !== 4 || parts[0] !== 'v1') return ''
+  try {
+    const iv = Buffer.from(parts[1], 'base64url')
+    const tag = Buffer.from(parts[2], 'base64url')
+    const payload = Buffer.from(parts[3], 'base64url')
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
+    decipher.setAuthTag(tag)
+    return Buffer.concat([decipher.update(payload), decipher.final()]).toString('utf8')
+  } catch {
+    return ''
+  }
+}
+
+function normalizeCanopyOauthTokenPayload(payload = {}) {
+  const accessToken = String(payload?.access_token || payload?.accessToken || '').trim()
+  const refreshToken = String(payload?.refresh_token || payload?.refreshToken || '').trim()
+  const tokenType = String(payload?.token_type || payload?.tokenType || 'bearer').trim() || 'bearer'
+  const scope = String(payload?.scope || payload?.scopes || CANOPY_OAUTH_SCOPE || '').trim()
+  const expiresInSeconds = Number(payload?.expires_in || payload?.expiresIn || 0) || 0
+  const expiresAt = expiresInSeconds > 0 ? Date.now() + expiresInSeconds * 1000 : 0
+  return {
+    accessToken,
+    refreshToken,
+    tokenType,
+    scope,
+    expiresAt,
+    rawPayload: payload && typeof payload === 'object' ? { ...payload } : {},
+  }
+}
+
+function setCanopyOauthTokenCache(record = null) {
+  if (!record?.accessToken) {
+    canopyOauthTokenCache = {
+      accessToken: '',
+      refreshToken: '',
+      tokenType: 'bearer',
+      scope: '',
+      expiresAt: 0,
+      authorizedByEmail: '',
+      loadedAt: Date.now(),
+    }
+    return canopyOauthTokenCache
+  }
+  canopyOauthTokenCache = {
+    accessToken: String(record.accessToken || '').trim(),
+    refreshToken: String(record.refreshToken || '').trim(),
+    tokenType: String(record.tokenType || 'bearer').trim() || 'bearer',
+    scope: String(record.scope || '').trim(),
+    expiresAt: Number(record.expiresAt || 0) || 0,
+    authorizedByEmail: String(record.authorizedByEmail || '').trim(),
+    loadedAt: Date.now(),
+  }
+  return canopyOauthTokenCache
+}
+
+async function dbGetCanopyOauthTokenRecord() {
+  if (!pool || isDbCircuitOpen()) return null
+  try {
+    const res = await pool.query(
+      `select provider, access_token_encrypted, refresh_token_encrypted, token_type, scope, expires_at, last_refreshed_at, authorized_by_email, raw_payload, updated_at
+         from ti_canopy_oauth_tokens
+        where provider = $1
+        limit 1`,
+      ['canopy_public_api'],
+    )
+    const row = res?.rows?.[0]
+    if (!row) return null
+    return {
+      provider: String(row.provider || 'canopy_public_api').trim(),
+      accessToken: decryptCanopyOauthValue(row.access_token_encrypted),
+      refreshToken: decryptCanopyOauthValue(row.refresh_token_encrypted),
+      tokenType: String(row.token_type || 'bearer').trim() || 'bearer',
+      scope: String(row.scope || '').trim(),
+      expiresAt: row.expires_at ? new Date(row.expires_at).getTime() : 0,
+      lastRefreshedAt: row.last_refreshed_at ? new Date(row.last_refreshed_at).getTime() : 0,
+      authorizedByEmail: String(row.authorized_by_email || '').trim(),
+      rawPayload: row.raw_payload && typeof row.raw_payload === 'object' ? row.raw_payload : {},
+      updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : 0,
+    }
+  } catch (error) {
+    recordDbFailure('canopy oauth token lookup failed:', error, {})
+    return null
+  }
+}
+
+async function dbUpsertCanopyOauthTokenRecord({
+  accessToken = '',
+  refreshToken = '',
+  tokenType = 'bearer',
+  scope = '',
+  expiresAt = 0,
+  authorizedByEmail = '',
+  rawPayload = {},
+} = {}) {
+  if (!pool || isDbCircuitOpen()) return false
+  const normalizedAccessToken = String(accessToken || '').trim()
+  if (!normalizedAccessToken) return false
+  try {
+    await pool.query(
+      `
+      insert into ti_canopy_oauth_tokens(provider, access_token_encrypted, refresh_token_encrypted, token_type, scope, expires_at, last_refreshed_at, authorized_by_email, raw_payload, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6, now(), $7, $8, now(), now())
+      on conflict (provider) do update
+        set access_token_encrypted = excluded.access_token_encrypted,
+            refresh_token_encrypted = excluded.refresh_token_encrypted,
+            token_type = excluded.token_type,
+            scope = excluded.scope,
+            expires_at = excluded.expires_at,
+            last_refreshed_at = now(),
+            authorized_by_email = excluded.authorized_by_email,
+            raw_payload = excluded.raw_payload,
+            updated_at = now()
+    `,
+      [
+        'canopy_public_api',
+        encryptCanopyOauthValue(normalizedAccessToken),
+        encryptCanopyOauthValue(String(refreshToken || '').trim()),
+        String(tokenType || 'bearer').trim() || 'bearer',
+        String(scope || '').trim(),
+        expiresAt ? new Date(expiresAt) : null,
+        String(authorizedByEmail || '').trim(),
+        rawPayload && typeof rawPayload === 'object' ? rawPayload : {},
+      ],
+    )
+    setCanopyOauthTokenCache({
+      accessToken: normalizedAccessToken,
+      refreshToken,
+      tokenType,
+      scope,
+      expiresAt,
+      authorizedByEmail,
+    })
+    return true
+  } catch (error) {
+    recordDbFailure('canopy oauth token upsert failed:', error, {})
+    return false
+  }
+}
+
+function buildCanopyOauthState(email = '') {
+  if (!CANOPY_OAUTH_STATE_SECRET) return ''
+  return jwt.sign(
+    {
+      provider: 'canopy_public_api',
+      email: String(email || '').trim().toLowerCase(),
+    },
+    CANOPY_OAUTH_STATE_SECRET,
+    { expiresIn: '10m' },
+  )
+}
+
+function verifyCanopyOauthState(state = '') {
+  if (!CANOPY_OAUTH_STATE_SECRET) return null
+  try {
+    const payload = jwt.verify(String(state || '').trim(), CANOPY_OAUTH_STATE_SECRET)
+    if (!payload || payload.provider !== 'canopy_public_api') return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+function buildCanopyOauthAuthorizeUrl({ email = '', fallback = '' } = {}) {
+  if (!isCanopyOauthConfigured(fallback)) return ''
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: CANOPY_OAUTH_CLIENT_ID,
+    redirect_uri: getCanopyOauthRedirectUrl(fallback),
+    scope: CANOPY_OAUTH_SCOPE,
+  })
+  const state = buildCanopyOauthState(email)
+  if (state) params.set('state', state)
+  return `${CANOPY_OAUTH_APP_URL}/#/oauth?${params.toString()}`
+}
+
+async function exchangeCanopyOauthToken(params = new URLSearchParams()) {
+  if (!isCanopyOauthConfigured()) {
+    const error = new Error('Canopy OAuth is not configured. Set client ID, client secret, and redirect URL.')
+    error.noRetry = true
+    throw error
+  }
+  const basicAuth = Buffer.from(`${CANOPY_OAUTH_CLIENT_ID}:${CANOPY_OAUTH_CLIENT_SECRET}`).toString('base64')
+  const response = await fetch(CANOPY_OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/x-www-form-urlencoded',
+      authorization: `Basic ${basicAuth}`,
+    },
+    body: params.toString(),
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const message = String(data?.message || data?.error || response.statusText || 'Canopy OAuth token exchange failed').trim()
+    const error = new Error(message || 'Canopy OAuth token exchange failed')
+    error.status = response.status
+    error.noRetry = response.status >= 400 && response.status < 500 && response.status !== 429
+    error.responseBody = data
+    throw error
+  }
+  return normalizeCanopyOauthTokenPayload(data)
+}
+
+async function exchangeCanopyAuthorizationCode(code = '', redirectUrl = '') {
+  const normalizedCode = String(code || '').trim()
+  if (!normalizedCode) {
+    const error = new Error('Missing Canopy authorization code.')
+    error.noRetry = true
+    throw error
+  }
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    redirect_uri: redirectUrl || getCanopyOauthRedirectUrl(),
+    code: normalizedCode,
+  })
+  return exchangeCanopyOauthToken(body)
+}
+
+async function refreshCanopyAccessToken(refreshToken = '') {
+  const normalizedRefreshToken = String(refreshToken || '').trim()
+  if (!normalizedRefreshToken) {
+    const error = new Error('Missing Canopy refresh token.')
+    error.noRetry = true
+    throw error
+  }
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: normalizedRefreshToken,
+  })
+  return exchangeCanopyOauthToken(body)
+}
+
+async function getCanopyApiAccessToken({ forceRefresh = false } = {}) {
+  if (CANOPY_SYNC_AUTH_TOKEN) {
+    return {
+      accessToken: CANOPY_SYNC_AUTH_TOKEN,
+      tokenType: CANOPY_SYNC_AUTH_SCHEME || 'Bearer',
+      scope: '',
+      source: 'env_static',
+      expiresAt: 0,
+    }
+  }
+  const now = Date.now()
+  const cachedExpiresSoon = canopyOauthTokenCache.expiresAt && canopyOauthTokenCache.expiresAt - now <= 60_000
+  if (!forceRefresh && canopyOauthTokenCache.accessToken && !cachedExpiresSoon) {
+    return {
+      accessToken: canopyOauthTokenCache.accessToken,
+      tokenType: canopyOauthTokenCache.tokenType,
+      scope: canopyOauthTokenCache.scope,
+      source: 'oauth_cache',
+      expiresAt: canopyOauthTokenCache.expiresAt,
+    }
+  }
+  const stored = await dbGetCanopyOauthTokenRecord()
+  if (!stored?.accessToken) {
+    return {
+      accessToken: '',
+      tokenType: 'bearer',
+      scope: '',
+      source: 'missing',
+      expiresAt: 0,
+    }
+  }
+  const expiresSoon = stored.expiresAt && stored.expiresAt - now <= 60_000
+  if (!forceRefresh && !expiresSoon) {
+    setCanopyOauthTokenCache(stored)
+    return {
+      accessToken: stored.accessToken,
+      tokenType: stored.tokenType,
+      scope: stored.scope,
+      source: 'oauth_db',
+      expiresAt: stored.expiresAt,
+    }
+  }
+  if (!stored.refreshToken) {
+    setCanopyOauthTokenCache(stored)
+    return {
+      accessToken: stored.accessToken,
+      tokenType: stored.tokenType,
+      scope: stored.scope,
+      source: 'oauth_db_no_refresh',
+      expiresAt: stored.expiresAt,
+    }
+  }
+  const refreshed = await refreshCanopyAccessToken(stored.refreshToken)
+  await dbUpsertCanopyOauthTokenRecord({
+    ...refreshed,
+    refreshToken: refreshed.refreshToken || stored.refreshToken,
+    authorizedByEmail: stored.authorizedByEmail,
+  })
+  return {
+    accessToken: refreshed.accessToken,
+    tokenType: refreshed.tokenType,
+    scope: refreshed.scope,
+    source: 'oauth_refresh',
+    expiresAt: refreshed.expiresAt,
+  }
+}
+
+function buildCanopyOauthResultHtml({ ok = false, title = '', message = '', details = '' } = {}) {
+  const safeTitle = String(title || (ok ? 'Canopy connected' : 'Canopy connection failed')).trim()
+  const safeMessage = String(message || '').trim()
+  const safeDetails = String(details || '').trim()
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${safeTitle}</title>
+    <style>
+      body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 32px; }
+      .card { max-width: 680px; margin: 48px auto; background: #111827; border: 1px solid #334155; border-radius: 16px; padding: 28px; }
+      h1 { margin: 0 0 12px; font-size: 28px; }
+      p { margin: 0 0 12px; line-height: 1.5; color: #cbd5e1; }
+      code { background: #0b1220; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>${safeTitle}</h1>
+      <p>${safeMessage}</p>
+      ${safeDetails ? `<p><code>${safeDetails}</code></p>` : ''}
+    </div>
+  </body>
+</html>`
+}
+
 function buildCanopySyncPayloadFromDetail(detail) {
   if (!detail) return { eligible: false, status: '', payload: null, payloadHash: '', reason: 'missing_detail' }
   const answers = detail?.answers && typeof detail.answers === 'object' ? detail.answers : {}
@@ -1804,21 +2202,29 @@ async function canopySyncUpsertClient(payload = {}) {
     error.noRetry = true
     throw error
   }
-  const headers = {
-    accept: 'application/json',
-    'content-type': 'application/json',
+  async function runRequest(forceRefresh = false) {
+    const headers = {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    }
+    const tokenInfo = await getCanopyApiAccessToken({ forceRefresh })
+    if (tokenInfo?.accessToken) {
+      const scheme = String(tokenInfo.tokenType || CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
+      headers[CANOPY_SYNC_AUTH_HEADER] = scheme ? `${scheme} ${tokenInfo.accessToken}`.trim() : tokenInfo.accessToken
+    }
+    const response = await fetch(CANOPY_SYNC_TARGET_URL, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload || {}),
+    })
+    const data = await response.json().catch(() => ({}))
+    return { response, data }
   }
-  if (CANOPY_SYNC_AUTH_TOKEN) {
-    headers[CANOPY_SYNC_AUTH_HEADER] = CANOPY_SYNC_AUTH_SCHEME
-      ? `${CANOPY_SYNC_AUTH_SCHEME} ${CANOPY_SYNC_AUTH_TOKEN}`.trim()
-      : CANOPY_SYNC_AUTH_TOKEN
+
+  let { response, data } = await runRequest(false)
+  if (response.status === 401 && !CANOPY_SYNC_AUTH_TOKEN) {
+    ;({ response, data } = await runRequest(true))
   }
-  const response = await fetch(CANOPY_SYNC_TARGET_URL, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload || {}),
-  })
-  const data = await response.json().catch(() => ({}))
   if (!response.ok) {
     const message =
       String(data?.message || data?.error || response.statusText || 'Canopy sync failed').trim() ||
@@ -13228,6 +13634,184 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
       return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
     }
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load durable field diagnostics' })
+  }
+})
+
+app.get('/api/canopy/callback', async (req, res) => {
+  const fallbackBase = `${req.protocol}://${req.get('host') || ''}`.replace(/\/+$/, '')
+  const code = String(req.query?.code || '').trim()
+  const oauthError = String(req.query?.error || '').trim()
+  const oauthErrorDescription = String(req.query?.error_description || '').trim()
+  const rawState = String(req.query?.state || '').trim()
+
+  if (oauthError) {
+    const message = oauthErrorDescription || oauthError || 'Canopy authorization was denied.'
+    const failureRedirect = normalizeAbsoluteUrl(CANOPY_OAUTH_FAILURE_REDIRECT)
+    if (failureRedirect) {
+      const url = new URL(failureRedirect)
+      url.searchParams.set('canopy_oauth', 'error')
+      url.searchParams.set('message', message)
+      return res.redirect(url.toString())
+    }
+    return res.status(400).send(
+      buildCanopyOauthResultHtml({
+        ok: false,
+        title: 'Canopy connection failed',
+        message,
+      }),
+    )
+  }
+
+  if (!code) {
+    return res.status(400).send(
+      buildCanopyOauthResultHtml({
+        ok: false,
+        title: 'Missing Canopy code',
+        message: 'Canopy did not send an authorization code to the callback URL.',
+      }),
+    )
+  }
+
+  if (!pool) {
+    return res.status(503).send(
+      buildCanopyOauthResultHtml({
+        ok: false,
+        title: 'Database unavailable',
+        message: 'The backend cannot persist Canopy tokens because the database is not configured.',
+      }),
+    )
+  }
+
+  if (rawState && !verifyCanopyOauthState(rawState)) {
+    return res.status(400).send(
+      buildCanopyOauthResultHtml({
+        ok: false,
+        title: 'Invalid Canopy state',
+        message: 'The Canopy OAuth state was invalid or expired. Start the authorization flow again from the admin route.',
+      }),
+    )
+  }
+
+  try {
+    const statePayload = rawState ? verifyCanopyOauthState(rawState) : null
+    const tokenPayload = await exchangeCanopyAuthorizationCode(code, getCanopyOauthRedirectUrl(fallbackBase))
+    const persisted = await dbUpsertCanopyOauthTokenRecord({
+      ...tokenPayload,
+      authorizedByEmail: String(statePayload?.email || '').trim().toLowerCase(),
+    })
+    if (!persisted) {
+      throw new Error('Failed to persist Canopy OAuth tokens.')
+    }
+    const successRedirect = normalizeAbsoluteUrl(CANOPY_OAUTH_SUCCESS_REDIRECT)
+    if (successRedirect) {
+      const url = new URL(successRedirect)
+      url.searchParams.set('canopy_oauth', 'success')
+      return res.redirect(url.toString())
+    }
+    return res.status(200).send(
+      buildCanopyOauthResultHtml({
+        ok: true,
+        title: 'Canopy connected',
+        message: 'The Canopy OAuth token was stored successfully. Your backend can now use the saved bearer token.',
+        details: tokenPayload.scope || CANOPY_OAUTH_SCOPE,
+      }),
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to complete the Canopy OAuth callback.'
+    const failureRedirect = normalizeAbsoluteUrl(CANOPY_OAUTH_FAILURE_REDIRECT)
+    if (failureRedirect) {
+      const url = new URL(failureRedirect)
+      url.searchParams.set('canopy_oauth', 'error')
+      url.searchParams.set('message', message)
+      return res.redirect(url.toString())
+    }
+    return res.status(500).send(
+      buildCanopyOauthResultHtml({
+        ok: false,
+        title: 'Canopy connection failed',
+        message,
+      }),
+    )
+  }
+})
+
+app.get('/api/admin/canopy/oauth/start', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  const fallbackBase = `${req.protocol}://${req.get('host') || ''}`.replace(/\/+$/, '')
+  const authorizeUrl = buildCanopyOauthAuthorizeUrl({
+    email: String(req.adminUser?.email || '').trim().toLowerCase(),
+    fallback: fallbackBase,
+  })
+  if (!authorizeUrl) {
+    return res.status(400).json({
+      error: 'Canopy OAuth is not configured. Set CANOPY_OAUTH_CLIENT_ID, CANOPY_OAUTH_CLIENT_SECRET, and CANOPY_OAUTH_REDIRECT_URL.',
+    })
+  }
+  if (String(req.query?.redirect || '').trim() === '1') {
+    return res.redirect(authorizeUrl)
+  }
+  return res.json({
+    ok: true,
+    authorizeUrl,
+    redirectUrl: getCanopyOauthRedirectUrl(fallbackBase),
+    scope: CANOPY_OAUTH_SCOPE,
+  })
+})
+
+app.get('/api/admin/canopy/oauth/status', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const fallbackBase = `${req.protocol}://${req.get('host') || ''}`.replace(/\/+$/, '')
+    const tokenRecord = await dbGetCanopyOauthTokenRecord()
+    const now = Date.now()
+    return res.json({
+      ok: true,
+      configured: isCanopyOauthConfigured(fallbackBase),
+      redirectUrl: getCanopyOauthRedirectUrl(fallbackBase),
+      authorizeUrl: buildCanopyOauthAuthorizeUrl({
+        email: String(req.adminUser?.email || '').trim().toLowerCase(),
+        fallback: fallbackBase,
+      }),
+      scope: CANOPY_OAUTH_SCOPE,
+      connected: Boolean(tokenRecord?.accessToken),
+      tokenType: String(tokenRecord?.tokenType || '').trim(),
+      authorizedByEmail: String(tokenRecord?.authorizedByEmail || '').trim(),
+      hasRefreshToken: Boolean(tokenRecord?.refreshToken),
+      expiresAt: tokenRecord?.expiresAt ? new Date(tokenRecord.expiresAt).toISOString() : '',
+      expiresSoon: Boolean(tokenRecord?.expiresAt && tokenRecord.expiresAt - now <= 60_000),
+    })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load Canopy OAuth status' })
+  }
+})
+
+app.post('/api/admin/canopy/oauth/refresh', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    const tokenRecord = await dbGetCanopyOauthTokenRecord()
+    if (!tokenRecord?.refreshToken) {
+      return res.status(400).json({ error: 'No stored Canopy refresh token was found.' })
+    }
+    const refreshed = await refreshCanopyAccessToken(tokenRecord.refreshToken)
+    const persisted = await dbUpsertCanopyOauthTokenRecord({
+      ...refreshed,
+      refreshToken: refreshed.refreshToken || tokenRecord.refreshToken,
+      authorizedByEmail: String(tokenRecord.authorizedByEmail || req.adminUser?.email || '').trim().toLowerCase(),
+    })
+    if (!persisted) {
+      return res.status(500).json({ error: 'Failed to persist the refreshed Canopy token.' })
+    }
+    return res.json({
+      ok: true,
+      tokenType: refreshed.tokenType,
+      scope: refreshed.scope,
+      expiresAt: refreshed.expiresAt ? new Date(refreshed.expiresAt).toISOString() : '',
+    })
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to refresh Canopy token' })
   }
 })
 
