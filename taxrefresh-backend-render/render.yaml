@@ -71,8 +71,18 @@ services:
         value: x-api-key
       - key: CANOPY_SYNC_ENABLED
         value: "0"
+      - key: CANOPY_SYNC_DRY_RUN
+        value: "0"
       - key: CANOPY_SYNC_TARGET_URL
         sync: false
+      - key: CANOPY_API_BASE_URL
+        value: https://api.canopytax.com
+      - key: CANOPY_CLIENT_CREATE_PATH
+        value: /public/v3/clients
+      - key: CANOPY_CLIENT_UPDATE_PATH_TEMPLATE
+        value: /public/v3/clients/{client_id}
+      - key: CANOPY_CLIENT_SEARCH_PATH
+        value: /public/v3/clients/search
       - key: CANOPY_SYNC_AUTH_TOKEN
         sync: false
       - key: CANOPY_SYNC_AUTH_HEADER

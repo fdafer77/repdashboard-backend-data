@@ -40,7 +40,12 @@ Optional, only if you use them:
 Canopy sync, only when you are ready to push EA-active clients into Canopy:
 
 - `CANOPY_SYNC_ENABLED`
+- `CANOPY_SYNC_DRY_RUN`
 - `CANOPY_SYNC_TARGET_URL`
+- `CANOPY_API_BASE_URL`
+- `CANOPY_CLIENT_CREATE_PATH`
+- `CANOPY_CLIENT_UPDATE_PATH_TEMPLATE`
+- `CANOPY_CLIENT_SEARCH_PATH`
 - `CANOPY_SYNC_AUTH_TOKEN`
 - `CANOPY_SYNC_AUTH_HEADER`
 - `CANOPY_SYNC_AUTH_SCHEME`
@@ -89,6 +94,11 @@ These are already set in `render.yaml`:
 Canopy sync defaults are also included in `render.yaml`, but they start in a safe disabled state:
 
 - `CANOPY_SYNC_ENABLED=0`
+- `CANOPY_SYNC_DRY_RUN=0`
+- `CANOPY_API_BASE_URL=https://api.canopytax.com`
+- `CANOPY_CLIENT_CREATE_PATH=/public/v3/clients`
+- `CANOPY_CLIENT_UPDATE_PATH_TEMPLATE=/public/v3/clients/{client_id}`
+- `CANOPY_CLIENT_SEARCH_PATH=/public/v3/clients/search`
 - `CANOPY_SYNC_AUTH_HEADER=authorization`
 - `CANOPY_SYNC_AUTH_SCHEME=Bearer`
 - `CANOPY_SYNC_POLL_MS=60000`
@@ -98,7 +108,6 @@ Canopy sync defaults are also included in `render.yaml`, but they start in a saf
 
 You still need to provide these Canopy secrets in Render before enabling the worker:
 
-- `CANOPY_SYNC_TARGET_URL`
 - `CANOPY_SYNC_AUTH_TOKEN`
 
 If you are using Canopy OAuth instead of a static sync token, also provide:
@@ -113,7 +122,7 @@ If you are using Canopy OAuth instead of a static sync token, also provide:
 Use this order so the dashboard stays untouched while you validate the mirror path.
 
 1. Deploy the backend with `CANOPY_SYNC_ENABLED=0`.
-2. Add `CANOPY_SYNC_TARGET_URL` and `CANOPY_SYNC_AUTH_TOKEN` in Render.
+2. Add `CANOPY_SYNC_AUTH_TOKEN` in Render.
 3. Redeploy and confirm the backend is healthy at `/health`.
 4. Flip `CANOPY_SYNC_ENABLED=1` and keep `CANOPY_SYNC_STARTUP_BACKFILL=0`.
 5. Create or update one EA-active test client in the dashboard and verify the client appears correctly in Canopy.
@@ -125,7 +134,11 @@ Use this order so the dashboard stays untouched while you validate the mirror pa
 These are the safest first values in Render:
 
 - `CANOPY_SYNC_ENABLED=0` for the first deploy, then `1` after the target is verified
-- `CANOPY_SYNC_TARGET_URL=<your Canopy upsert endpoint or your proxy endpoint>`
+- `CANOPY_SYNC_DRY_RUN=1` if you want to stage payloads without sending anything to Canopy yet
+- `CANOPY_API_BASE_URL=https://api.canopytax.com`
+- `CANOPY_CLIENT_CREATE_PATH=/public/v3/clients`
+- `CANOPY_CLIENT_UPDATE_PATH_TEMPLATE=/public/v3/clients/{client_id}`
+- `CANOPY_CLIENT_SEARCH_PATH=/public/v3/clients/search`
 - `CANOPY_SYNC_AUTH_TOKEN=<secret token>`
 - `CANOPY_SYNC_AUTH_HEADER=authorization`
 - `CANOPY_SYNC_AUTH_SCHEME=Bearer`
@@ -154,6 +167,22 @@ Once deployed, these backend routes are available:
 - `GET /api/canopy/callback`
 
 Use the admin `start` route to generate or redirect to the Canopy authorization URL. The callback route exchanges the returned code for tokens, stores them in Postgres in encrypted form, and the sync worker will automatically prefer the saved bearer token over `CANOPY_SYNC_AUTH_TOKEN` when present.
+
+## Canopy dry-run mode
+
+If you want to stage all EA-active client payloads before live writes, you can still use dry-run mode safely.
+
+- Set `CANOPY_SYNC_ENABLED=1`
+- Set `CANOPY_SYNC_DRY_RUN=1`
+- Leave `CANOPY_SYNC_STARTUP_BACKFILL=0`
+- You may leave `CANOPY_SYNC_TARGET_URL` blank in dry-run mode
+
+Then:
+
+- `POST /api/admin/canopy/backfill-active-clients` queues the current EA-active clients
+- `GET /api/admin/canopy/staged-clients` shows the staged payloads that would be sent
+
+Each staged client stores the latest payload snapshot and payload hash in Postgres so you can review exactly what the live sync will send later.
 
 ## BoldSign branding control
 

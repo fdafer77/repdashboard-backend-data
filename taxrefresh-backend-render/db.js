@@ -333,12 +333,16 @@ export async function ensureSchema(pool) {
       canopy_client_id text,
       sync_state text not null default 'pending',
       last_synced_at timestamptz,
+      last_staged_at timestamptz,
       last_payload_hash text not null default '',
+      last_payload_snapshot jsonb not null default '{}'::jsonb,
       last_error text not null default '',
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
   `)
+  await pool.query(`alter table ti_canopy_client_sync add column if not exists last_staged_at timestamptz;`)
+  await pool.query(`alter table ti_canopy_client_sync add column if not exists last_payload_snapshot jsonb not null default '{}'::jsonb;`)
   await pool.query(`create index if not exists ti_canopy_client_sync_updated_at_idx on ti_canopy_client_sync(updated_at desc);`)
   await pool.query(`create index if not exists ti_canopy_client_sync_state_idx on ti_canopy_client_sync(sync_state, updated_at desc);`)
 

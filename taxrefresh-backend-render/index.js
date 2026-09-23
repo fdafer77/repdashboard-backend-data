@@ -46,8 +46,13 @@ const CANOPY_SYNC_TARGET_URL = String(
 const CANOPY_SYNC_AUTH_TOKEN = String(process.env.CANOPY_SYNC_AUTH_TOKEN || process.env.CANOPY_API_TOKEN || '').trim()
 const CANOPY_SYNC_AUTH_HEADER = String(process.env.CANOPY_SYNC_AUTH_HEADER || 'authorization').trim() || 'authorization'
 const CANOPY_SYNC_AUTH_SCHEME = String(process.env.CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
+const CANOPY_SYNC_DRY_RUN = ['1', 'true', 'yes', 'on'].includes(String(process.env.CANOPY_SYNC_DRY_RUN || '').trim().toLowerCase())
 const CANOPY_OAUTH_APP_URL = String(process.env.CANOPY_OAUTH_APP_URL || 'https://app.canopytax.com').trim().replace(/\/+$/, '')
 const CANOPY_OAUTH_API_URL = String(process.env.CANOPY_OAUTH_API_URL || 'https://api.canopytax.com').trim().replace(/\/+$/, '')
+const CANOPY_API_BASE_URL = String(process.env.CANOPY_API_BASE_URL || CANOPY_OAUTH_API_URL || 'https://api.canopytax.com').trim().replace(/\/+$/, '')
+const CANOPY_CLIENT_CREATE_PATH = String(process.env.CANOPY_CLIENT_CREATE_PATH || '/public/v3/clients').trim() || '/public/v3/clients'
+const CANOPY_CLIENT_UPDATE_PATH_TEMPLATE = String(process.env.CANOPY_CLIENT_UPDATE_PATH_TEMPLATE || '/public/v3/clients/{client_id}').trim() || '/public/v3/clients/{client_id}'
+const CANOPY_CLIENT_SEARCH_PATH = String(process.env.CANOPY_CLIENT_SEARCH_PATH || '/public/v3/clients/search').trim() || '/public/v3/clients/search'
 const CANOPY_OAUTH_TOKEN_URL = String(process.env.CANOPY_OAUTH_TOKEN_URL || `${CANOPY_OAUTH_API_URL}/public/v3/token`)
   .trim()
   .replace(/\/+$/, '')
@@ -1383,6 +1388,10 @@ function buildCanopyPayloadHash(payload = {}) {
   return crypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex')
 }
 
+function isCanopySyncTransportReady() {
+  return Boolean(CANOPY_SYNC_DRY_RUN || CANOPY_SYNC_TARGET_URL || CANOPY_API_BASE_URL)
+}
+
 function getCanopyBackoffMs(attemptCount = 1) {
   const baseDelay = Math.max(30_000, CANOPY_SYNC_POLL_MS)
   const exponent = Math.max(0, Number(attemptCount || 1) - 1)
@@ -1399,6 +1408,179 @@ function extractCanopyClientId(responseBody = {}) {
       responseBody?.data?.id ||
       '',
   ).trim()
+}
+
+function normalizeCanopyDate(value = '') {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
+  const parsed = new Date(raw)
+  if (!Number.isFinite(parsed.getTime())) return ''
+  return parsed.toISOString().slice(0, 10)
+}
+
+function normalizeCanopyFilingStatus(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return ''
+  if (['single'].includes(normalized)) return 'SINGLE'
+  if (['married filing jointly', 'married_joint', 'married joint', 'mfj'].includes(normalized)) return 'MARRIED_JOINT'
+  if (['married filing separately', 'married_separate', 'married separate', 'mfs'].includes(normalized)) return 'MARRIED_SEPARATE'
+  if (['head of household', 'head_of_household', 'hoh'].includes(normalized)) return 'HEAD_OF_HOUSEHOLD'
+  if (['qualifying widow', 'qualifying widower', 'qualifying_with_dependents', 'qualifying surviving spouse'].includes(normalized)) {
+    return 'QUALIFYING_WITH_DEPENDENTS'
+  }
+  return ''
+}
+
+function normalizeCanopyBusinessType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return ''
+  if (normalized.includes('c corp') || normalized.includes('c-corp') || normalized.includes('c corporation')) return 'C_CORPORATION'
+  if (normalized.includes('s corp') || normalized.includes('s-corp') || normalized.includes('s corporation')) return 'S_CORPORATION'
+  if (normalized === 'llc') return 'LLC'
+  if (normalized.includes('partnership')) return 'PARTNERSHIP'
+  if (normalized.includes('sole propriet')) return 'SOLE_PROPRIETORSHIP'
+  if (normalized.includes('estate')) return 'ESTATE'
+  if (normalized.includes('trust')) return 'TRUST'
+  if (normalized.includes('non profit') || normalized.includes('non-profit') || normalized.includes('nonprofit')) return 'NON_PROFIT'
+  if (normalized.includes('other')) return 'OTHER'
+  return ''
+}
+
+function buildCanopyPrimaryEmails(email = '') {
+  const normalized = String(email || '').trim().toLowerCase()
+  if (!normalized) return []
+  return [{ email: normalized, is_primary: true, type: 'PERSONAL' }]
+}
+
+function buildCanopyPrimaryPhones(phone = '') {
+  const normalized = normalizePhoneForSms(phone)
+  if (!normalized) return []
+  return [{ number: normalized, is_primary: true, type: 'MOBILE' }]
+}
+
+function buildCanopyPrimaryAddresses({ addressLine1 = '', city = '', stateCode = '', postalCode = '' } = {}) {
+  if (!String(addressLine1 || city || stateCode || postalCode).trim()) return []
+  return [
+    {
+      address_1: String(addressLine1 || '').trim(),
+      locality: String(city || '').trim(),
+      region: String(stateCode || '').trim(),
+      postal_code: String(postalCode || '').trim(),
+      country: 'US',
+      is_primary: true,
+      type: 'MAILING',
+    },
+  ]
+}
+
+function normalizeCanopySearchText(value = '') {
+  return String(value || '').trim().toLowerCase()
+}
+
+function buildCanopyClientNotes(payload = {}) {
+  const lines = [
+    `TaxRefresh external ID: ${String(payload?.externalId || '').trim()}`,
+    `EA status: ${String(payload?.eaCase?.status || '').trim()}`,
+    `Source updated at: ${String(payload?.sourceUpdatedAt || '').trim()}`,
+    `Pipeline: ${String(payload?.customFields?.taxrefresh_pipeline_name || '').trim()}`,
+    `Stage: ${String(payload?.customFields?.taxrefresh_stage_name || '').trim()}`,
+    `Assigned EA: ${String(payload?.customFields?.taxrefresh_assigned_ea_name || '').trim()}`,
+  ].filter((line) => !line.endsWith(': '))
+  return lines.join('\n')
+}
+
+function buildCanopyClientBodyFromSyncPayload(payload = {}) {
+  const client = payload?.client && typeof payload.client === 'object' ? payload.client : {}
+  const taxProfile = payload?.taxProfile && typeof payload.taxProfile === 'object' ? payload.taxProfile : {}
+  const businessName = String(client.businessName || client.companyName || taxProfile.businessName || '').trim()
+  const isBusiness = Boolean(businessName)
+  if (isBusiness) {
+    const displayName = businessName || String(client.name || '').trim()
+    return {
+      is_business: true,
+      type: 'CLIENT',
+      is_active: true,
+      business_name: displayName,
+      display_name: displayName,
+      business_type: normalizeCanopyBusinessType(taxProfile.businessType || taxProfile.taxType || '') || undefined,
+      external_id: String(payload?.externalId || '').trim() || undefined,
+      emails: buildCanopyPrimaryEmails(client.email),
+      phones: buildCanopyPrimaryPhones(client.phone),
+      addresses: buildCanopyPrimaryAddresses(client),
+      notes: buildCanopyClientNotes(payload) || undefined,
+    }
+  }
+  const firstName = String(client.firstName || '').trim()
+  const lastName = String(client.lastName || '').trim()
+  const displayName = String(client.name || [firstName, lastName].filter(Boolean).join(' ')).trim()
+  return {
+    is_business: false,
+    type: 'CLIENT',
+    is_active: true,
+    first_name: firstName || undefined,
+    last_name: lastName || undefined,
+    display_name: displayName || undefined,
+    birthdate: normalizeCanopyDate(client.dateOfBirth),
+    filing_status: normalizeCanopyFilingStatus(taxProfile.filingStatus) || undefined,
+    external_id: String(payload?.externalId || '').trim() || undefined,
+    emails: buildCanopyPrimaryEmails(client.email),
+    phones: buildCanopyPrimaryPhones(client.phone),
+    addresses: buildCanopyPrimaryAddresses(client),
+    notes: buildCanopyClientNotes(payload) || undefined,
+  }
+}
+
+function buildCanopySearchCandidatesFromSyncPayload(payload = {}) {
+  const client = payload?.client && typeof payload.client === 'object' ? payload.client : {}
+  const name = String(client.name || [client.firstName, client.lastName].filter(Boolean).join(' ')).trim()
+  const email = String(client.email || '').trim().toLowerCase()
+  const phone = normalizePhoneForSms(client.phone)
+  return [
+    email ? { kind: 'email', value: email, params: { email } } : null,
+    phone ? { kind: 'phone', value: phone, params: { phone } } : null,
+    name ? { kind: 'name', value: name, params: { name } } : null,
+  ].filter(Boolean)
+}
+
+function getCanopyResponseItems(data = {}) {
+  if (Array.isArray(data)) return data
+  if (Array.isArray(data?.clients)) return data.clients
+  if (Array.isArray(data?.data)) return data.data
+  if (Array.isArray(data?.results)) return data.results
+  if (data?.client && typeof data.client === 'object') return [data.client]
+  if (data && typeof data === 'object' && extractCanopyClientId(data)) return [data]
+  return []
+}
+
+function scoreCanopyClientMatch(candidate = {}, payload = {}) {
+  const client = payload?.client && typeof payload.client === 'object' ? payload.client : {}
+  const payloadExternalId = String(payload?.externalId || '').trim()
+  const candidateExternalId = String(candidate?.external_id || candidate?.externalId || '').trim()
+  if (payloadExternalId && candidateExternalId && payloadExternalId === candidateExternalId) return 100
+  const candidateEmail = normalizeCanopySearchText(candidate?.emails?.find?.((entry) => entry?.is_primary)?.email || candidate?.email || '')
+  const payloadEmail = normalizeCanopySearchText(client.email || '')
+  if (payloadEmail && candidateEmail && payloadEmail === candidateEmail) return 90
+  const candidatePhone = digitsOnly(candidate?.phones?.find?.((entry) => entry?.is_primary)?.number || candidate?.phone || '')
+  const payloadPhone = digitsOnly(client.phone || '')
+  if (payloadPhone && candidatePhone && payloadPhone === candidatePhone) return 80
+  const candidateName = normalizeCanopySearchText(candidate?.display_name || candidate?.name || [candidate?.first_name, candidate?.last_name].filter(Boolean).join(' '))
+  const payloadName = normalizeCanopySearchText(client.name || [client.firstName, client.lastName].filter(Boolean).join(' '))
+  if (payloadName && candidateName && payloadName === candidateName) return 70
+  return 0
+}
+
+function pickBestCanopyClientMatch(items = [], payload = {}) {
+  let best = null
+  let bestScore = 0
+  for (const item of Array.isArray(items) ? items : []) {
+    const score = scoreCanopyClientMatch(item, payload)
+    if (score > bestScore) {
+      best = item
+      bestScore = score
+    }
+  }
+  return bestScore >= 70 ? best : null
 }
 
 function normalizeAbsoluteUrl(value = '') {
@@ -1871,7 +2053,7 @@ async function dbGetCanopySyncState(sessionCode = '') {
   if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return null
   try {
     const res = await pool.query(
-      `select session_code, canopy_client_id, sync_state, last_synced_at, last_payload_hash, last_error
+      `select session_code, canopy_client_id, sync_state, last_synced_at, last_staged_at, last_payload_hash, last_payload_snapshot, last_error
          from ti_canopy_client_sync
         where session_code = $1
         limit 1`,
@@ -1889,21 +2071,25 @@ async function dbUpsertCanopySyncState({
   canopyClientId = '',
   syncState = 'pending',
   lastPayloadHash = '',
+  lastPayloadSnapshot = null,
   lastError = '',
   syncedAt = null,
+  stagedAt = null,
 } = {}) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!pool || isDbCircuitOpen() || !normalizedSessionCode) return false
   try {
     await pool.query(
       `
-      insert into ti_canopy_client_sync(session_code, canopy_client_id, sync_state, last_synced_at, last_payload_hash, last_error, created_at, updated_at)
-      values ($1, $2, $3, $4, $5, $6, now(), now())
+      insert into ti_canopy_client_sync(session_code, canopy_client_id, sync_state, last_synced_at, last_staged_at, last_payload_hash, last_payload_snapshot, last_error, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
       on conflict (session_code) do update
         set canopy_client_id = coalesce(excluded.canopy_client_id, ti_canopy_client_sync.canopy_client_id),
             sync_state = excluded.sync_state,
             last_synced_at = excluded.last_synced_at,
+            last_staged_at = coalesce(excluded.last_staged_at, ti_canopy_client_sync.last_staged_at),
             last_payload_hash = excluded.last_payload_hash,
+            last_payload_snapshot = coalesce(excluded.last_payload_snapshot, ti_canopy_client_sync.last_payload_snapshot),
             last_error = excluded.last_error,
             updated_at = now()
     `,
@@ -1912,7 +2098,9 @@ async function dbUpsertCanopySyncState({
         String(canopyClientId || '').trim() || null,
         String(syncState || 'pending').trim() || 'pending',
         syncedAt ? new Date(syncedAt) : null,
+        stagedAt ? new Date(stagedAt) : null,
         String(lastPayloadHash || '').trim(),
+        lastPayloadSnapshot && typeof lastPayloadSnapshot === 'object' ? lastPayloadSnapshot : null,
         String(lastError || '').trim(),
       ],
     )
@@ -2127,7 +2315,7 @@ async function dbMarkCanopySyncJobSkipped(jobId, { sessionCode = '', reason = ''
 
 async function dbMarkCanopySyncJobSucceeded(
   jobId,
-  { sessionCode = '', canopyClientId = '', payloadHash = '', responseSnapshot = {} } = {},
+  { sessionCode = '', canopyClientId = '', payloadHash = '', payloadSnapshot = null, responseSnapshot = {} } = {},
 ) {
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!pool || isDbCircuitOpen() || !jobId || !normalizedSessionCode) return false
@@ -2146,6 +2334,7 @@ async function dbMarkCanopySyncJobSucceeded(
       canopyClientId,
       syncState: 'succeeded',
       lastPayloadHash: payloadHash,
+      lastPayloadSnapshot: payloadSnapshot && typeof payloadSnapshot === 'object' ? payloadSnapshot : null,
       lastError: '',
       syncedAt: new Date().toISOString(),
     })
@@ -2196,54 +2385,163 @@ async function dbMarkCanopySyncJobFailed(
   }
 }
 
-async function canopySyncUpsertClient(payload = {}) {
-  if (!CANOPY_SYNC_TARGET_URL) {
-    const error = new Error('CANOPY_SYNC_TARGET_URL is not configured.')
+function buildCanopyApiUrl(pathname = '', query = null) {
+  const normalizedPath = String(pathname || '').trim()
+  if (!normalizedPath) return ''
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    const url = new URL(normalizedPath)
+    if (query && typeof query === 'object') {
+      Object.entries(query).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return
+        url.searchParams.set(key, String(value))
+      })
+    }
+    return url.toString()
+  }
+  const base = String(CANOPY_API_BASE_URL || CANOPY_OAUTH_API_URL || '').trim()
+  if (!base) return ''
+  const url = new URL(normalizedPath.startsWith('/') ? normalizedPath : `/${normalizedPath}`, `${base}/`)
+  if (query && typeof query === 'object') {
+    Object.entries(query).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === '') return
+      url.searchParams.set(key, String(value))
+    })
+  }
+  return url.toString()
+}
+
+async function runCanopyApiRequest({ method = 'GET', path = '', query = null, body = undefined, forceRefresh = false } = {}) {
+  const requestUrl = buildCanopyApiUrl(path, query)
+  if (!requestUrl) {
+    const error = new Error('Canopy API URL is not configured.')
     error.noRetry = true
     throw error
   }
-  async function runRequest(forceRefresh = false) {
-    const headers = {
-      accept: 'application/json',
-      'content-type': 'application/json',
-    }
-    const tokenInfo = await getCanopyApiAccessToken({ forceRefresh })
-    if (tokenInfo?.accessToken) {
-      const scheme = String(tokenInfo.tokenType || CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
-      headers[CANOPY_SYNC_AUTH_HEADER] = scheme ? `${scheme} ${tokenInfo.accessToken}`.trim() : tokenInfo.accessToken
-    }
-    const response = await fetch(CANOPY_SYNC_TARGET_URL, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload || {}),
-    })
-    const data = await response.json().catch(() => ({}))
-    return { response, data }
-  }
-
-  let { response, data } = await runRequest(false)
-  if (response.status === 401 && !CANOPY_SYNC_AUTH_TOKEN) {
-    ;({ response, data } = await runRequest(true))
-  }
-  if (!response.ok) {
-    const message =
-      String(data?.message || data?.error || response.statusText || 'Canopy sync failed').trim() ||
-      'Canopy sync failed'
-    const error = new Error(message)
-    error.status = response.status
-    error.noRetry = response.status >= 400 && response.status < 500 && response.status !== 429
-    error.responseBody = data
+  const headers = { accept: 'application/json' }
+  const tokenInfo = await getCanopyApiAccessToken({ forceRefresh })
+  if (!tokenInfo?.accessToken) {
+    const error = new Error('Missing Canopy access token.')
+    error.noRetry = true
     throw error
   }
+  const scheme = String(tokenInfo.tokenType || CANOPY_SYNC_AUTH_SCHEME || 'Bearer').trim()
+  headers[CANOPY_SYNC_AUTH_HEADER] = scheme ? `${scheme} ${tokenInfo.accessToken}`.trim() : tokenInfo.accessToken
+  let requestBody
+  if (body !== undefined) {
+    headers['content-type'] = 'application/json'
+    requestBody = JSON.stringify(body)
+  }
+  let response = await fetch(requestUrl, { method, headers, body: requestBody })
+  let data = await response.json().catch(() => ({}))
+  if (response.status === 401 && !CANOPY_SYNC_AUTH_TOKEN && !forceRefresh) {
+    return runCanopyApiRequest({ method, path, query, body, forceRefresh: true })
+  }
+  if (!response.ok) {
+    const message = String(data?.message || data?.error || response.statusText || 'Canopy sync failed').trim() || 'Canopy sync failed'
+    const error = new Error(message)
+    error.status = response.status
+    error.noRetry = response.status >= 400 && response.status < 500 && response.status !== 404 && response.status !== 429
+    error.responseBody = data
+    error.requestUrl = requestUrl
+    throw error
+  }
+  return { response, data, requestUrl }
+}
+
+async function searchCanopyClientMatch(payload = {}) {
+  const candidates = buildCanopySearchCandidatesFromSyncPayload(payload)
+  const searchPaths = [CANOPY_CLIENT_SEARCH_PATH, '/public/v2/clients/search'].filter((value, index, list) => value && list.indexOf(value) === index)
+  const queryVariants = [
+    (params) => params,
+    (params) => ({ query: Object.values(params || {})[0] || '' }),
+    (params) => ({ q: Object.values(params || {})[0] || '' }),
+  ]
+  for (const candidate of candidates) {
+    for (const path of searchPaths) {
+      for (const buildParams of queryVariants) {
+        const params = buildParams(candidate.params || {})
+        if (!Object.values(params || {}).some(Boolean)) continue
+        try {
+          const { data } = await runCanopyApiRequest({ method: 'GET', path, query: params })
+          const matched = pickBestCanopyClientMatch(getCanopyResponseItems(data), payload)
+          if (matched) {
+            return {
+              clientId: extractCanopyClientId(matched),
+              matchedClient: matched,
+              matchedBy: candidate.kind,
+              requestParams: params,
+              requestPath: path,
+            }
+          }
+        } catch (error) {
+          if (Number(error?.status || 0) === 404) continue
+          throw error
+        }
+      }
+    }
+  }
+  return { clientId: '', matchedClient: null, matchedBy: '', requestParams: {}, requestPath: '' }
+}
+
+async function canopySyncUpsertClient({ payload = {}, syncState = null } = {}) {
+  if (CANOPY_SYNC_DRY_RUN) {
+    return {
+      canopyClientId: '',
+      responseBody: {
+        ok: true,
+        mode: 'dry_run',
+        stagedAt: new Date().toISOString(),
+        payload,
+      },
+    }
+  }
+  if (CANOPY_SYNC_TARGET_URL) {
+    const { data } = await runCanopyApiRequest({ method: 'POST', path: CANOPY_SYNC_TARGET_URL, body: payload || {} })
+    return {
+      canopyClientId: extractCanopyClientId(data),
+      responseBody: data,
+      action: 'generic_post',
+    }
+  }
+  const canopyClient = buildCanopyClientBodyFromSyncPayload(payload)
+  const requestBody = { client: canopyClient }
+  let canopyClientId = String(syncState?.canopy_client_id || syncState?.canopyClientId || '').trim()
+  let matchedClient = null
+  let matchedBy = ''
+  if (!canopyClientId) {
+    const match = await searchCanopyClientMatch(payload)
+    canopyClientId = String(match?.clientId || '').trim()
+    matchedClient = match?.matchedClient || null
+    matchedBy = String(match?.matchedBy || '').trim()
+  }
+  if (canopyClientId) {
+    const updatePath = CANOPY_CLIENT_UPDATE_PATH_TEMPLATE.replace('{client_id}', encodeURIComponent(canopyClientId))
+    const { data } = await runCanopyApiRequest({ method: 'PATCH', path: updatePath, body: requestBody })
+    return {
+      canopyClientId: canopyClientId || extractCanopyClientId(data),
+      responseBody: {
+        mode: 'patch',
+        matchedBy: matchedBy || (matchedClient ? 'search' : 'stored_mapping'),
+        matchedClientId: canopyClientId,
+        client: data,
+      },
+      action: 'patch',
+    }
+  }
+  const { data } = await runCanopyApiRequest({ method: 'POST', path: CANOPY_CLIENT_CREATE_PATH, body: requestBody })
   return {
     canopyClientId: extractCanopyClientId(data),
-    responseBody: data,
+    responseBody: {
+      mode: 'create',
+      client: data,
+    },
+    action: 'create',
   }
 }
 
 async function runCanopySyncWorkerTick() {
   if (!CANOPY_SYNC_ENABLED || !pool || canopySyncWorkerRunning) return false
-  if (!CANOPY_SYNC_TARGET_URL) return false
+  if (!isCanopySyncTransportReady()) return false
   canopySyncWorkerRunning = true
   let activeJob = null
   let activeSessionCode = ''
@@ -2280,11 +2578,44 @@ async function runCanopySyncWorkerTick() {
       })
       return true
     }
-    const syncResponse = await canopySyncUpsertClient(payloadInfo.payload)
+    if (String(syncState?.last_payload_hash || '').trim() === payloadInfo.payloadHash && String(syncState?.sync_state || '').trim() === 'staged') {
+      await dbMarkCanopySyncJobSkipped(job?.id, {
+        sessionCode,
+        reason: 'unchanged_staged_payload',
+        responseSnapshot: { reason: 'unchanged_staged_payload', mode: 'dry_run' },
+      })
+      return true
+    }
+    const syncResponse = await canopySyncUpsertClient({ payload: payloadInfo.payload, syncState })
+    if (CANOPY_SYNC_DRY_RUN) {
+      const stagedAt = new Date().toISOString()
+      await dbUpsertCanopySyncState({
+        sessionCode,
+        canopyClientId: '',
+        syncState: 'staged',
+        lastPayloadHash: payloadInfo.payloadHash,
+        lastPayloadSnapshot: payloadInfo.payload,
+        lastError: '',
+        stagedAt,
+      })
+      await dbMarkCanopySyncJobSucceeded(job?.id, {
+        sessionCode,
+        canopyClientId: '',
+        payloadHash: payloadInfo.payloadHash,
+        payloadSnapshot: payloadInfo.payload,
+        responseSnapshot: {
+          mode: 'dry_run',
+          stagedAt,
+          payload: payloadInfo.payload,
+        },
+      })
+      return true
+    }
     await dbMarkCanopySyncJobSucceeded(job?.id, {
       sessionCode,
       canopyClientId: syncResponse.canopyClientId || String(syncState?.canopy_client_id || '').trim(),
       payloadHash: payloadInfo.payloadHash,
+      payloadSnapshot: payloadInfo.payload,
       responseSnapshot: syncResponse.responseBody || {},
     })
     return true
@@ -2307,7 +2638,7 @@ async function runCanopySyncWorkerTick() {
 }
 
 function startCanopySyncWorker() {
-  if (!CANOPY_SYNC_ENABLED || !pool || canopySyncWorkerTimer || !CANOPY_SYNC_TARGET_URL) return
+  if (!CANOPY_SYNC_ENABLED || !pool || canopySyncWorkerTimer || !isCanopySyncTransportReady()) return
   canopySyncWorkerTimer = setInterval(() => {
     runCanopySyncWorkerTick().catch((error) => console.error('Canopy sync worker failed:', error))
   }, CANOPY_SYNC_POLL_MS)
@@ -13815,6 +14146,46 @@ app.post('/api/admin/canopy/oauth/refresh', async (req, res) => {
   }
 })
 
+app.get('/api/admin/canopy/staged-clients', async (req, res) => {
+  if (!requireAdminAccess(req, res)) return
+  try {
+    if (!pool) return res.status(503).json({ error: 'Database is not configured.' })
+    if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open' })
+    const limit = Math.max(1, Math.min(250, Number(req.query?.limit || 50) || 50))
+    const rowsRes = await pool.query(
+      `select session_code, canopy_client_id, sync_state, last_synced_at, last_staged_at, last_payload_hash, last_payload_snapshot, last_error, updated_at
+         from ti_canopy_client_sync
+        where sync_state in ('staged', 'succeeded', 'pending', 'failed', 'skipped')
+          and last_payload_snapshot <> '{}'::jsonb
+        order by coalesce(last_staged_at, updated_at) desc
+        limit $1`,
+      [limit],
+    )
+    const rows = Array.isArray(rowsRes.rows) ? rowsRes.rows : []
+    return res.json({
+      ok: true,
+      dryRun: CANOPY_SYNC_DRY_RUN,
+      count: rows.length,
+      items: rows.map((row) => ({
+        sessionCode: String(row?.session_code || '').trim(),
+        canopyClientId: String(row?.canopy_client_id || '').trim(),
+        syncState: String(row?.sync_state || '').trim(),
+        lastSyncedAt: row?.last_synced_at ? new Date(row.last_synced_at).toISOString() : '',
+        lastStagedAt: row?.last_staged_at ? new Date(row.last_staged_at).toISOString() : '',
+        lastPayloadHash: String(row?.last_payload_hash || '').trim(),
+        lastError: String(row?.last_error || '').trim(),
+        updatedAt: row?.updated_at ? new Date(row.updated_at).toISOString() : '',
+        payload: row?.last_payload_snapshot && typeof row.last_payload_snapshot === 'object' ? row.last_payload_snapshot : {},
+      })),
+    })
+  } catch (error) {
+    if (isTransientDbConnectionError(error) || error?.isTransientDb) {
+      return res.status(503).json({ error: 'Database is waking up. Please refresh again in 10–30 seconds.' })
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load staged Canopy clients' })
+  }
+})
+
 app.post('/api/admin/canopy/backfill-active-clients', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
@@ -13835,7 +14206,8 @@ app.post('/api/admin/canopy/backfill-active-clients', async (req, res) => {
       skipped: Number(result?.skipped || 0) || 0,
       total: Number(result?.total || 0) || 0,
       workerEnabled: CANOPY_SYNC_ENABLED,
-      targetConfigured: Boolean(CANOPY_SYNC_TARGET_URL),
+      dryRun: CANOPY_SYNC_DRY_RUN,
+      targetConfigured: isCanopySyncTransportReady(),
     })
   } catch (error) {
     if (isTransientDbConnectionError(error) || error?.isTransientDb) {
