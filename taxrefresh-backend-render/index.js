@@ -17971,19 +17971,6 @@ function buildConsultationAnalytics(items = [], account = null) {
         .trim()
         .toLowerCase()
       const isCancellationRequested = hasActiveCancellationRequestStatus(cancellationStatus)
-      const investigationDocumentsSigned = hasSignedPendingRevenueDocuments(answers)
-      const resolutionDocumentsSigned = hasSignedResolutionDocuments(answers)
-      const hasStoredPaymentMethod = hasStoredPaymentMethodOnFile(answers)
-      const investigationScheduleRowKeys = new Set(
-        getScopedBillingScheduleRowsFromAnswers(answers, 'investigation')
-          .map((row) => getBillingRowMatchKey(row))
-          .filter(Boolean),
-      )
-      const resolutionScheduleRowKeys = new Set(
-        getScopedBillingScheduleRowsFromAnswers(answers, 'resolution')
-          .map((row) => getBillingRowMatchKey(row))
-          .filter(Boolean),
-      )
       const scheduleRows = getBillingScheduleRowsFromAnswers(answers)
       if (!isCancellationRequested) {
         const hasAnyStripeSignal =
@@ -18007,20 +17994,6 @@ function buildConsultationAnalytics(items = [], account = null) {
           const normalizedDate = normalizeBillingDateValue(getBillingProcessedAtValue(row) || row?.date || '')
           const monthKey = normalizedDate.slice(0, 7)
           const matchKey = getBillingRowMatchKey({ date: normalizedDate, amount })
-          const matchesInvestigationRow = Boolean(matchKey && investigationScheduleRowKeys.has(matchKey))
-          const matchesResolutionRow = Boolean(matchKey && resolutionScheduleRowKeys.has(matchKey))
-          let docsSignedEligible = investigationDocumentsSigned || resolutionDocumentsSigned
-          if (matchesResolutionRow && !matchesInvestigationRow) {
-            docsSignedEligible = resolutionDocumentsSigned
-          } else if (matchesInvestigationRow && !matchesResolutionRow) {
-            docsSignedEligible = investigationDocumentsSigned
-          } else if (matchesInvestigationRow || matchesResolutionRow) {
-            docsSignedEligible =
-              (matchesInvestigationRow && investigationDocumentsSigned) ||
-              (matchesResolutionRow && resolutionDocumentsSigned)
-          }
-          const pendingRevenueEligible = docsSignedEligible && hasStoredPaymentMethod
-          if (tone === 'pending' && !docsSignedEligible) return
           const isPastDuePending = tone === 'pending' && Boolean(normalizedDate) && normalizedDate < todayKey
           const statusLabel = tone === 'processed' ? 'Processed' : tone === 'failed' ? 'Failed' : isPastDuePending ? 'Past due' : 'Pending'
           const failureReason = String(row?.failureReason || row?.processorReason || row?.reason || '').trim()
@@ -18040,11 +18013,11 @@ function buildConsultationAnalytics(items = [], account = null) {
               if (countedFailedMatchKeys.has(matchKey)) return
               countedFailedMatchKeys.add(matchKey)
             }
-          } else if (!isPastDuePending && pendingRevenueEligible) {
-            if (matchKey) {
-              if (countedPendingMatchKeys.has(matchKey)) return
-              countedPendingMatchKeys.add(matchKey)
-            }
+          } else if (matchKey) {
+            if (countedPendingMatchKeys.has(matchKey)) return
+            countedPendingMatchKeys.add(matchKey)
+          } else if (tone !== 'processed' && tone !== 'failed' && !amount && !normalizedDate) {
+            return
           }
           const paymentScheduleEntry = {
             id: `${String(item.sessionCode || '').trim()}_${normalizedDate || 'undated'}_${rowIndex}`,
@@ -18078,7 +18051,10 @@ function buildConsultationAnalytics(items = [], account = null) {
             failedRevenue += amount
             failedRevenueTotal += amount
             failedPayments.push(paymentScheduleEntry)
-          } else if (pendingRevenueEligible) {
+          } else {
+            if (matchKey) {
+              countedPendingMatchKeys.add(matchKey)
+            }
             pendingRevenue += amount
             pendingRevenueTotal += amount
           }
