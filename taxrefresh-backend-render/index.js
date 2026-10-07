@@ -2741,9 +2741,13 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
       scope: String(row?.billing_scope || 'all').trim() || 'all',
       payload: row?.payload && typeof row.payload === 'object' ? { ...row.payload } : {},
     }))
-    if (existingBillingRows.length) {
+    const finalizedBillingRows = existingBillingRows.filter((row) => {
+      const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {}
+      return getBillingStatusTone(payload) !== 'pending' || hasBillingProcessingEvidence(payload)
+    })
+    if (finalizedBillingRows.length) {
       const mergedDurableAnswers = mergeConsultationDurableProjectionIntoAnswers(mergedAnswers, {
-        billingRows: existingBillingRows,
+        billingRows: finalizedBillingRows,
       })
       Object.assign(mergedAnswers, mergedDurableAnswers)
     }
