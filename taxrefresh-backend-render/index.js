@@ -7109,7 +7109,7 @@ function getLifecycleLabel(item = {}) {
 function isPortalAuthorizedForAnswers(answers = {}) {
   const onboardingStatus = String(answers?.onboarding_status || '').trim().toLowerCase()
   if (onboardingStatus === 'documents_signed') return true
-  return isForm8821FullySigned(answers)
+  return hasAnySignedInvestigationDocuments(answers)
 }
 
 function hasSignedResolutionDocuments(answers = {}) {
@@ -13593,6 +13593,128 @@ async function findLatestSessionByPhone(phone = '') {
   return liveCandidates[0] || null
 }
 
+async function hydratePortalLookupRow(row = null) {
+  if (!row?.session_code) return row
+  try {
+    const detail = await getConsultationRecordByCode(String(row.session_code || '').trim())
+    const mergedAnswers = detail?.answers && typeof detail.answers === 'object' ? { ...detail.answers } : null
+    if (!mergedAnswers) return row
+    return {
+      ...row,
+      state: {
+        ...(row?.state && typeof row.state === 'object' ? row.state : {}),
+        answers: mergedAnswers,
+      },
+    }
+  } catch {
+    return row
+  }
+}
+
+async function findBestPortalSessionByEmail(email = '') {
+  const normalized = String(email || '').trim().toLowerCase()
+  if (!normalized) return null
+
+  let candidates = []
+  if (pool) {
+    const query = `
+      select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+      from ti_sessions
+      where
+        lower(coalesce(state->'answers'->>'email', '')) = $1
+        or lower(coalesce(state->'answers'->>'email_address', '')) = $1
+      order by updated_at desc
+      limit 25
+    `
+    const res = await pool.query(query, [normalized])
+    candidates = Array.isArray(res.rows) ? res.rows : []
+  } else {
+    const persistedRows = await fallbackListSessions()
+    const persistedCandidates = persistedRows
+      .map((row) => {
+        const answers = row?.state?.answers || {}
+        const rowEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
+        if (!rowEmail || rowEmail !== normalized) return null
+        return row
+      })
+      .filter(Boolean)
+    const liveCandidates = Array.from(rooms.entries())
+      .map(([sessionCode, room]) => {
+        const answers = room?.state?.answers || {}
+        const rowEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim().toLowerCase()
+        if (!rowEmail || rowEmail !== normalized) return null
+        return {
+          session_code: sessionCode,
+          ghl_contact_id: room?.contactId || null,
+          ghl_opportunity_id: room?.opportunityId || null,
+          state: room?.state || null,
+          created_at: null,
+          updated_at: new Date(Number(room?.state?.updatedAt) || Date.now()),
+        }
+      })
+      .filter(Boolean)
+    candidates = [...persistedCandidates, ...liveCandidates].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+  }
+
+  if (!candidates.length) return null
+  const hydratedCandidates = await Promise.all(candidates.map((candidate) => hydratePortalLookupRow(candidate)))
+  return hydratedCandidates.find((candidate) => isPortalAuthorizedForAnswers(candidate?.state?.answers || {})) || hydratedCandidates[0] || null
+}
+
+async function findBestPortalSessionByPhone(phone = '') {
+  const normalizedDigits = getPortalPhoneDigits(phone)
+  if (normalizedDigits.length !== 10) return null
+
+  let candidates = []
+  if (pool) {
+    const query = `
+      select session_code, ghl_contact_id, ghl_opportunity_id, state, created_at, updated_at
+      from ti_sessions
+      where
+        right(regexp_replace(coalesce(state->'answers'->>'phone', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'phone_number', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'mobile', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'mobile_phone', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'cell', ''), '[^0-9]', '', 'g'), 10) = $1
+        or right(regexp_replace(coalesce(state->'answers'->>'cell_phone', ''), '[^0-9]', '', 'g'), 10) = $1
+      order by updated_at desc
+      limit 25
+    `
+    const res = await pool.query(query, [normalizedDigits])
+    candidates = Array.isArray(res.rows) ? res.rows : []
+  } else {
+    const persistedRows = await fallbackListSessions()
+    const persistedCandidates = persistedRows
+      .map((row) => {
+        const answers = row?.state?.answers || {}
+        const rowDigits = getPortalPhoneDigits(getPrimaryAnswer(answers, ['phone', 'phone_number', 'mobile', 'mobile_phone', 'cell', 'cell_phone']) || '')
+        if (rowDigits.length !== 10 || rowDigits !== normalizedDigits) return null
+        return row
+      })
+      .filter(Boolean)
+    const liveCandidates = Array.from(rooms.entries())
+      .map(([sessionCode, room]) => {
+        const answers = room?.state?.answers || {}
+        const rowDigits = getPortalPhoneDigits(getPrimaryAnswer(answers, ['phone', 'phone_number', 'mobile', 'mobile_phone', 'cell', 'cell_phone']) || '')
+        if (rowDigits.length !== 10 || rowDigits !== normalizedDigits) return null
+        return {
+          session_code: sessionCode,
+          ghl_contact_id: room?.contactId || null,
+          ghl_opportunity_id: room?.opportunityId || null,
+          state: room?.state || null,
+          created_at: null,
+          updated_at: new Date(Number(room?.state?.updatedAt) || Date.now()),
+        }
+      })
+      .filter(Boolean)
+    candidates = [...persistedCandidates, ...liveCandidates].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+  }
+
+  if (!candidates.length) return null
+  const hydratedCandidates = await Promise.all(candidates.map((candidate) => hydratePortalLookupRow(candidate)))
+  return hydratedCandidates.find((candidate) => isPortalAuthorizedForAnswers(candidate?.state?.answers || {})) || hydratedCandidates[0] || null
+}
+
 function createPortalAuthSuccessPayload(row) {
   const answers = row?.state?.answers || {}
   return {
@@ -17551,7 +17673,7 @@ app.post('/api/client-portal/check-email', (req, res) => {
   ;(async () => {
     const email = String(req.body?.email || '').trim().toLowerCase()
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email is required.' })
-    const row = await findLatestSessionByEmail(email)
+    const row = await findBestPortalSessionByEmail(email)
     const answers = row?.state?.answers || {}
     const authorized = Boolean(row?.session_code) && isPortalAuthorizedForAnswers(answers)
     return res.json({
@@ -17571,7 +17693,7 @@ app.post('/api/client-portal/auth', (req, res) => {
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email is required.' })
     if (ssn4.length !== 4) return res.status(400).json({ error: 'Last 4 digits are required.' })
 
-    const row = await findLatestSessionByEmail(email)
+    const row = await findBestPortalSessionByEmail(email)
     if (!row?.session_code) return res.status(404).json({ error: 'No client portal record found for that email.' })
 
     const answers = row?.state?.answers || {}
@@ -17597,7 +17719,7 @@ app.post('/api/client-portal/send-sms-code', (req, res) => {
     const phoneDigits = getPortalPhoneDigits(normalizedPhone)
     if (phoneDigits.length !== 10) return res.status(400).json({ error: 'A valid 10-digit phone number is required.' })
 
-    const row = await findLatestSessionByPhone(normalizedPhone)
+    const row = await findBestPortalSessionByPhone(normalizedPhone)
     if (!row?.session_code) return res.status(404).json({ error: 'No client portal record found for that phone number.' })
 
     const answers = row?.state?.answers || {}
