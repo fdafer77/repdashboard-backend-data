@@ -2743,7 +2743,17 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
     }))
     const finalizedBillingRows = existingBillingRows.filter((row) => {
       const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {}
-      return getBillingStatusTone(payload) !== 'pending' || hasBillingProcessingEvidence(payload)
+      const statusTone = getBillingStatusTone(payload)
+      if (statusTone === 'pending') return false
+
+      const processedManually = Boolean(payload?.processedManually || payload?.processed_manually)
+      const hasProcessorEvidence = hasBillingProcessingEvidence(payload)
+
+      if (statusTone === 'processed' && processedManually && !hasProcessorEvidence) {
+        return false
+      }
+
+      return true
     })
     if (finalizedBillingRows.length) {
       const mergedDurableAnswers = mergeConsultationDurableProjectionIntoAnswers(mergedAnswers, {
