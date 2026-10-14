@@ -2747,9 +2747,8 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
       if (statusTone === 'pending') return false
 
       const processedManually = Boolean(payload?.processedManually || payload?.processed_manually)
-      const hasProcessorEvidence = hasBillingProcessingEvidence(payload)
 
-      if (statusTone === 'processed' && processedManually && !hasProcessorEvidence) {
+      if (statusTone === 'processed' && processedManually) {
         return false
       }
 
