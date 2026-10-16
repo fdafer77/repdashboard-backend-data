@@ -6810,10 +6810,16 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
     const tone = getBillingTimingTone(row?.date || '')
     return tone === 'today' || tone === 'past'
   })
+  const investigationInvoiceAmount = getBillingInvoiceAmountFromAnswers(answers, 'investigation')
+  const existingScheduleSummary = summarizeRevenueRows(existingScheduleRows)
+  const hasScheduleAmountMismatch =
+    investigationInvoiceAmount > 0 &&
+    existingScheduleSummary.processedRevenue + existingScheduleSummary.pendingRevenue + existingScheduleSummary.failedRevenue + 0.01 <
+      investigationInvoiceAmount
   // Previously we bailed out as soon as we saw *any* processing evidence. That can miss later payments
   // (e.g. one payment intent succeeded but never got written back to the schedule). If there are
   // due/past rows still outstanding, we should attempt a restore (throttled by attempted_at).
-  if (hasExistingEvidence && outstandingDueRows.length === 0) return
+  if (hasExistingEvidence && outstandingDueRows.length === 0 && !hasScheduleAmountMismatch) return
 
   let customerId = String(answers.stripe_customer_id || '').trim()
   const email = String(answers.email || '').trim()
