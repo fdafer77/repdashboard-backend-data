@@ -16896,10 +16896,25 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
       row.processorReason = ''
       row.reason = ''
     })
-    const cleanedRows = collapseOverflowEqualInstallmentRows(
+    const processedTargetRow = rows[targetScheduleIndex] ? { ...rows[targetScheduleIndex] } : null
+    let cleanedRows = collapseOverflowEqualInstallmentRows(
       rows,
       getBillingInvoiceAmountFromAnswers(room.state.answers || {}, billingMode),
     )
+    if (processedTargetRow) {
+      const preservedProcessedTarget = cleanedRows.some((row) => {
+        if (getBillingStripePaymentIntentIdValue(row) === intent.id) return true
+        return (
+          getBillingStatusTone(row) === 'processed' &&
+          getBillingRowMatchKey(row) === getBillingRowMatchKey(processedTargetRow)
+        )
+      })
+      if (!preservedProcessedTarget) {
+        cleanedRows = mergeUniqueBillingScheduleRows(cleanedRows, [processedTargetRow]).sort((left, right) =>
+          normalizeBillingDateValue(left?.date || '').localeCompare(normalizeBillingDateValue(right?.date || '')),
+        )
+      }
+    }
     room.state.answers[scheduleFieldKey] = cleanedRows
     const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: cleanedRows }]
     if (billingMode === 'investigation') {
