@@ -3263,17 +3263,43 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
           .map((row) => (row?.payload && typeof row.payload === 'object' ? { ...row.payload } : null))
           .filter(Boolean),
       )
+    const getPendingSessionDraftRows = (existingRows, projectedRows) => {
+      const projectedKeys = new Set(
+        (Array.isArray(projectedRows) ? projectedRows : [])
+          .map((row) => getBillingRowMatchKey(row))
+          .filter(Boolean),
+      )
+      return normalizeBillingScheduleRows(existingRows).filter((row) => {
+        const matchKey = getBillingRowMatchKey(row)
+        if (matchKey && projectedKeys.has(matchKey)) return false
+        if (getBillingStatusTone(row) !== 'pending') return false
+        if (hasBillingProcessingEvidence(row)) return false
+        if (String(row?.failureReason || row?.processorReason || row?.reason || '').trim()) return false
+        return Boolean(String(row?.date || '').trim() || String(row?.amount || '').trim())
+      })
+    }
     const existingAllRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.billing_schedule, []))
     const existingInvestigationRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.investigation_billing_schedule, []))
     const existingResolutionRows = normalizeBillingScheduleRows(parseStoredObject(nextAnswers.resolution_billing_schedule, []))
     const allRows = normalizeProjectedRows('all')
     const investigationRows = normalizeProjectedRows('investigation')
     const resolutionRows = normalizeProjectedRows('resolution')
-    const mergedInvestigationRows = mergeUniqueBillingScheduleRows(existingInvestigationRows, investigationRows)
-    const mergedResolutionRows = mergeUniqueBillingScheduleRows(existingResolutionRows, resolutionRows)
-    const mergedAllRows = mergeUniqueBillingScheduleRows(
-      existingAllRows,
+    const mergedInvestigationRows = mergeUniqueBillingScheduleRows(
+      investigationRows,
+      getPendingSessionDraftRows(existingInvestigationRows, investigationRows),
+    )
+    const mergedResolutionRows = mergeUniqueBillingScheduleRows(
+      resolutionRows,
+      getPendingSessionDraftRows(existingResolutionRows, resolutionRows),
+    )
+    const projectedAllRows = mergeUniqueBillingScheduleRows(
       allRows.length ? allRows : [],
+      mergedInvestigationRows,
+      mergedResolutionRows,
+    )
+    const mergedAllRows = mergeUniqueBillingScheduleRows(
+      projectedAllRows,
+      getPendingSessionDraftRows(existingAllRows, projectedAllRows),
       mergedInvestigationRows,
       mergedResolutionRows,
     )
