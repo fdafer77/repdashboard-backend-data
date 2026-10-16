@@ -6398,6 +6398,7 @@ function collapseOverflowEqualInstallmentRows(rows = [], invoiceAmount = 0) {
   const normalizedRows = normalizeBillingScheduleRows(Array.isArray(rows) ? rows : [])
   const normalizedInvoiceAmount = toNumberValue(invoiceAmount)
   if (!normalizedRows.length || normalizedInvoiceAmount <= 0) return normalizedRows
+  if (!normalizedRows.some((row) => getBillingStatusTone(row) === 'failed')) return normalizedRows
 
   const uniqueAmounts = Array.from(
     new Set(
