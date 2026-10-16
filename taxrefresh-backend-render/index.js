@@ -6809,8 +6809,9 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
       } else if (Array.isArray(intent.payment_method_types) && intent.payment_method_types.length) {
         methodType = String(intent.payment_method_types[0] || '').trim()
       }
+      const scheduledDate = normalizeBillingDateValue(intent?.metadata?.scheduledDate || '')
       return {
-        date: normalizedDate,
+        date: scheduledDate || normalizedDate,
         amount,
         status: 'processed',
         stripePaymentIntentId: String(intent.id || '').trim(),
@@ -6820,6 +6821,7 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
         processedPaymentMethodBrand: brand,
         processedPaymentMethodLast4: last4,
         processedPaymentMethodType: methodType,
+        _scheduledDate: scheduledDate,
         _billingMode: billingMode,
       }
     })
@@ -6872,25 +6874,42 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   const existingDirectSchedule = normalizeBillingScheduleRows(parseStoredObject(answers.billing_schedule, []))
   const existingIntentIds = new Set(existingDirectSchedule.map((row) => getBillingStripePaymentIntentIdValue(row)).filter(Boolean))
   const existingByKey = new Map()
+  const existingOutstandingByAmount = new Map()
   existingDirectSchedule.forEach((row) => {
     const key = getBillingRowMatchKey(row)
     if (!key) return
     const bucket = existingByKey.get(key)
     if (bucket) bucket.push(row)
     else existingByKey.set(key, [row])
+    if (getBillingStatusTone(row) === 'processed') return
+    const amountKey = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+    const amountBucket = existingOutstandingByAmount.get(amountKey)
+    if (amountBucket) amountBucket.push(row)
+    else existingOutstandingByAmount.set(amountKey, [row])
   })
 
   const merged = [...existingDirectSchedule]
   candidates.forEach((candidate) => {
     const intentId = getBillingStripePaymentIntentIdValue(candidate)
     if (intentId && existingIntentIds.has(intentId)) return
-    const key = getBillingRowMatchKey(candidate)
-    if (!key) return
-    const bucket = existingByKey.get(key)
-    const match = Array.isArray(bucket) && bucket.length ? bucket[0] : null
+    const scheduledDate = normalizeBillingDateValue(candidate?._scheduledDate || candidate?.date || '')
+    const key = getBillingRowMatchKey({ date: scheduledDate, amount: candidate?.amount || 0 })
+    let match = null
+    const bucket = key ? existingByKey.get(key) : null
+    if (Array.isArray(bucket) && bucket.length) {
+      match = bucket[0]
+    } else {
+      const amountKey = Number(toNumberValue(candidate?.amount || 0)).toFixed(2)
+      const amountBucket = existingOutstandingByAmount.get(amountKey)
+      if (Array.isArray(amountBucket) && amountBucket.length) {
+        match = amountBucket.shift()
+      }
+    }
     if (match) {
       if (hasBillingProcessingEvidence(match)) return
-      Object.assign(match, candidate)
+      Object.assign(match, candidate, {
+        date: normalizeBillingDateValue(match?.date || scheduledDate || candidate?.date || ''),
+      })
       existingIntentIds.add(intentId)
       return
     }
@@ -6901,7 +6920,7 @@ async function autoRestoreStripeBillingEvidenceIfMissing({ roomCode, state, pers
   const nextSchedule = sanitizeBillingScheduleRowsForPersistence(
     // remove helper-only field before saving
     merged.map((row) => {
-      const { _billingMode, ...rest } = row || {}
+      const { _billingMode, _scheduledDate, ...rest } = row || {}
       return rest
     }),
     existingDirectSchedule,
@@ -16220,8 +16239,9 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
         } else if (Array.isArray(intent.payment_method_types) && intent.payment_method_types.length) {
           methodType = String(intent.payment_method_types[0] || '').trim()
         }
+        const scheduledDate = normalizeBillingDateValue(intent?.metadata?.scheduledDate || '')
         return {
-          date: normalizedDate,
+          date: scheduledDate || normalizedDate,
           amount,
           status: 'processed',
           stripePaymentIntentId: String(intent.id || '').trim(),
@@ -16231,6 +16251,7 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
           processedPaymentMethodBrand: brand,
           processedPaymentMethodLast4: last4,
           processedPaymentMethodType: methodType,
+          _scheduledDate: scheduledDate,
         }
       })
       .filter((row) => Boolean(row?.stripePaymentIntentId) && Number(row?.amount || 0) > 0 && Boolean(row?.date))
@@ -16257,6 +16278,7 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
 
     const normalizedExisting = normalizeBillingScheduleRows(existingSchedule)
     const existingByKey = new Map()
+    const existingOutstandingByAmount = new Map()
     const existingIntentIds = new Set(
       normalizedExisting.map((row) => getBillingStripePaymentIntentIdValue(row)).filter(Boolean),
     )
@@ -16266,19 +16288,35 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
       const bucket = existingByKey.get(key)
       if (bucket) bucket.push(row)
       else existingByKey.set(key, [row])
+      if (getBillingStatusTone(row) === 'processed') return
+      const amountKey = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+      const amountBucket = existingOutstandingByAmount.get(amountKey)
+      if (amountBucket) amountBucket.push(row)
+      else existingOutstandingByAmount.set(amountKey, [row])
     })
 
     const merged = [...normalizedExisting]
     candidates.forEach((candidate) => {
       const intentId = getBillingStripePaymentIntentIdValue(candidate)
       if (intentId && existingIntentIds.has(intentId)) return
-      const key = getBillingRowMatchKey(candidate)
-      if (!key) return
-      const bucket = existingByKey.get(key)
-      const match = Array.isArray(bucket) && bucket.length ? bucket[0] : null
+      const scheduledDate = normalizeBillingDateValue(candidate?._scheduledDate || candidate?.date || '')
+      const key = getBillingRowMatchKey({ date: scheduledDate, amount: candidate?.amount || 0 })
+      let match = null
+      const bucket = key ? existingByKey.get(key) : null
+      if (Array.isArray(bucket) && bucket.length) {
+        match = bucket[0]
+      } else {
+        const amountKey = Number(toNumberValue(candidate?.amount || 0)).toFixed(2)
+        const amountBucket = existingOutstandingByAmount.get(amountKey)
+        if (Array.isArray(amountBucket) && amountBucket.length) {
+          match = amountBucket.shift()
+        }
+      }
       if (match) {
         if (hasBillingProcessingEvidence(match)) return
-        Object.assign(match, candidate)
+        Object.assign(match, candidate, {
+          date: normalizeBillingDateValue(match?.date || scheduledDate || candidate?.date || ''),
+        })
         existingIntentIds.add(intentId)
         return
       }
@@ -16286,7 +16324,13 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
       existingIntentIds.add(intentId)
     })
 
-    const nextSchedule = sanitizeBillingScheduleRowsForPersistence(merged, existingSchedule)
+    const nextSchedule = sanitizeBillingScheduleRowsForPersistence(
+      merged.map((row) => {
+        const { _scheduledDate, ...rest } = row || {}
+        return rest
+      }),
+      existingSchedule,
+    )
 
     room.state.answers[scheduleFieldKey] = nextSchedule
     // Keep generic investigation fields aligned for older records.
@@ -16672,6 +16716,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
         sessionCode: roomCode,
         scheduleIndex: String(targetScheduleIndex),
         billingMode,
+        scheduledDate: normalizeBillingDateValue(targetRow?.date || scheduledDate || ''),
         amount: String(amount),
       },
     })
