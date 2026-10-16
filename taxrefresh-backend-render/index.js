@@ -15062,6 +15062,19 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
         })
       },
     })
+    await repairConsultationRecordIntegrity({
+      roomCode: row.session_code,
+      state: row.state,
+      persist: async (nextState) => {
+        row.state = nextState
+        await dbUpsertSession({
+          code: row.session_code,
+          contactId: row.ghl_contact_id,
+          opportunityId: row.ghl_opportunity_id,
+          state: nextState,
+        })
+      },
+    })
     const durableProjection = await dbGetConsultationDurableProjection(String(row.session_code || req.params.code || ''))
     const item = await attachSmsThreadToConsultationDetail(buildConsultationDetail({
       sessionCode: row.session_code,
