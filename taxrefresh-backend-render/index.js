@@ -6211,21 +6211,86 @@ function normalizeBillingScheduleRows(rows = []) {
 }
 
 function mergeUniqueBillingScheduleRows(...groups) {
-  const seen = new Set()
-  return groups
-    .flat()
-    .filter((row) => {
-      const key = [
-        String(row?.date || '').trim(),
-        String(row?.amount || '').trim(),
-        String(row?.status || '').trim().toLowerCase(),
-        String(row?.failureReason || '').trim().toLowerCase(),
-      ].join('|')
-      if (!key.replace(/\|/g, '')) return false
-      if (seen.has(key)) return false
-      seen.add(key)
-      return true
-    })
+  const matchedRows = new Map()
+  const matchedOrder = []
+  const unmatchedSeen = new Set()
+  const unmatchedRows = []
+
+  const getBillingRowSignalScore = (row = {}) => {
+    let score = 0
+    if (hasBillingProcessingEvidence(row)) score += 4
+    if (String(row?.failureReason || '').trim()) score += 2
+    if (String(row?.processorReason || '').trim()) score += 1
+    if (String(row?.reason || '').trim()) score += 1
+    if (String(row?.status || '').trim()) score += 1
+    return score
+  }
+
+  const getBillingRowToneRank = (row = {}) => {
+    const tone = getBillingStatusTone(row)
+    if (tone === 'processed') return 3
+    if (tone === 'failed') return 2
+    return 1
+  }
+
+  const getBillingRowRecencyScore = (row = {}) => {
+    const iso =
+      String(getBillingProcessedAtValue(row) || '').trim() ||
+      String(row?.processedManualAt || row?.processed_manual_at || '').trim() ||
+      ''
+    if (!iso) return 0
+    const value = new Date(iso).getTime()
+    return Number.isFinite(value) ? value : 0
+  }
+
+  const choosePreferredBillingRow = (current = {}, candidate = {}) => {
+    const currentToneRank = getBillingRowToneRank(current)
+    const candidateToneRank = getBillingRowToneRank(candidate)
+    if (candidateToneRank !== currentToneRank) {
+      return candidateToneRank > currentToneRank ? { ...current, ...candidate } : current
+    }
+
+    const currentSignalScore = getBillingRowSignalScore(current)
+    const candidateSignalScore = getBillingRowSignalScore(candidate)
+    if (candidateSignalScore !== currentSignalScore) {
+      return candidateSignalScore > currentSignalScore ? { ...current, ...candidate } : current
+    }
+
+    const currentRecency = getBillingRowRecencyScore(current)
+    const candidateRecency = getBillingRowRecencyScore(candidate)
+    if (candidateRecency !== currentRecency) {
+      return candidateRecency > currentRecency ? { ...current, ...candidate } : current
+    }
+
+    return { ...current, ...candidate }
+  }
+
+  groups.flat().forEach((row) => {
+    if (!row || typeof row !== 'object') return
+    const matchKey = getBillingRowMatchKey(row)
+    if (matchKey) {
+      if (!matchedRows.has(matchKey)) {
+        matchedRows.set(matchKey, row)
+        matchedOrder.push(matchKey)
+        return
+      }
+      matchedRows.set(matchKey, choosePreferredBillingRow(matchedRows.get(matchKey), row))
+      return
+    }
+
+    const fallbackKey = [
+      String(row?.date || '').trim(),
+      String(row?.amount || '').trim(),
+      String(row?.status || '').trim().toLowerCase(),
+      String(row?.failureReason || '').trim().toLowerCase(),
+    ].join('|')
+    if (!fallbackKey.replace(/\|/g, '')) return
+    if (unmatchedSeen.has(fallbackKey)) return
+    unmatchedSeen.add(fallbackKey)
+    unmatchedRows.push(row)
+  })
+
+  return matchedOrder.map((key) => matchedRows.get(key)).concat(unmatchedRows)
 }
 
 function mapClientPortalPendingPaymentsToBillingRows(value = []) {
@@ -6433,22 +6498,14 @@ function getBillingRowMatchKey(row = {}) {
 }
 
 function getBillingRowPersistenceKey(row = {}) {
-  const tone = getBillingStatusTone(row)
-  // Persisted rows sometimes lack an explicit `date` but have `processedAt` (or `processed_at`).
-  // Use the processed timestamp as a stable fallback so schedule edits don't orphan processed rows
-  // and wipe Stripe evidence on save.
-  const normalizedDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
-  const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
-  if (!normalizedDate && normalizedAmount === '0.00') return ''
-  if (tone === 'processed' && hasBillingProcessingEvidence(row)) {
-    return `processed|${normalizedDate}|${normalizedAmount}`
-  }
-  return `open|${normalizedDate}|${normalizedAmount}`
+  const matchKey = getBillingRowMatchKey(row)
+  return matchKey ? `installment|${matchKey}` : ''
 }
 
 function sanitizeBillingScheduleRowsForPersistence(nextRows = [], existingRows = []) {
+  const mergedExistingRows = mergeUniqueBillingScheduleRows(Array.isArray(existingRows) ? existingRows : [])
   const existingBuckets = new Map()
-  ;(Array.isArray(existingRows) ? existingRows : []).forEach((row) => {
+  mergedExistingRows.forEach((row) => {
     const key = getBillingRowPersistenceKey(row)
     if (!key) return
     const bucket = existingBuckets.get(key)
@@ -6459,7 +6516,19 @@ function sanitizeBillingScheduleRowsForPersistence(nextRows = [], existingRows =
     existingBuckets.set(key, [row])
   })
 
-  return (Array.isArray(nextRows) ? nextRows : [])
+  const dedupedNextRows = mergeUniqueBillingScheduleRows(
+    (Array.isArray(nextRows) ? nextRows : []).map((row) => ({
+      ...(row || {}),
+      date: normalizeBillingDateValue(row?.date || ''),
+      amount: String(row?.amount ?? '').trim(),
+      status: String(row?.status || '').trim(),
+      failureReason: String(row?.failureReason || '').trim(),
+      processorReason: String(row?.processorReason || '').trim(),
+      reason: String(row?.reason || '').trim(),
+    })),
+  )
+
+  return dedupedNextRows
     .map((row) => ({
       ...(row || {}),
       date: normalizeBillingDateValue(row?.date || ''),
