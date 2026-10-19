@@ -2659,23 +2659,15 @@ function buildConsultationBillingProjectionRows({ sessionCode, contactId = '', o
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) return []
   const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
-  const investigationInvoiceAmount = getBillingInvoiceAmountFromAnswers(sourceAnswers, 'investigation')
-  const resolutionInvoiceAmount = getBillingInvoiceAmountFromAnswers(sourceAnswers, 'resolution')
   const scopedSchedules = [
-    { scope: 'all', rows: collapseOverflowEqualInstallmentRows(getBillingScheduleRowsFromAnswers(sourceAnswers), investigationInvoiceAmount) },
+    { scope: 'all', rows: getBillingScheduleRowsFromAnswers(sourceAnswers) },
     {
       scope: 'investigation',
-      rows: collapseOverflowEqualInstallmentRows(
-        getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'investigation'),
-        investigationInvoiceAmount,
-      ),
+      rows: getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'investigation'),
     },
     {
       scope: 'resolution',
-      rows: collapseOverflowEqualInstallmentRows(
-        getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'resolution'),
-        resolutionInvoiceAmount,
-      ),
+      rows: getScopedBillingScheduleRowsFromAnswers(sourceAnswers, 'resolution'),
     },
   ]
   const rowCounts = new Map()
@@ -3298,8 +3290,6 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
     const allRows = normalizeProjectedRows('all')
     const investigationRows = normalizeProjectedRows('investigation')
     const resolutionRows = normalizeProjectedRows('resolution')
-    const investigationInvoiceAmount = getBillingInvoiceAmountFromAnswers(nextAnswers, 'investigation')
-    const resolutionInvoiceAmount = getBillingInvoiceAmountFromAnswers(nextAnswers, 'resolution')
     const mergedInvestigationRows = mergeUniqueBillingScheduleRows(
       investigationRows,
       getPendingSessionDraftRows(existingInvestigationRows, investigationRows),
@@ -3319,15 +3309,9 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
       mergedInvestigationRows,
       mergedResolutionRows,
     )
-    nextAnswers.billing_schedule = collapseOverflowEqualInstallmentRows(mergedAllRows, investigationInvoiceAmount)
-    nextAnswers.investigation_billing_schedule = collapseOverflowEqualInstallmentRows(
-      mergedInvestigationRows,
-      investigationInvoiceAmount,
-    )
-    nextAnswers.resolution_billing_schedule = collapseOverflowEqualInstallmentRows(
-      mergedResolutionRows,
-      resolutionInvoiceAmount,
-    )
+    nextAnswers.billing_schedule = mergedAllRows
+    nextAnswers.investigation_billing_schedule = mergedInvestigationRows
+    nextAnswers.resolution_billing_schedule = mergedResolutionRows
   }
 
   if (profile) {
@@ -7224,7 +7208,7 @@ function queueStripeBillingRestore(roomCode = '') {
   stripeBillingRestoreQueue.add(normalized)
 }
 
-async function repairConsultationRecordIntegrity({ roomCode, state, persist } = {}) {
+async function repairConsultationRecordIntegrity({ roomCode, state, persist, skipBillingRestore = false } = {}) {
   const normalizedRoomCode = String(roomCode || '').trim()
   if (!normalizedRoomCode) return { restoredFromBackup: false, normalized8821: false, normalizedResolution: false, reconciled8821: false, reconciledResolution: false, restoredBilling: false, syncedPaymentMethods: false, storedSigned8821: false }
   if (typeof persist !== 'function') {
@@ -7270,11 +7254,13 @@ async function repairConsultationRecordIntegrity({ roomCode, state, persist } = 
     state: currentState,
     persist: persistAndCapture,
   })
-  results.restoredBilling = await autoRestoreStripeBillingEvidenceIfMissing({
-    roomCode: normalizedRoomCode,
-    state: currentState,
-    persist: persistAndCapture,
-  })
+  if (!skipBillingRestore) {
+    results.restoredBilling = await autoRestoreStripeBillingEvidenceIfMissing({
+      roomCode: normalizedRoomCode,
+      state: currentState,
+      persist: persistAndCapture,
+    })
+  }
   results.syncedPaymentMethods = await autoSyncStripePaymentMethodsIfMissing({
     roomCode: normalizedRoomCode,
     state: currentState,
@@ -14150,6 +14136,7 @@ async function getConsultationRecordByCode(code) {
       void repairConsultationRecordIntegrity({
         roomCode: row.session_code,
         state: row.state,
+        skipBillingRestore: true,
         persist: async (nextState) => {
           row.state = nextState
           await dbUpsertSession({ code: row.session_code, state: nextState })
@@ -14182,6 +14169,7 @@ async function getConsultationRecordByCode(code) {
     void repairConsultationRecordIntegrity({
       roomCode: normalized,
       state: room.state,
+      skipBillingRestore: true,
       persist: async (nextState) => {
         room.state = nextState
         await dbUpsertSession({ code: normalized, state: nextState })
@@ -15065,6 +15053,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
     await repairConsultationRecordIntegrity({
       roomCode: row.session_code,
       state: row.state,
+      skipBillingRestore: true,
       persist: async (nextState) => {
         row.state = nextState
         await dbUpsertSession({
@@ -15819,10 +15808,7 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
       if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule)
       return []
     })()
-    const schedule = collapseOverflowEqualInstallmentRows(
-      sanitizeBillingScheduleRowsForPersistence(incomingSchedule, existingSchedule),
-      toNumberValue(invoiceAmount) || getBillingInvoiceAmountFromAnswers(room.state.answers || {}, billingMode),
-    )
+    const schedule = sanitizeBillingScheduleRowsForPersistence(incomingSchedule, existingSchedule)
 
     room.state.answers[invoiceAmountFieldKey] = invoiceAmount === null || invoiceAmount === undefined ? '' : invoiceAmount
     room.state.answers[invoiceCreatedAtFieldKey] = invoiceCreatedAt === null || invoiceCreatedAt === undefined ? '' : invoiceCreatedAt
@@ -15892,6 +15878,7 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
   if (!requireAdminAccess(req, res)) return
   try {
     const roomCode = String(req.params.code || '').trim()
+    const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
     const scheduledDateRaw = String(req.body?.scheduledDate || '').trim()
     const scheduledAmount = Number(req.body?.scheduledAmount)
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
@@ -15918,49 +15905,47 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
       return []
     }
 
-    const scheduleKeys = ['billing_schedule', 'investigation_billing_schedule', 'resolution_billing_schedule']
+    const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
     const nextAnswers = room.state.answers || {}
     const persistPatches = []
     let updatedCount = 0
-
-    scheduleKeys.forEach((key) => {
-      const existingSchedule = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[key]))
-      if (!existingSchedule.length) return
-
-      let keyUpdated = 0
-      const nextSchedule = existingSchedule.map((row) => {
-        const rowDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
-        const rowAmount = toNumberValue(row?.amount)
-        const dateMatches = rowDate === normalizedDate
-        const amountMatches = Math.abs(Number(rowAmount) - Number(scheduledAmount)) < 0.01
-        if (!dateMatches || !amountMatches) return row
-        if (getBillingStatusTone(row) === 'processed') return row
-        updatedCount += 1
-        keyUpdated += 1
-        return {
-          ...(row || {}),
-          status: 'processed',
-          failureReason: '',
-          processorReason: '',
-          reason: '',
-          processedAt: getBillingProcessedAtValue(row) || getBillingProcessedAtIsoForScheduledDate(normalizedDate, nowIso),
-          processedManually: true,
-          processedManualBy: actorEmail,
-          processedManualAt: nowIso,
-        }
-      })
-
-      if (keyUpdated === 0) return
-      const sanitized = collapseOverflowEqualInstallmentRows(
-        sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule),
-        getBillingInvoiceAmountFromAnswers(nextAnswers, billingMode),
-      )
-      nextAnswers[key] = sanitized
-      persistPatches.push({ type: 'setAnswer', questionId: key, value: sanitized })
+    const existingSchedule = (() => {
+      const scoped = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[scheduleFieldKey]))
+      if (scoped.length) return scoped
+      if (billingMode === 'investigation') return normalizeBillingScheduleRows(parseScheduleValue(nextAnswers.billing_schedule))
+      return []
+    })()
+    const nextSchedule = existingSchedule.map((row) => {
+      const rowDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
+      const rowAmount = toNumberValue(row?.amount)
+      const dateMatches = rowDate === normalizedDate
+      const amountMatches = Math.abs(Number(rowAmount) - Number(scheduledAmount)) < 0.01
+      if (!dateMatches || !amountMatches) return row
+      if (getBillingStatusTone(row) === 'processed') return row
+      updatedCount += 1
+      return {
+        ...(row || {}),
+        status: 'processed',
+        failureReason: '',
+        processorReason: '',
+        reason: '',
+        processedAt: getBillingProcessedAtValue(row) || getBillingProcessedAtIsoForScheduledDate(normalizedDate, nowIso),
+        processedManually: true,
+        processedManualBy: actorEmail,
+        processedManualAt: nowIso,
+      }
     })
 
     if (updatedCount === 0) {
       return res.status(404).json({ error: 'No matching billing schedule row was found to mark processed.' })
+    }
+
+    const sanitized = sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule)
+    nextAnswers[scheduleFieldKey] = sanitized
+    persistPatches.push({ type: 'setAnswer', questionId: scheduleFieldKey, value: sanitized })
+    if (billingMode === 'investigation') {
+      nextAnswers.billing_schedule = sanitized
+      persistPatches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: sanitized })
     }
 
     room.state.answers = nextAnswers
@@ -15982,9 +15967,10 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
     void dbInsertBillingAudit({
       sessionCode: roomCode,
       eventType: 'payment_marked_processed',
-      billingMode: '',
+      billingMode,
       actorEmail,
       payload: {
+        billingMode,
         scheduledDate: normalizedDate,
         scheduledAmount,
         updatedCount,
@@ -16039,7 +16025,12 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
 
     const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
     const nextAnswers = room.state.answers || {}
-    const existingSchedule = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[scheduleFieldKey]))
+    const existingSchedule = (() => {
+      const scoped = normalizeBillingScheduleRows(parseScheduleValue(nextAnswers[scheduleFieldKey]))
+      if (scoped.length) return scoped
+      if (billingMode === 'investigation') return normalizeBillingScheduleRows(parseScheduleValue(nextAnswers.billing_schedule))
+      return []
+    })()
     const manualLabel = paymentMethod === 'cash' ? 'Cash payment' : `${paymentMethod} payment`
     const manualReason = manualNote ? `${manualLabel}: ${manualNote}` : manualLabel
 
@@ -16087,12 +16078,13 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
       })
     }
 
-    const sanitized = collapseOverflowEqualInstallmentRows(
-      sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule),
-      getBillingInvoiceAmountFromAnswers(nextAnswers, billingMode),
-    )
+    const sanitized = sanitizeBillingScheduleRowsForPersistence(nextSchedule, existingSchedule)
     nextAnswers[scheduleFieldKey] = sanitized
     const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: sanitized }]
+    if (billingMode === 'investigation') {
+      nextAnswers.billing_schedule = sanitized
+      persistPatches.push({ type: 'setAnswer', questionId: 'billing_schedule', value: sanitized })
+    }
 
     room.state.answers = nextAnswers
     await persistRoomState(roomCode, room, persistPatches)
