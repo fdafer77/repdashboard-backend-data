@@ -4800,6 +4800,7 @@ function getSigned8821FirstPageDocumentRecord(answers = {}) {
 }
 
 const signed8821StoreInFlight = new Map()
+const signed8821ClientEmailInFlight = new Map()
 
 function hasFreshSigned8821StoredRecord(answers = {}) {
   return Boolean(
@@ -8200,61 +8201,75 @@ function buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }) 
 }
 
 async function sendSigned8821CopyEmail({ roomCode, room }) {
+  const normalizedRoomCode = String(roomCode || '').trim().toUpperCase()
   const answers = room?.state?.answers || {}
+  if (!normalizedRoomCode) return false
   if (!isForm8821FullySigned(answers)) return false
   if (String(answers.signed_8821_client_emailed_at || '').trim()) return false
   if (String(answers.signed_8821_client_email_sending_at || '').trim()) return false
-
-  const contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
-  const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
-  if (!contactId || !isValidEmailAddress(recipientEmail)) return false
-
-  const backendBase = getBackendBaseUrl()
-  if (!backendBase) return false
-
-  answers.signed_8821_client_email_sending_at = new Date().toISOString()
-  room.state.updatedAt = Date.now()
-  io.to(roomCode).emit('room_state', room.state)
-  try {
-    await dbUpsertSession({ code: roomCode, state: room.state })
-  } catch {
-    // ignore; room state still updates in-memory
+  if (signed8821ClientEmailInFlight.has(normalizedRoomCode)) {
+    return signed8821ClientEmailInFlight.get(normalizedRoomCode)
   }
 
-  const downloadLink = `${backendBase}/api/session/${encodeURIComponent(String(roomCode || '').trim())}/signed-8821?download=1`
-  const portalLink = buildClientPortalLoginLink(roomCode, room)
-  const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
-  try {
-    await sendGhlEmailMessage({
-      contactId,
-      emailTo: recipientEmail,
-      subject: 'Your Signed TaxRefresh Document Copy',
-      message: `Your Signed TaxRefresh Document Copy is ready: ${downloadLink}`,
-      html: buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }),
-    })
+  const task = (async () => {
+    const contactId = String(room?.contactId || answers.ghl_contact_id || '').trim()
+    const recipientEmail = String(getPrimaryAnswer(answers, ['email', 'email_address']) || '').trim()
+    if (!contactId || !isValidEmailAddress(recipientEmail)) return false
 
-    answers.signed_8821_client_emailed_at = new Date().toISOString()
-    answers.signed_8821_client_emailed_to = recipientEmail
-    answers.signed_8821_client_email_sending_at = ''
+    const backendBase = getBackendBaseUrl()
+    if (!backendBase) return false
+
+    answers.signed_8821_client_email_sending_at = new Date().toISOString()
     room.state.updatedAt = Date.now()
-    io.to(roomCode).emit('room_state', room.state)
+    io.to(normalizedRoomCode).emit('room_state', room.state)
     try {
-      await dbUpsertSession({ code: roomCode, state: room.state })
+      await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
     } catch {
       // ignore; room state still updates in-memory
     }
-  } catch (error) {
-    answers.signed_8821_client_email_sending_at = ''
-    room.state.updatedAt = Date.now()
-    io.to(roomCode).emit('room_state', room.state)
+
+    const downloadLink = `${backendBase}/api/session/${encodeURIComponent(normalizedRoomCode)}/signed-8821?download=1`
+    const portalLink = buildClientPortalLoginLink(normalizedRoomCode, room)
+    const clientName = String(getPrimaryAnswer(answers, ['full_name', 'name']) || 'TaxRefresh Client').trim()
     try {
-      await dbUpsertSession({ code: roomCode, state: room.state })
-    } catch {
-      // ignore; room state still updates in-memory
+      await sendGhlEmailMessage({
+        contactId,
+        emailTo: recipientEmail,
+        subject: 'Your Signed TaxRefresh Document Copy',
+        message: `Your Signed TaxRefresh Document Copy is ready: ${downloadLink}`,
+        html: buildSigned8821CopyEmailHtml({ clientName, downloadLink, portalLink }),
+      })
+
+      answers.signed_8821_client_emailed_at = new Date().toISOString()
+      answers.signed_8821_client_emailed_to = recipientEmail
+      answers.signed_8821_client_email_sending_at = ''
+      room.state.updatedAt = Date.now()
+      io.to(normalizedRoomCode).emit('room_state', room.state)
+      try {
+        await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
+      } catch {
+        // ignore; room state still updates in-memory
+      }
+    } catch (error) {
+      answers.signed_8821_client_email_sending_at = ''
+      room.state.updatedAt = Date.now()
+      io.to(normalizedRoomCode).emit('room_state', room.state)
+      try {
+        await dbUpsertSession({ code: normalizedRoomCode, state: room.state })
+      } catch {
+        // ignore; room state still updates in-memory
+      }
+      throw error
     }
-    throw error
+    return true
+  })()
+
+  signed8821ClientEmailInFlight.set(normalizedRoomCode, task)
+  try {
+    return await task
+  } finally {
+    signed8821ClientEmailInFlight.delete(normalizedRoomCode)
   }
-  return true
 }
 
 async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '', target = 'client' }) {
@@ -8345,9 +8360,6 @@ async function markBoldsign8821Completed({ roomCode, completedDocumentCode = '',
       .catch((error) => {
         console.error('Signed 8821 storage failed:', error)
       })
-    void sendSigned8821CopyEmail({ roomCode, room }).catch((error) => {
-      console.error('Signed 8821 client email failed:', error)
-    })
   }
   logMemoryDiagnostics('markBoldsign8821Completed:after-persist', {
     roomCode,
