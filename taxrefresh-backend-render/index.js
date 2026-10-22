@@ -2727,55 +2727,11 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
   }
   const normalizedSessionCode = String(sessionCode || '').trim()
   if (!normalizedSessionCode) return false
-  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
-  const mergedAnswers = { ...sourceAnswers }
-  try {
-    const existingBillingRowsRes = await pool.query(
-      `select billing_scope, payload
-         from ti_billing_schedule_rows
-        where session_code = $1
-        order by billing_scope asc, scheduled_date asc nulls last, updated_at desc, id asc`,
-      [normalizedSessionCode],
-    )
-    const existingBillingRows = (existingBillingRowsRes.rows || []).map((row) => ({
-      scope: String(row?.billing_scope || 'all').trim() || 'all',
-      payload: row?.payload && typeof row.payload === 'object' ? { ...row.payload } : {},
-    }))
-    const finalizedBillingRows = existingBillingRows.filter((row) => {
-      const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {}
-      const statusTone = getBillingStatusTone(payload)
-      if (statusTone === 'pending') return false
-
-      const processedManually = Boolean(payload?.processedManually || payload?.processed_manually)
-
-      if (statusTone === 'processed' && processedManually) {
-        return false
-      }
-
-      return true
-    })
-    if (finalizedBillingRows.length) {
-      const mergedDurableAnswers = mergeConsultationDurableProjectionIntoAnswers(mergedAnswers, {
-        billingRows: finalizedBillingRows,
-      })
-      Object.assign(mergedAnswers, mergedDurableAnswers)
-    }
-  } catch (error) {
-    recordDbFailure('ti_billing_schedule_rows prefetch failed:', error, { sessionCode: normalizedSessionCode })
-    if (STRICT_DB_MODE) {
-      if (isTransientDbConnectionError(error)) {
-        const wrapped = new Error('Database is temporarily unavailable.')
-        wrapped.isTransientDb = true
-        throw wrapped
-      }
-      throw error
-    }
-  }
   const rows = buildConsultationBillingProjectionRows({
     sessionCode: normalizedSessionCode,
     contactId,
     opportunityId,
-    answers: mergedAnswers,
+    answers,
   })
   const client = await pool.connect()
   try {
