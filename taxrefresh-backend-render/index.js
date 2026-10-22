@@ -6303,44 +6303,15 @@ function getBillingInvoiceAmountFromAnswers(answers = {}, mode = 'investigation'
   return 0
 }
 
-function removeCrossScopeBillingDuplicates(primaryRows = [], otherRows = []) {
-  const normalizedPrimary = normalizeBillingScheduleRows(Array.isArray(primaryRows) ? primaryRows : [])
-  const normalizedOther = normalizeBillingScheduleRows(Array.isArray(otherRows) ? otherRows : [])
-  if (!normalizedPrimary.length || !normalizedOther.length) return normalizedPrimary
-
-  const buildKey = (row = {}) => {
-    const normalizedDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
-    const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
-    const tone = getBillingStatusTone(row)
-    if (!normalizedDate && normalizedAmount === '0.00') return ''
-    return `${normalizedDate}|${normalizedAmount}|${tone}`
-  }
-
-  const otherKeys = new Set(normalizedOther.map((row) => buildKey(row)).filter(Boolean))
-  if (!otherKeys.size) return normalizedPrimary
-
-  const filtered = normalizedPrimary.filter((row) => !otherKeys.has(buildKey(row)))
-  return filtered.length ? filtered : normalizedPrimary
-}
-
 function getScopedBillingScheduleRowsFromAnswers(answers = {}, mode = 'investigation') {
   const scheduleFieldKey = mode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
   const scopedSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.[scheduleFieldKey], []))
-  if (scopedSchedule.length) {
-    if (mode === 'resolution') {
-      const investigationSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.investigation_billing_schedule, []))
-      return removeCrossScopeBillingDuplicates(scopedSchedule, investigationSchedule)
-    }
-    return scopedSchedule
-  }
+  if (scopedSchedule.length) return scopedSchedule
 
   const resolutionSignals = hasResolutionBillingSignalsFromAnswers(answers)
   const genericSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.billing_schedule, []))
   if (mode === 'resolution') {
-    if (genericSchedule.length && resolutionSignals) {
-      const investigationSchedule = normalizeBillingScheduleRows(parseStoredObject(answers?.investigation_billing_schedule, []))
-      return removeCrossScopeBillingDuplicates(genericSchedule, investigationSchedule)
-    }
+    if (genericSchedule.length && resolutionSignals) return genericSchedule
     return []
   }
   if (genericSchedule.length && !resolutionSignals) return genericSchedule
