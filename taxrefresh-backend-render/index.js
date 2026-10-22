@@ -6455,8 +6455,14 @@ function getBillingRowMatchKey(row = {}) {
 }
 
 function getBillingRowPersistenceKey(row = {}) {
-  const matchKey = getBillingRowMatchKey(row)
-  return matchKey ? `installment|${matchKey}` : ''
+  const tone = getBillingStatusTone(row)
+  // Persisted rows sometimes lack an explicit `date` but have `processedAt` (or `processed_at`).
+  // Use the processed timestamp as a stable fallback so schedule edits don't orphan processed rows
+  // and wipe Stripe evidence on save.
+  const normalizedDate = normalizeBillingDateValue(row?.date || getBillingProcessedAtValue(row) || '')
+  const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
+  if (!normalizedDate && normalizedAmount === '0.00') return ''
+  return `${tone}|${normalizedDate}|${normalizedAmount}`
 }
 
 function sanitizeBillingScheduleRowsForPersistence(nextRows = [], existingRows = []) {
@@ -16725,9 +16731,6 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     const roomCode = String(req.params.code || '').trim()
     const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
     const scheduleIndex = Number(req.body?.scheduleIndex)
-    const rowKey = String(req.body?.rowKey || '').trim()
-    const scheduledDate = String(req.body?.scheduledDate || '').trim()
-    const scheduledAmount = Number(req.body?.scheduledAmount)
     if (roomCode && Number.isInteger(scheduleIndex) && scheduleIndex >= 0) {
       try {
         const room = await ensureRoom(roomCode)
@@ -16750,47 +16753,16 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
           if (billingMode === 'investigation') return parseScheduleValue(room.state.answers.billing_schedule).map((row) => ({ ...(row || {}) }))
           return []
         })()
-        let targetScheduleIndex = scheduleIndex
-        const buildRunPaymentRowKey = (row = {}, index = -1) => {
-          const normalizedDate = normalizeBillingDateValue(row?.date || '')
-          const normalizedAmount = Number(toNumberValue(row?.amount || 0)).toFixed(2)
-          if (!normalizedDate && normalizedAmount === '0.00') return ''
-          return `${normalizedDate}|${normalizedAmount}|${index}`
-        }
-        if (rowKey) {
-          const matchedIndex = rows.findIndex((row, index) => buildRunPaymentRowKey(row, index) === rowKey)
-          if (matchedIndex >= 0) targetScheduleIndex = matchedIndex
-        }
-        if (
-          (!rows[targetScheduleIndex] ||
-            (scheduledDate && String(rows[targetScheduleIndex]?.date || '').trim() !== scheduledDate) ||
-            (Number.isFinite(scheduledAmount) && Number(rows[targetScheduleIndex]?.amount || 0) !== scheduledAmount)) &&
-          (scheduledDate || Number.isFinite(scheduledAmount))
-        ) {
-          const matchedIndex = rows.findIndex((row) => {
-            const rowDate = String(row?.date || '').trim()
-            const rowAmount = Number(row?.amount || 0)
-            const dateMatches = scheduledDate ? rowDate === scheduledDate : true
-            const amountMatches = Number.isFinite(scheduledAmount) ? rowAmount === scheduledAmount : true
-            return dateMatches && amountMatches
-          })
-          if (matchedIndex >= 0) targetScheduleIndex = matchedIndex
-        }
-        if (rows[targetScheduleIndex]) {
+        if (rows[scheduleIndex]) {
           const reason = getStripePaymentFailureReason(error)
-          rows[targetScheduleIndex] = {
-            ...rows[targetScheduleIndex],
+          rows[scheduleIndex] = {
+            ...rows[scheduleIndex],
             status: 'Failed',
             failureReason: reason,
             processorReason: reason,
             reason,
             processedPaymentMethodLast4: '',
             processedPaymentMethodBrand: '',
-            processedAt: '',
-            stripePaymentIntentId: '',
-            processedStripePaymentMethodId: '',
-            processedStripeCustomerId: '',
-            processedPaymentMethodType: '',
           }
           room.state.answers[scheduleFieldKey] = rows
           const persistPatches = [{ type: 'setAnswer', questionId: scheduleFieldKey, value: rows }]
