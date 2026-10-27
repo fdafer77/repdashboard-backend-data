@@ -4178,6 +4178,10 @@ function isAllowedCorsOrigin(origin = '') {
     return (
       url.hostname === 'localhost' ||
       url.hostname === '127.0.0.1' ||
+      url.hostname === 'tax-refresh.com' ||
+      url.hostname.endsWith('.tax-refresh.com') ||
+      url.hostname === 'pages.dev' ||
+      url.hostname.endsWith('.pages.dev') ||
       /^192\.168\./.test(url.hostname) ||
       /^10\./.test(url.hostname) ||
       /^172\.(1[6-9]|2\d|3[0-1])\./.test(url.hostname)
@@ -17932,7 +17936,10 @@ app.post('/api/boldsign/8821/complete', async (req, res) => {
 const server = http.createServer(app)
 const io = new SocketIOServer(server, {
   cors: {
-    origin: CLIENT_ORIGIN === '*' ? true : CLIENT_ORIGIN.split(','),
+    origin(origin, callback) {
+      if (isAllowedCorsOrigin(origin || '')) return callback(null, true)
+      return callback(new Error(`Socket CORS blocked for origin: ${origin || 'unknown'}`))
+    },
     credentials: true,
   },
 })
