@@ -11,8 +11,22 @@ This package contains the Node backend needed by:
 - Express API server
 - Socket.IO server
 - Postgres schema bootstrap
+- Recovery archive job
 - Form 8821 PDF asset
 - `render.yaml` blueprint for Render
+
+## Backup model
+
+This backend now uses three durability layers:
+
+1. Primary Postgres (`DATABASE_URL`) for live application state.
+2. Append-only internal backup and audit tables in the primary database:
+   - `ti_session_backups`
+   - `ti_billing_audit`
+   - `ti_events`
+3. A separate recovery Postgres that receives compressed full-table archives on a schedule.
+
+The goal is that the app keeps running off the primary database, while recovery archives live in a second database that is not part of the normal request path.
 
 ## Before deploying
 
@@ -76,20 +90,26 @@ Canopy OAuth, when you want the backend to hold a saved bearer token from Canopy
 4. Render will create:
    - a web service named `taxrefresh-backend`
    - a Postgres database named `taxrefresh-postgres`
+   - a Postgres database named `taxrefresh-postgres-recovery`
+   - a cron job named `taxrefresh-backup-archive`
 5. After the resources are created, open the web service settings.
 6. Add the secret environment variables listed above.
-7. Redeploy the web service.
+7. Redeploy the web service and the cron job.
 
 ## Important environment values already included
 
 These are already set in `render.yaml`:
 
 - `DATABASE_URL` from the Render Postgres instance
+- `RECOVERY_DATABASE_URL` from the recovery Render Postgres instance
 - `DB_SSL=1`
 - `CLIENT_ORIGIN=https://taxrefreshdashboard.com,https://taxrefresh-auth.com,https://secure.taxrefresh.us`
 - `PUBLIC_BASE_URL=https://secure.taxrefresh.us`
 - `EXPERIENCE_BASE_URL=https://secure.taxrefresh.us`
 - `BOLDSIGN_8821_PDF_PATH=./assets/f8821.pdf`
+- `BACKUP_ARCHIVE_HISTORY_DAYS=45`
+- `BACKUP_ARCHIVE_RETENTION_DAYS=30`
+- `BACKUP_ARCHIVE_REASON=scheduled_archive`
 
 Canopy sync defaults are also included in `render.yaml`, but they start in a safe disabled state:
 
@@ -209,3 +229,50 @@ Set both to the new Render backend URL.
 Render can use:
 
 - `/health`
+
+## Manual backup commands
+
+Run a new recovery archive immediately:
+
+```bash
+npm run backup:archive
+```
+
+Download the latest recovery archive locally:
+
+```bash
+npm run backup:download
+```
+
+Download a specific archive:
+
+```bash
+BACKUP_ARCHIVE_KEY=backup-2026-10-30T17-00-00-000Z-abcd1234 npm run backup:download
+```
+
+Optional environment values for local backup work:
+
+- `RECOVERY_DATABASE_URL`
+- `BACKUP_ARCHIVE_HISTORY_DAYS`
+- `BACKUP_ARCHIVE_RETENTION_DAYS`
+- `BACKUP_ARCHIVE_WRITE_LOCAL_COPY=1`
+- `BACKUP_ARCHIVE_LOCAL_DIR=.data/backups`
+- `BACKUP_ARCHIVE_OUTPUT_PATH=.data/downloaded-backups/latest-backup.json.gz`
+
+## What the archive job stores
+
+Each scheduled archive stores:
+
+- full current-state tables like `ti_sessions`, `ti_billing_schedule_rows`, profile tables, notes, receipts, and financial profiles
+- recent append-only history from `ti_session_backups`, `ti_billing_audit`, and `ti_events`
+- a manifest with row counts, checksums, and gzip size
+
+Archives are written to the recovery database in `ti_backup_archives`, and each cron execution is tracked in `ti_backup_runs`.
+
+## Recovery workflow
+
+Use these layers in order:
+
+1. For missing field recovery inside a live session, the app can already use `ti_session_backups`.
+2. For billing-specific reconciliation between prod and recovery databases, use `merge_billing_from_recovery.mjs`.
+3. For broader disaster recovery, download the latest archive from `ti_backup_archives` and restore the needed tables into a standby environment before promoting anything back to production.

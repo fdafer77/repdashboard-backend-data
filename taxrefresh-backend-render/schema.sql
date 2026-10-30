@@ -224,3 +224,28 @@ create index if not exists ti_consultation_financial_profiles_contact_id_idx on 
 create index if not exists ti_consultation_financial_profiles_opportunity_id_idx on ti_consultation_financial_profiles(ghl_opportunity_id);
 create index if not exists ti_consultation_financial_profiles_complete_idx on ti_consultation_financial_profiles(profile_complete, updated_at desc);
 create index if not exists ti_consultation_financial_profiles_updated_at_idx on ti_consultation_financial_profiles(updated_at desc);
+
+create table if not exists ti_backup_archives (
+  id bigserial primary key,
+  archive_key text not null unique,
+  source_database text not null default '',
+  source_host text not null default '',
+  backup_reason text not null default 'scheduled_archive',
+  schema_version text not null default 'v1',
+  manifest jsonb not null default '{}'::jsonb,
+  payload_gzip bytea not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists ti_backup_archives_created_at_idx on ti_backup_archives(created_at desc);
+
+create table if not exists ti_backup_runs (
+  id bigserial primary key,
+  archive_key text,
+  status text not null default 'started',
+  details jsonb not null default '{}'::jsonb,
+  started_at timestamptz not null default now(),
+  completed_at timestamptz
+);
+
+create index if not exists ti_backup_runs_started_at_idx on ti_backup_runs(started_at desc);

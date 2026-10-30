@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "backup:archive": "node backup_archive_to_recovery.mjs",
+    "backup:download": "node download_backup_archive.mjs"
   },
   "keywords": [],
   "author": "",
