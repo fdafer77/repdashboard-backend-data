@@ -4011,6 +4011,61 @@ function buildFallbackRow(entry) {
   }
 }
 
+function getSessionAnswerObject(stateOrAnswers = null) {
+  if (stateOrAnswers && typeof stateOrAnswers === 'object' && stateOrAnswers.answers && typeof stateOrAnswers.answers === 'object') {
+    return stateOrAnswers.answers
+  }
+  return stateOrAnswers && typeof stateOrAnswers === 'object' ? stateOrAnswers : {}
+}
+
+function getSessionCriticalAnswerCoverageScore(stateOrAnswers = null) {
+  const answers = getSessionAnswerObject(stateOrAnswers)
+  return CRITICAL_SESSION_ANSWER_KEYS.reduce((total, key) => {
+    return total + (hasMeaningfulSessionValue(answers?.[key]) ? 1 : 0)
+  }, 0)
+}
+
+function getSessionPortalBillingCoverageScore(stateOrAnswers = null) {
+  const answers = getSessionAnswerObject(stateOrAnswers)
+  const billingRows = getBillingScheduleRowsFromAnswers(answers)
+  const billingMethods = parseStoredPaymentMethods(answers?.billing_payment_methods)
+  const portalMethods = parseStoredPaymentMethods(answers?.client_portal_payment_methods)
+  const portalPendingPayments = parseStoredObject(answers?.client_portal_pending_payments, [])
+  return (
+    billingRows.length * 5 +
+    billingMethods.length * 3 +
+    portalMethods.length * 2 +
+    (Array.isArray(portalPendingPayments) ? portalPendingPayments.length : 0)
+  )
+}
+
+function enrichSessionRowWithFallback(primaryRow, fallbackRow) {
+  if (!primaryRow) return fallbackRow || null
+  if (!fallbackRow?.state) return primaryRow
+
+  const primaryScore =
+    getSessionCriticalAnswerCoverageScore(primaryRow?.state) + getSessionPortalBillingCoverageScore(primaryRow?.state)
+  const fallbackScore =
+    getSessionCriticalAnswerCoverageScore(fallbackRow?.state) + getSessionPortalBillingCoverageScore(fallbackRow?.state)
+
+  if (fallbackScore <= primaryScore) return primaryRow
+
+  const primaryCode = String(primaryRow?.session_code || '')
+  const fallbackCode = String(fallbackRow?.session_code || '')
+  return {
+    ...primaryRow,
+    session_code: primaryCode || fallbackCode,
+    ghl_contact_id: primaryRow?.ghl_contact_id || fallbackRow?.ghl_contact_id || null,
+    ghl_opportunity_id: primaryRow?.ghl_opportunity_id || fallbackRow?.ghl_opportunity_id || null,
+    state: mergeSessionStateForPersistence(fallbackRow.state, primaryRow.state, {
+      code: primaryCode || fallbackCode,
+      source: 'database_fallback_enrichment',
+    }),
+    created_at: primaryRow?.created_at || fallbackRow?.created_at || new Date().toISOString(),
+    updated_at: primaryRow?.updated_at || fallbackRow?.updated_at || new Date().toISOString(),
+  }
+}
+
 const MIRRORED_ANSWER_KEY_GROUPS = [
   ['full_name', 'name', 'client_name', 'clientName'],
   ['first_name', 'firstName'],
@@ -10835,6 +10890,10 @@ function buildConsultationSummary(record) {
     eaCaseState: record?.consultationEaCaseState || null,
   })
   normalizePersistedSigned8821State(answers)
+  const financialProfileProjection =
+    record?.consultationFinancialProfile && typeof record.consultationFinancialProfile === 'object'
+      ? record.consultationFinancialProfile
+      : normalizeConsultationFinancialProfileProjection(answers)
   const rawIrsBalance = toNumberValue(
     getPrimaryAnswer(answers, ['irsBalance', 'irs_balance', 'federalBalance', 'federal_balance', 'irs_balance_amount']),
   )
@@ -11015,6 +11074,9 @@ function buildConsultationSummary(record) {
     resolutionDocumentsSigned,
     resolutionSignedAt,
     eaTranscriptsReadyForClient,
+    financialProfileComplete: Boolean(financialProfileProjection?.profileComplete),
+    financialProfileCompletionPercent: Number(financialProfileProjection?.completionPercent || 0) || 0,
+    financialProfileLastSavedAt: String(financialProfileProjection?.lastSavedAt || '').trim(),
     redDocumentViewedAt,
     resolutionDocumentsViewedAt,
     consultationNotesCount: activeConsultationNotes.length,
@@ -12641,6 +12703,10 @@ const CRITICAL_SESSION_ANSWER_KEYS = [
   'investigation_billing_invoice_created_at',
   'resolution_billing_invoice_amount',
   'resolution_billing_invoice_created_at',
+  'billing_payment_method',
+  'billing_payment_methods',
+  'client_portal_payment_methods',
+  'client_portal_pending_payments',
   'document_receipts',
   'document_delivery_log',
   'document_email_log',
@@ -13044,15 +13110,15 @@ async function dbGetSession(code) {
       ])
       const row = res.rows[0]
       if (row) {
+        const fallback = await fallbackGetSession(code).catch(() => null)
         // During short DB outages we may have persisted to the file store; when DB returns,
         // prefer the most recently updated copy to avoid the UI "going backwards".
         if (dbLastFailureAt && Date.now() - dbLastFailureAt < DB_RECOVERY_MERGE_WINDOW_MS) {
-          const fallback = await fallbackGetSession(code).catch(() => null)
           const fallbackUpdatedAt = fallback?.updated_at ? new Date(fallback.updated_at).getTime() : 0
           const dbUpdatedAt = row?.updated_at ? new Date(row.updated_at).getTime() : 0
           if (fallback && fallbackUpdatedAt > dbUpdatedAt) return fallback
         }
-        return row
+        return enrichSessionRowWithFallback(row, fallback)
       }
     }
     return null
@@ -18695,9 +18761,12 @@ io.on('connection', (socket) => {
     socket.to(roomCode).emit('rep_text', { text: safeText, at: Date.now() })
   })
 
-  socket.on('patch', async ({ code, patch }) => {
+  socket.on('patch', async ({ code, patch }, ack) => {
     const roomCode = String(code || '').toUpperCase().trim()
-    if (!roomCode) return
+    if (!roomCode) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Missing room code' })
+      return
+    }
     const room = await ensureRoom(roomCode)
     let experienceReceiptUpdate = null
 
@@ -18753,6 +18822,9 @@ io.on('connection', (socket) => {
       void syncSessionToGhl({ roomCode, room, reason: patch.type === 'setRoute' ? 'route_changed' : `answer_${patch.questionId}` }).catch((error) => {
         console.error('GHL patch sync failed:', error)
       })
+    }
+    if (typeof ack === 'function') {
+      ack({ ok: true, updatedAt: room.state.updatedAt || Date.now() })
     }
   })
 
