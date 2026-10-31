@@ -162,6 +162,32 @@ create index if not exists ti_consultation_case_facts_contact_id_idx on ti_consu
 create index if not exists ti_consultation_case_facts_opportunity_id_idx on ti_consultation_case_facts(ghl_opportunity_id);
 create index if not exists ti_consultation_case_facts_updated_at_idx on ti_consultation_case_facts(updated_at desc);
 
+create table if not exists ti_billing_accounts (
+  session_code text primary key,
+  ghl_contact_id text,
+  ghl_opportunity_id text,
+  stripe_customer_id text not null default '',
+  billing_invoice_amount numeric(12, 2),
+  billing_invoice_created_at text not null default '',
+  investigation_billing_invoice_amount numeric(12, 2),
+  investigation_billing_invoice_created_at text not null default '',
+  resolution_billing_invoice_amount numeric(12, 2),
+  resolution_billing_invoice_created_at text not null default '',
+  billing_payment_method jsonb,
+  billing_payment_methods jsonb not null default '[]'::jsonb,
+  client_portal_payment_method jsonb,
+  client_portal_payment_methods jsonb not null default '[]'::jsonb,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  actor_email text
+);
+
+create index if not exists ti_billing_accounts_contact_id_idx on ti_billing_accounts(ghl_contact_id);
+create index if not exists ti_billing_accounts_opportunity_id_idx on ti_billing_accounts(ghl_opportunity_id);
+create index if not exists ti_billing_accounts_stripe_customer_id_idx on ti_billing_accounts(stripe_customer_id);
+create index if not exists ti_billing_accounts_updated_at_idx on ti_billing_accounts(updated_at desc);
+
 create table if not exists ti_billing_schedule_rows (
   id bigserial primary key,
   session_code text not null,

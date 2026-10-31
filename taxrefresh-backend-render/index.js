@@ -9,7 +9,7 @@ import { customAlphabet } from 'nanoid'
 import { Configuration, PlaidApi, PlaidEnvironments } from 'plaid'
 import jwt from 'jsonwebtoken'
 import Stripe from 'stripe'
-import { ensureSchema, getPool } from './db.js'
+import { ensureBillingSchema, ensureSchema, getBillingPool, getPool } from './db.js'
 import crypto from 'node:crypto'
 import { PDFArray, PDFDict, PDFDocument, PDFName, StandardFonts, rgb } from 'pdf-lib'
 
@@ -171,11 +171,17 @@ const DEFAULT_GHL_OPPORTUNITY_FIELDS = [
 ]
 
 const pool = getPool()
+const dedicatedBillingPool = getBillingPool()
+const billingPool = dedicatedBillingPool || pool
+const BILLING_DB_IS_SEPARATE = Boolean(dedicatedBillingPool && dedicatedBillingPool !== pool)
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null
 if (pool) {
   // eslint-disable-next-line no-console
   ensureSchema(pool)
     .then(async () => {
+      if (BILLING_DB_IS_SEPARATE && billingPool) {
+        await ensureBillingSchema(billingPool)
+      }
       await seedConsultationDurableProjectionBackfill().catch((error) => console.error('Durable projection backfill failed:', error))
       if (CANOPY_SYNC_STARTUP_BACKFILL_ENABLED) {
         await enqueueCanopySyncBackfill({ reason: 'startup_backfill' }).catch((error) => console.error('Canopy startup backfill failed:', error))
@@ -205,6 +211,28 @@ let dbLastFailureAt = 0
 let dbLastFailureMessage = ''
 let dbLastFailureLoggedAt = 0
 let dbLastProbeAt = 0
+
+const SEPARATE_BILLING_ANSWER_KEYS = new Set([
+  'stripe_customer_id',
+  'billing_schedule',
+  'investigation_billing_schedule',
+  'resolution_billing_schedule',
+  'billing_invoice_amount',
+  'billing_invoice_created_at',
+  'investigation_billing_invoice_amount',
+  'investigation_billing_invoice_created_at',
+  'resolution_billing_invoice_amount',
+  'resolution_billing_invoice_created_at',
+  'billing_payment_method',
+  'billing_payment_methods',
+  'client_portal_payment_method',
+  'client_portal_payment_methods',
+  'client_portal_pending_payments',
+  '_auto_stripe_billing_restore_attempted_at',
+  '_auto_stripe_billing_restore_at',
+  '_auto_stripe_payment_method_sync_attempted_at',
+  '_auto_stripe_payment_method_sync_at',
+])
 
 function isDbCircuitOpen() {
   return Boolean(pool && Date.now() < dbCircuitOpenUntil)
@@ -2135,6 +2163,7 @@ async function dbGetCanopySyncSnapshot(sessionCode = '') {
       consultationProfile: durableProjection?.profile || null,
       consultationCaseFacts: durableProjection?.caseFacts || null,
       consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingAccount: durableProjection?.billingAccount || null,
       consultationBillingRows: durableProjection?.billingRows || [],
       consultationDocumentReceipts: durableProjection?.documentReceipts || [],
       consultationNotes: durableProjection?.notes || [],
@@ -2717,8 +2746,10 @@ function buildConsultationBillingProjectionRows({ sessionCode, contactId = '', o
 }
 
 async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
-  if (!pool || isDbCircuitOpen()) {
-    if (STRICT_DB_MODE) {
+  const projectionPool = getBillingProjectionPool()
+  const usingPrimaryPool = projectionPool === pool
+  if (!projectionPool || (usingPrimaryPool && isDbCircuitOpen())) {
+    if (STRICT_DB_MODE && usingPrimaryPool) {
       const error = new Error('Database is temporarily unavailable.')
       error.isTransientDb = true
       throw error
@@ -2733,7 +2764,7 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
     opportunityId,
     answers,
   })
-  const client = await pool.connect()
+  const client = await projectionPool.connect()
   try {
     await client.query('begin')
     await client.query('delete from ti_billing_schedule_rows where session_code = $1', [normalizedSessionCode])
@@ -2782,7 +2813,7 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
   } catch (error) {
     await client.query('rollback').catch(() => {})
     recordDbFailure('ti_billing_schedule_rows sync failed:', error, { sessionCode: normalizedSessionCode, rowCount: rows.length })
-    if (STRICT_DB_MODE) {
+    if (STRICT_DB_MODE && usingPrimaryPool) {
       if (isTransientDbConnectionError(error)) {
         const wrapped = new Error('Database is temporarily unavailable.')
         wrapped.isTransientDb = true
@@ -2798,6 +2829,13 @@ async function dbReplaceConsultationBillingScheduleProjection({ sessionCode, con
 }
 
 async function dbSyncConsultationRevenueProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  await dbUpsertConsultationBillingAccountProjection({
+    sessionCode,
+    contactId,
+    opportunityId,
+    answers,
+    actorEmail,
+  })
   await dbReplaceConsultationBillingScheduleProjection({
     sessionCode,
     contactId,
@@ -2811,8 +2849,9 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
   const normalizedCodes = Array.from(new Set((Array.isArray(sessionCodes) ? sessionCodes : []).map((value) => String(value || '').trim()).filter(Boolean)))
   const result = new Map()
   if (!pool || isDbCircuitOpen() || normalizedCodes.length === 0) return result
+  const billingReadPool = getBillingProjectionPool()
   try {
-    const [profileRes, caseFactsRes, financialProfileRes, billingRowsRes, documentReceiptsRes, notesRes, eaDocumentsRes, eaActivityRes, eaCaseStateRes] =
+    const [profileRes, caseFactsRes, financialProfileRes, billingAccountRes, billingRowsRes, documentReceiptsRes, notesRes, eaDocumentsRes, eaActivityRes, eaCaseStateRes] =
       await Promise.all([
       pool.query(
         `select session_code, payload
@@ -2846,13 +2885,36 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
           where session_code = any($1::text[])`,
         [normalizedCodes],
       ),
-      pool.query(
+      billingReadPool
+        ? billingReadPool.query(
+            `select
+                session_code,
+                stripe_customer_id,
+                billing_invoice_amount,
+                billing_invoice_created_at,
+                investigation_billing_invoice_amount,
+                investigation_billing_invoice_created_at,
+                resolution_billing_invoice_amount,
+                resolution_billing_invoice_created_at,
+                billing_payment_method,
+                billing_payment_methods,
+                client_portal_payment_method,
+                client_portal_payment_methods,
+                payload
+               from ti_billing_accounts
+              where session_code = any($1::text[])`,
+            [normalizedCodes],
+          )
+        : Promise.resolve({ rows: [] }),
+      billingReadPool
+        ? billingReadPool.query(
         `select session_code, billing_scope, payload
            from ti_billing_schedule_rows
           where session_code = any($1::text[])
           order by session_code asc, billing_scope asc, scheduled_date asc nulls last, updated_at desc, id asc`,
         [normalizedCodes],
-      ),
+      )
+        : Promise.resolve({ rows: [] }),
       pool.query(
         `select session_code, receipt_id, name, document_code, status, method, recipient_email, sent_at, signed_at, payload
            from ti_document_receipts
@@ -2939,6 +3001,40 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
           lastSavedAt: row?.last_saved_at ? new Date(row.last_saved_at).toISOString() : '',
           payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
           draftPayload: row?.draft_payload && typeof row.draft_payload === 'object' ? row.draft_payload : null,
+        },
+      })
+    }
+    for (const row of billingAccountRes.rows || []) {
+      const sessionCode = String(row?.session_code || '').trim()
+      if (!sessionCode) continue
+      const existing = result.get(sessionCode) || {}
+      result.set(sessionCode, {
+        ...existing,
+        billingAccount: {
+          stripeCustomerId: String(row?.stripe_customer_id || '').trim(),
+          billingInvoiceAmount: row?.billing_invoice_amount === null || row?.billing_invoice_amount === undefined ? null : Number(row.billing_invoice_amount),
+          billingInvoiceCreatedAt: String(row?.billing_invoice_created_at || '').trim(),
+          investigationBillingInvoiceAmount:
+            row?.investigation_billing_invoice_amount === null || row?.investigation_billing_invoice_amount === undefined
+              ? null
+              : Number(row.investigation_billing_invoice_amount),
+          investigationBillingInvoiceCreatedAt: String(row?.investigation_billing_invoice_created_at || '').trim(),
+          resolutionBillingInvoiceAmount:
+            row?.resolution_billing_invoice_amount === null || row?.resolution_billing_invoice_amount === undefined
+              ? null
+              : Number(row.resolution_billing_invoice_amount),
+          resolutionBillingInvoiceCreatedAt: String(row?.resolution_billing_invoice_created_at || '').trim(),
+          billingPaymentMethod:
+            row?.billing_payment_method && typeof row.billing_payment_method === 'object' ? row.billing_payment_method : null,
+          billingPaymentMethods:
+            Array.isArray(row?.billing_payment_methods) ? sanitizePaymentMethodList(row.billing_payment_methods) : [],
+          clientPortalPaymentMethod:
+            row?.client_portal_payment_method && typeof row.client_portal_payment_method === 'object'
+              ? row.client_portal_payment_method
+              : null,
+          clientPortalPaymentMethods:
+            Array.isArray(row?.client_portal_payment_methods) ? sanitizePaymentMethodList(row.client_portal_payment_methods) : [],
+          payload: row?.payload && typeof row.payload === 'object' ? row.payload : {},
         },
       })
     }
@@ -3062,9 +3158,35 @@ async function dbGetConsultationDurableProjectionMap(sessionCodes = []) {
 
 async function dbGetConsultationDurableProjection(sessionCode = '') {
   const normalizedSessionCode = String(sessionCode || '').trim()
-  if (!normalizedSessionCode) return { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [], notes: [], eaDocuments: [], eaActivityTimeline: [], eaCaseState: null }
+  if (!normalizedSessionCode) {
+    return {
+      profile: null,
+      caseFacts: null,
+      financialProfile: null,
+      billingAccount: null,
+      billingRows: [],
+      documentReceipts: [],
+      notes: [],
+      eaDocuments: [],
+      eaActivityTimeline: [],
+      eaCaseState: null,
+    }
+  }
   const projectionMap = await dbGetConsultationDurableProjectionMap([normalizedSessionCode])
-  return projectionMap.get(normalizedSessionCode) || { profile: null, caseFacts: null, financialProfile: null, documentReceipts: [], notes: [], eaDocuments: [], eaActivityTimeline: [], eaCaseState: null }
+  return (
+    projectionMap.get(normalizedSessionCode) || {
+      profile: null,
+      caseFacts: null,
+      financialProfile: null,
+      billingAccount: null,
+      billingRows: [],
+      documentReceipts: [],
+      notes: [],
+      eaDocuments: [],
+      eaActivityTimeline: [],
+      eaCaseState: null,
+    }
+  )
 }
 
 async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT) {
@@ -3090,6 +3212,12 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       const expectedEaDocuments = normalizeEaDocumentsValue(row?.state?.answers?.ea_documents)
       const expectedEaActivityTimeline = normalizeEaActivityTimelineValue(row?.state?.answers?.ea_activity_timeline)
       const expectedEaCaseState = normalizeEaCaseStateProjection(row?.state?.answers || {})
+      const expectedBillingAccount = buildBillingAccountProjection({
+        sessionCode,
+        contactId: row?.ghl_contact_id || '',
+        opportunityId: row?.ghl_opportunity_id || '',
+        answers: row?.state?.answers || {},
+      })
       const expectedBillingRows = buildConsultationBillingProjectionRows({
         sessionCode,
         contactId: row?.ghl_contact_id || '',
@@ -3098,6 +3226,7 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       })
       const expectedFinancialProfile = normalizeConsultationFinancialProfileProjection(row?.state?.answers || {})
       const expectedDocumentReceipts = normalizeDocumentReceiptsValue(row?.state?.answers?.document_receipts)
+      const hasDurableBillingAccount = hasBillingAccountProjectionData(existingProjection.billingAccount)
       const hasDurableBillingProjection = Array.isArray(existingProjection.billingRows) && existingProjection.billingRows.length > 0
       const hasDurableFinancialProjection = hasConsultationFinancialProfileProjectionData(existingProjection.financialProfile)
       const hasDurableDocumentReceipts = Array.isArray(existingProjection.documentReceipts) && existingProjection.documentReceipts.length > 0
@@ -3106,6 +3235,7 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       const hasDurableEaActivityTimeline = Array.isArray(existingProjection.eaActivityTimeline) && existingProjection.eaActivityTimeline.length > 0
       const hasDurableEaCaseState = hasEaCaseStateProjectionData(existingProjection.eaCaseState)
       const expectsDocumentReceipts = expectedDocumentReceipts.length > 0
+      const expectsBillingAccount = hasBillingAccountProjectionData(expectedBillingAccount)
       const expectsFinancialProjection = hasConsultationFinancialProfileProjectionData(expectedFinancialProfile)
       const expectsNotes = expectedNotes.length > 0
       const expectsEaDocuments = expectedEaDocuments.length > 0
@@ -3114,6 +3244,7 @@ async function seedConsultationDurableProjectionBackfill(limit = CONSULTATION_DU
       if (
         existingProjection.profile &&
         existingProjection.caseFacts &&
+        (hasDurableBillingAccount || !expectsBillingAccount) &&
         (hasDurableBillingProjection || expectedBillingRows.length === 0) &&
         (hasDurableFinancialProjection || !expectsFinancialProjection) &&
         (hasDurableDocumentReceipts || !expectsDocumentReceipts) &&
@@ -3172,6 +3303,7 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
   const profile = durableProjection?.profile && typeof durableProjection.profile === 'object' ? durableProjection.profile : null
   const caseFacts = durableProjection?.caseFacts && typeof durableProjection.caseFacts === 'object' ? durableProjection.caseFacts : null
   const financialProfile = durableProjection?.financialProfile && typeof durableProjection.financialProfile === 'object' ? durableProjection.financialProfile : null
+  const billingAccount = durableProjection?.billingAccount && typeof durableProjection.billingAccount === 'object' ? durableProjection.billingAccount : null
   const billingRows = Array.isArray(durableProjection?.billingRows) ? durableProjection.billingRows : []
   const documentReceipts = normalizeDocumentReceiptsValue(durableProjection?.documentReceipts)
   const notes = normalizeConsultationNotesValue(durableProjection?.notes)
@@ -3236,6 +3368,35 @@ function mergeConsultationDurableProjectionIntoAnswers(answers = {}, durableProj
     nextAnswers.billing_schedule = mergedAllRows
     nextAnswers.investigation_billing_schedule = mergedInvestigationRows
     nextAnswers.resolution_billing_schedule = mergedResolutionRows
+  }
+
+  if (billingAccount) {
+    nextAnswers.stripe_customer_id = String(billingAccount?.stripeCustomerId || '').trim()
+    nextAnswers.billing_invoice_amount =
+      billingAccount?.billingInvoiceAmount === null || billingAccount?.billingInvoiceAmount === undefined
+        ? ''
+        : String(billingAccount.billingInvoiceAmount)
+    nextAnswers.billing_invoice_created_at = String(billingAccount?.billingInvoiceCreatedAt || '').trim()
+    nextAnswers.investigation_billing_invoice_amount =
+      billingAccount?.investigationBillingInvoiceAmount === null || billingAccount?.investigationBillingInvoiceAmount === undefined
+        ? ''
+        : String(billingAccount.investigationBillingInvoiceAmount)
+    nextAnswers.investigation_billing_invoice_created_at = String(billingAccount?.investigationBillingInvoiceCreatedAt || '').trim()
+    nextAnswers.resolution_billing_invoice_amount =
+      billingAccount?.resolutionBillingInvoiceAmount === null || billingAccount?.resolutionBillingInvoiceAmount === undefined
+        ? ''
+        : String(billingAccount.resolutionBillingInvoiceAmount)
+    nextAnswers.resolution_billing_invoice_created_at = String(billingAccount?.resolutionBillingInvoiceCreatedAt || '').trim()
+    nextAnswers.billing_payment_method =
+      billingAccount?.billingPaymentMethod && typeof billingAccount.billingPaymentMethod === 'object'
+        ? sanitizePaymentMethodRecord(billingAccount.billingPaymentMethod)
+        : null
+    nextAnswers.billing_payment_methods = sanitizePaymentMethodList(billingAccount?.billingPaymentMethods || [])
+    nextAnswers.client_portal_payment_method =
+      billingAccount?.clientPortalPaymentMethod && typeof billingAccount.clientPortalPaymentMethod === 'object'
+        ? sanitizePaymentMethodRecord(billingAccount.clientPortalPaymentMethod)
+        : null
+    nextAnswers.client_portal_payment_methods = sanitizePaymentMethodList(billingAccount?.clientPortalPaymentMethods || [])
   }
 
   if (profile) {
@@ -3544,12 +3705,13 @@ function sanitizeSensitiveBillingAnswers(answers = {}) {
 }
 
 async function dbInsertBillingAudit({ sessionCode, eventType, billingMode = '', actorEmail = '', payload = {} } = {}) {
-  if (!pool) return
+  const projectionPool = getBillingProjectionPool()
+  if (!projectionPool) return
   const normalizedCode = String(sessionCode || '').trim()
   const normalizedEvent = String(eventType || '').trim()
   if (!normalizedCode || !normalizedEvent) return
   try {
-    await pool.query(
+    await projectionPool.query(
       `insert into ti_billing_audit(session_code, event_type, billing_mode, actor_email, payload) values ($1, $2, $3, $4, $5)`,
       [normalizedCode, normalizedEvent, String(billingMode || '').trim() || null, String(actorEmail || '').trim() || null, payload || {}],
     )
@@ -3560,6 +3722,23 @@ async function dbInsertBillingAudit({ sessionCode, eventType, billingMode = '', 
       message: error instanceof Error ? error.message : String(error || ''),
     })
   }
+}
+
+function getSessionBackupRestoreAnswerKeys() {
+  if (!BILLING_DB_IS_SEPARATE) return SESSION_BACKUP_RESTORE_ANSWER_KEYS
+  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.filter((key) => !SEPARATE_BILLING_ANSWER_KEYS.has(key))
+}
+
+function stripBillingAnswersForPrimarySessionState(state = null) {
+  if (!BILLING_DB_IS_SEPARATE || !state || typeof state !== 'object') return state
+  const nextState = { ...state }
+  const sourceAnswers = state?.answers && typeof state.answers === 'object' ? state.answers : {}
+  const nextAnswers = { ...sourceAnswers }
+  SEPARATE_BILLING_ANSWER_KEYS.forEach((key) => {
+    delete nextAnswers[key]
+  })
+  nextState.answers = nextAnswers
+  return nextState
 }
 
 const SESSION_BACKUP_RESTORE_ANSWER_KEYS = [
@@ -3794,7 +3973,7 @@ async function dbGetLatestSessionBackup(sessionCode = '') {
 function getCriticalAnswerCoverageScore(answers = {}, currentAnswers = null) {
   const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
   const liveAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : null
-  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.reduce((total, key) => {
+  return getSessionBackupRestoreAnswerKeys().reduce((total, key) => {
     if (!hasMeaningfulSessionValue(sourceAnswers[key])) return total
     if (liveAnswers && hasMeaningfulSessionValue(liveAnswers[key])) return total
     return total + 1
@@ -3839,7 +4018,7 @@ function restoreCriticalAnswersFromBackup(currentAnswers = {}, backupAnswers = {
   const sourceAnswers = backupAnswers && typeof backupAnswers === 'object' ? backupAnswers : {}
   let changed = false
 
-  SESSION_BACKUP_RESTORE_ANSWER_KEYS.forEach((key) => {
+  getSessionBackupRestoreAnswerKeys().forEach((key) => {
     if (!hasMeaningfulSessionValue(sourceAnswers[key])) return
     if (hasMeaningfulSessionValue(nextAnswers[key])) return
     nextAnswers[key] = safeJsonClone(sourceAnswers[key])
@@ -3868,13 +4047,13 @@ async function restoreCriticalSessionDataFromBackupIfMissing({ roomCode, state, 
 
 function getMissingCriticalAnswerKeys(answers = {}) {
   const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
-  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.filter((key) => !hasMeaningfulSessionValue(sourceAnswers[key]))
+  return getSessionBackupRestoreAnswerKeys().filter((key) => !hasMeaningfulSessionValue(sourceAnswers[key]))
 }
 
 function getRestorableCriticalAnswerKeys(currentAnswers = {}, backupAnswers = {}) {
   const liveAnswers = currentAnswers && typeof currentAnswers === 'object' ? currentAnswers : {}
   const sourceAnswers = backupAnswers && typeof backupAnswers === 'object' ? backupAnswers : {}
-  return SESSION_BACKUP_RESTORE_ANSWER_KEYS.filter((key) => {
+  return getSessionBackupRestoreAnswerKeys().filter((key) => {
     if (hasMeaningfulSessionValue(liveAnswers[key])) return false
     return hasMeaningfulSessionValue(sourceAnswers[key])
   })
@@ -9386,7 +9565,7 @@ function buildBoldsignExistingFormFieldsFromAnswers(answers = {}, { sentDateLabe
 
   const effectiveInvoiceAmount = Number(context.effectiveInvoiceAmount || 0)
   const discountActive = effectiveInvoiceAmount === 375
-  const redYearsOwedAutofill = '2016-2026'
+  const redYearsOwedAutofill = '2010-2028'
 
   const clientFields = {
     // Client identity
@@ -9536,7 +9715,7 @@ function buildBoldsignResolutionExistingFormFieldsFromAnswers(answers = {}) {
     Enrolled_Agent_Phone: RESOLUTION_EA_PROFILE.phone,
     Tax_Type: 'Income',
     Tax_Form: '1040',
-    Years_Owed: '2016-2026',
+    Years_Owed: '2010-2028',
     Client_Full_Name2: fullName,
     Client_Full_Name4: fullName,
     Client_Last_Name: String(context.lastName || '').trim(),
@@ -10882,6 +11061,7 @@ function buildConsultationSummary(record) {
     profile: record?.consultationProfile || null,
     caseFacts: record?.consultationCaseFacts || null,
     financialProfile: record?.consultationFinancialProfile || null,
+    billingAccount: record?.consultationBillingAccount || null,
     billingRows: record?.consultationBillingRows || [],
     documentReceipts: record?.consultationDocumentReceipts || [],
     notes: record?.consultationNotes || [],
@@ -12426,6 +12606,7 @@ function buildConsultationDetail(record) {
     profile: record?.consultationProfile || null,
     caseFacts: record?.consultationCaseFacts || null,
     financialProfile: record?.consultationFinancialProfile || null,
+    billingAccount: record?.consultationBillingAccount || null,
     billingRows: record?.consultationBillingRows || [],
     documentReceipts: record?.consultationDocumentReceipts || [],
     notes: record?.consultationNotes || [],
@@ -12867,6 +13048,146 @@ function buildClientPortalPaymentMethodRecord(method) {
   return { holder, brand, last4, exp }
 }
 
+function getBillingProjectionPool() {
+  return billingPool || pool || null
+}
+
+function buildBillingAccountProjection({ sessionCode, contactId = '', opportunityId = '', answers = {} } = {}) {
+  const sourceAnswers = answers && typeof answers === 'object' ? answers : {}
+  const billingPaymentMethods = sanitizePaymentMethodList(sourceAnswers.billing_payment_methods)
+  const portalPaymentMethods = sanitizePaymentMethodList(sourceAnswers.client_portal_payment_methods)
+  const billingPaymentMethod = sanitizePaymentMethodRecord(parseStoredObject(sourceAnswers.billing_payment_method, null))
+  const portalPaymentMethod = sanitizePaymentMethodRecord(parseStoredObject(sourceAnswers.client_portal_payment_method, null))
+  return {
+    sessionCode: String(sessionCode || '').trim(),
+    contactId: String(contactId || '').trim(),
+    opportunityId: String(opportunityId || '').trim(),
+    stripeCustomerId: String(sourceAnswers.stripe_customer_id || '').trim(),
+    billingInvoiceAmount: hasMeaningfulSessionValue(sourceAnswers.billing_invoice_amount) ? toNumberValue(sourceAnswers.billing_invoice_amount) : null,
+    billingInvoiceCreatedAt: String(sourceAnswers.billing_invoice_created_at || '').trim(),
+    investigationBillingInvoiceAmount: hasMeaningfulSessionValue(sourceAnswers.investigation_billing_invoice_amount)
+      ? toNumberValue(sourceAnswers.investigation_billing_invoice_amount)
+      : null,
+    investigationBillingInvoiceCreatedAt: String(sourceAnswers.investigation_billing_invoice_created_at || '').trim(),
+    resolutionBillingInvoiceAmount: hasMeaningfulSessionValue(sourceAnswers.resolution_billing_invoice_amount)
+      ? toNumberValue(sourceAnswers.resolution_billing_invoice_amount)
+      : null,
+    resolutionBillingInvoiceCreatedAt: String(sourceAnswers.resolution_billing_invoice_created_at || '').trim(),
+    billingPaymentMethod: billingPaymentMethod || null,
+    billingPaymentMethods,
+    clientPortalPaymentMethod: portalPaymentMethod || null,
+    clientPortalPaymentMethods: portalPaymentMethods,
+    payload: {
+      autoStripeBillingRestoreAt: String(sourceAnswers._auto_stripe_billing_restore_at || '').trim(),
+      autoStripePaymentMethodSyncAt: String(sourceAnswers._auto_stripe_payment_method_sync_at || '').trim(),
+    },
+  }
+}
+
+function hasBillingAccountProjectionData(projection = null) {
+  if (!projection || typeof projection !== 'object') return false
+  return Boolean(
+    String(projection?.stripeCustomerId || '').trim() ||
+      Number.isFinite(Number(projection?.billingInvoiceAmount)) ||
+      Number.isFinite(Number(projection?.investigationBillingInvoiceAmount)) ||
+      Number.isFinite(Number(projection?.resolutionBillingInvoiceAmount)) ||
+      String(projection?.billingInvoiceCreatedAt || '').trim() ||
+      String(projection?.investigationBillingInvoiceCreatedAt || '').trim() ||
+      String(projection?.resolutionBillingInvoiceCreatedAt || '').trim() ||
+      (Array.isArray(projection?.billingPaymentMethods) && projection.billingPaymentMethods.length) ||
+      (Array.isArray(projection?.clientPortalPaymentMethods) && projection.clientPortalPaymentMethods.length) ||
+      (projection?.billingPaymentMethod && typeof projection.billingPaymentMethod === 'object') ||
+      (projection?.clientPortalPaymentMethod && typeof projection.clientPortalPaymentMethod === 'object'),
+  )
+}
+
+async function dbUpsertConsultationBillingAccountProjection({ sessionCode, contactId = '', opportunityId = '', answers, actorEmail = '' } = {}) {
+  const projectionPool = getBillingProjectionPool()
+  const usingPrimaryPool = projectionPool === pool
+  if (!projectionPool || (usingPrimaryPool && isDbCircuitOpen())) {
+    if (STRICT_DB_MODE && usingPrimaryPool) {
+      const error = new Error('Database is temporarily unavailable.')
+      error.isTransientDb = true
+      throw error
+    }
+    return false
+  }
+
+  const projection = buildBillingAccountProjection({ sessionCode, contactId, opportunityId, answers })
+  if (!projection.sessionCode) return false
+  try {
+    await projectionPool.query(
+      `
+      insert into ti_billing_accounts(
+        session_code, ghl_contact_id, ghl_opportunity_id, stripe_customer_id,
+        billing_invoice_amount, billing_invoice_created_at,
+        investigation_billing_invoice_amount, investigation_billing_invoice_created_at,
+        resolution_billing_invoice_amount, resolution_billing_invoice_created_at,
+        billing_payment_method, billing_payment_methods,
+        client_portal_payment_method, client_portal_payment_methods,
+        payload, actor_email
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      on conflict (session_code) do update
+        set ghl_contact_id = excluded.ghl_contact_id,
+            ghl_opportunity_id = excluded.ghl_opportunity_id,
+            stripe_customer_id = excluded.stripe_customer_id,
+            billing_invoice_amount = excluded.billing_invoice_amount,
+            billing_invoice_created_at = excluded.billing_invoice_created_at,
+            investigation_billing_invoice_amount = excluded.investigation_billing_invoice_amount,
+            investigation_billing_invoice_created_at = excluded.investigation_billing_invoice_created_at,
+            resolution_billing_invoice_amount = excluded.resolution_billing_invoice_amount,
+            resolution_billing_invoice_created_at = excluded.resolution_billing_invoice_created_at,
+            billing_payment_method = excluded.billing_payment_method,
+            billing_payment_methods = excluded.billing_payment_methods,
+            client_portal_payment_method = excluded.client_portal_payment_method,
+            client_portal_payment_methods = excluded.client_portal_payment_methods,
+            payload = excluded.payload,
+            actor_email = excluded.actor_email,
+            updated_at = now()
+    `,
+      [
+        projection.sessionCode,
+        projection.contactId || null,
+        projection.opportunityId || null,
+        projection.stripeCustomerId || '',
+        projection.billingInvoiceAmount,
+        projection.billingInvoiceCreatedAt || '',
+        projection.investigationBillingInvoiceAmount,
+        projection.investigationBillingInvoiceCreatedAt || '',
+        projection.resolutionBillingInvoiceAmount,
+        projection.resolutionBillingInvoiceCreatedAt || '',
+        projection.billingPaymentMethod,
+        projection.billingPaymentMethods,
+        projection.clientPortalPaymentMethod,
+        projection.clientPortalPaymentMethods,
+        projection.payload,
+        String(actorEmail || '').trim() || null,
+      ],
+    )
+  } catch (error) {
+    recordDbFailure('ti_billing_accounts sync failed:', error, { sessionCode: projection.sessionCode })
+    if (STRICT_DB_MODE && usingPrimaryPool && isTransientDbConnectionError(error)) {
+      const wrapped = new Error('Database is temporarily unavailable.')
+      wrapped.isTransientDb = true
+      throw wrapped
+    }
+    return false
+  }
+  return true
+}
+
+async function hydrateRoomBillingAnswersFromProjection(roomCode, room) {
+  const normalizedRoomCode = String(roomCode || '').trim()
+  if (!normalizedRoomCode || !room?.state || typeof room.state !== 'object') return room
+  const projection = await dbGetConsultationDurableProjection(normalizedRoomCode)
+  room.state.answers = mergeConsultationDurableProjectionIntoAnswers(room.state.answers || {}, {
+    billingAccount: projection?.billingAccount || null,
+    billingRows: Array.isArray(projection?.billingRows) ? projection.billingRows : [],
+  })
+  return room
+}
+
 async function persistRoomPaymentMethodAnswers(roomCode, room, nextMethods, nextMethod) {
   const portalMethods = nextMethods.map(buildClientPortalPaymentMethodRecord).filter((entry) => entry && (entry.holder || entry.last4))
   const portalMethod = portalMethods[portalMethods.length - 1] || null
@@ -13178,6 +13499,7 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
     const existing = await dbGetSession(code)
     const resolvedCode = String(existing?.session_code || code)
     const nextState = mergeSessionStateForPersistence(existing?.state, state, { code: resolvedCode, source: 'database' })
+    const stateForPrimarySessionStore = stripBillingAnswersForPrimarySessionState(nextState)
     await pool.query(
       `
       insert into ti_sessions(session_code, ghl_contact_id, ghl_opportunity_id, state)
@@ -13188,13 +13510,13 @@ async function dbUpsertSession({ code, contactId = null, opportunityId = null, s
             state = excluded.state,
             updated_at = now()
     `,
-      [resolvedCode, contactId, opportunityId, nextState],
+      [resolvedCode, contactId, opportunityId, stateForPrimarySessionStore],
     )
     await dbInsertSessionBackup({
       sessionCode: resolvedCode,
       contactId: contactId ?? existing?.ghl_contact_id ?? '',
       opportunityId: opportunityId ?? existing?.ghl_opportunity_id ?? '',
-      state: nextState,
+      state: stateForPrimarySessionStore,
       previousState: existing?.state || null,
       reason: 'session_upsert',
     })
@@ -13502,6 +13824,7 @@ async function ensureRoom(code) {
     repControlAt: null,
     lastGhlSyncSignature: '',
   }
+  await hydrateRoomBillingAnswersFromProjection(canonicalCode, room)
   rooms.set(canonicalCode, room)
   return room
 }
@@ -13513,7 +13836,14 @@ async function getSessionStateForCode(code) {
     const variants = Array.from(new Set([normalized, normalized.toUpperCase(), normalized.toLowerCase()])).filter(Boolean)
     for (const candidate of variants) {
       const row = await dbGetSession(candidate)
-      if (row?.state) return row.state
+      if (row?.state) {
+        const projection = await dbGetConsultationDurableProjection(String(row?.session_code || candidate || '').trim())
+        const hydratedAnswers = mergeConsultationDurableProjectionIntoAnswers(row.state?.answers || {}, {
+          billingAccount: projection?.billingAccount || null,
+          billingRows: projection?.billingRows || [],
+        })
+        return { ...row.state, answers: hydratedAnswers }
+      }
     }
     return null
   }
@@ -13882,6 +14212,7 @@ async function listConsultationRecords({ search = '', limit = 100 } = {}) {
         consultationProfile: durableProjectionMap.get(String(row.session_code || ''))?.profile || null,
         consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
+        consultationBillingAccount: durableProjectionMap.get(String(row.session_code || ''))?.billingAccount || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
         consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
         consultationNotes: durableProjectionMap.get(String(row.session_code || ''))?.notes || [],
@@ -13970,6 +14301,7 @@ async function getConsultationRecordByCode(code) {
       consultationProfile: durableProjection?.profile || null,
       consultationCaseFacts: durableProjection?.caseFacts || null,
       consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingAccount: durableProjection?.billingAccount || null,
       consultationBillingRows: durableProjection?.billingRows || [],
       consultationDocumentReceipts: durableProjection?.documentReceipts || [],
       consultationNotes: durableProjection?.notes || [],
@@ -14083,6 +14415,7 @@ app.get('/api/admin/diagnostics/data', async (req, res) => {
 app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
+    const billingProjectionPool = getBillingProjectionPool()
     const diagnostics = {
       at: new Date().toISOString(),
       dbReady: Boolean(pool) && !isDbCircuitOpen(),
@@ -14104,14 +14437,12 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
     if (!pool) return res.status(503).json({ error: 'Database is not configured.', diagnostics })
     if (isDbCircuitOpen()) return res.status(503).json({ error: 'Database temporarily unavailable.', reason: 'db_circuit_open', diagnostics })
 
-    const [countsRes, sampleRes] = await Promise.all([
+    const [countsRes, billingCountsRes, sampleRes] = await Promise.all([
       pool.query(
         `select
             (select count(*)::int from ti_sessions) as session_count,
             (select count(*)::int from ti_consultation_profiles) as profile_projection_count,
             (select count(*)::int from ti_consultation_case_facts) as case_facts_projection_count,
-            (select count(*)::int from ti_billing_schedule_rows) as billing_projection_row_count,
-            (select count(distinct session_code)::int from ti_billing_schedule_rows) as sessions_with_billing_projection_count,
             (select count(*)::int from ti_document_receipts) as document_receipt_projection_count,
             (select count(distinct session_code)::int from ti_document_receipts) as sessions_with_document_receipt_projection_count,
             (
@@ -14140,6 +14471,13 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
               where p.session_code is null or c.session_code is null
             ) as missing_either_count`,
       ),
+      billingProjectionPool
+        ? billingProjectionPool.query(
+            `select
+                (select count(*)::int from ti_billing_schedule_rows) as billing_projection_row_count,
+                (select count(distinct session_code)::int from ti_billing_schedule_rows) as sessions_with_billing_projection_count`,
+          )
+        : Promise.resolve({ rows: [{ billing_projection_row_count: 0, sessions_with_billing_projection_count: 0 }] }),
       pool.query(
         `select s.session_code
            from ti_sessions s
@@ -14154,8 +14492,8 @@ app.get('/api/admin/diagnostics/durable-fields', async (req, res) => {
     diagnostics.sessionCount = countsRes.rows?.[0]?.session_count ?? 0
     diagnostics.profileProjectionCount = countsRes.rows?.[0]?.profile_projection_count ?? 0
     diagnostics.caseFactsProjectionCount = countsRes.rows?.[0]?.case_facts_projection_count ?? 0
-    diagnostics.billingProjectionRowCount = countsRes.rows?.[0]?.billing_projection_row_count ?? 0
-    diagnostics.sessionsWithBillingProjectionCount = countsRes.rows?.[0]?.sessions_with_billing_projection_count ?? 0
+    diagnostics.billingProjectionRowCount = billingCountsRes.rows?.[0]?.billing_projection_row_count ?? 0
+    diagnostics.sessionsWithBillingProjectionCount = billingCountsRes.rows?.[0]?.sessions_with_billing_projection_count ?? 0
     diagnostics.documentReceiptProjectionCount = countsRes.rows?.[0]?.document_receipt_projection_count ?? 0
     diagnostics.sessionsWithDocumentReceiptProjectionCount = countsRes.rows?.[0]?.sessions_with_document_receipt_projection_count ?? 0
     diagnostics.fullyProjectedCount = countsRes.rows?.[0]?.fully_projected_count ?? 0
@@ -14427,6 +14765,7 @@ app.post('/api/admin/canopy/backfill-active-clients', async (req, res) => {
 app.get('/api/admin/diagnostics/revenue-integrity', async (req, res) => {
   if (!requireAdminAccess(req, res)) return
   try {
+    const billingProjectionPool = getBillingProjectionPool()
     const diagnostics = {
       at: new Date().toISOString(),
       dbReady: Boolean(pool) && !isDbCircuitOpen(),
@@ -14461,12 +14800,14 @@ app.get('/api/admin/diagnostics/revenue-integrity', async (req, res) => {
           limit $1`,
         [CONSULTATION_DURABLE_PROJECTION_BACKFILL_STARTUP_LIMIT],
       ),
-      pool.query(
-        `select session_code, payload
-           from ti_billing_schedule_rows
-          where billing_scope = 'all'
-          order by session_code asc, scheduled_date asc nulls last, updated_at desc, id asc`,
-      ),
+      billingProjectionPool
+        ? billingProjectionPool.query(
+            `select session_code, payload
+               from ti_billing_schedule_rows
+              where billing_scope = 'all'
+              order by session_code asc, scheduled_date asc nulls last, updated_at desc, id asc`,
+          )
+        : Promise.resolve({ rows: [] }),
     ])
 
     const sessionRows = Array.isArray(sessionsRes.rows) ? sessionsRes.rows : []
@@ -14877,6 +15218,7 @@ app.get('/api/admin/consultations/:code', async (req, res) => {
       consultationProfile: durableProjection?.profile || null,
       consultationCaseFacts: durableProjection?.caseFacts || null,
       consultationFinancialProfile: durableProjection?.financialProfile || null,
+      consultationBillingAccount: durableProjection?.billingAccount || null,
       consultationBillingRows: durableProjection?.billingRows || [],
       consultationDocumentReceipts: durableProjection?.documentReceipts || [],
       consultationNotes: durableProjection?.notes || [],
@@ -15585,6 +15927,7 @@ app.patch('/api/admin/consultations/:code/billing', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
 
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const billingMode = String(req.body?.billingMode || '').trim().toLowerCase() === 'resolution' ? 'resolution' : 'investigation'
     const invoiceAmountFieldKey = billingMode === 'resolution' ? 'resolution_billing_invoice_amount' : 'investigation_billing_invoice_amount'
     const invoiceCreatedAtFieldKey = billingMode === 'resolution' ? 'resolution_billing_invoice_created_at' : 'investigation_billing_invoice_created_at'
@@ -15690,6 +16033,7 @@ app.post('/api/admin/consultations/:code/billing/mark-processed', async (req, re
     }
 
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const nowIso = new Date().toISOString()
     const actorEmail = String(req.adminUser?.email || '')
 
@@ -15806,6 +16150,7 @@ app.post('/api/admin/consultations/:code/billing/record-manual-payment', async (
     }
 
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const nowIso = new Date().toISOString()
     const actorEmail = String(req.adminUser?.email || '')
 
@@ -15931,6 +16276,7 @@ app.post('/api/admin/consultations/:code/stripe/setup-intent', async (req, res) 
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
     const requestedType = String(req.body?.paymentMethodType || 'card').trim().toLowerCase()
     const paymentMethodType = requestedType === 'us_bank_account' || requestedType === 'ach' ? 'us_bank_account' : 'card'
@@ -15976,6 +16322,7 @@ app.post('/api/admin/consultations/:code/stripe/payment-methods', async (req, re
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     let customerId = await ensureStripeCustomerForRoom(roomCode, room)
     let setupIntentCustomerId = ''
     if (setupIntentId) {
@@ -16050,6 +16397,7 @@ app.post('/api/admin/consultations/:code/stripe/sync-payment-methods', async (re
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
 
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
 
     const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods)
@@ -16108,6 +16456,7 @@ app.post('/api/admin/consultations/:code/stripe/restore-billing', async (req, re
     const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
 
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
 
     // Prefer the persisted customer id so we don't accidentally create a new customer (which would have no history).
     let customerId = String(room?.state?.answers?.stripe_customer_id || '').trim()
@@ -16265,6 +16614,7 @@ app.post('/api/admin/consultations/:code/stripe/link-stored-card', async (req, r
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const storedMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods)
     const requestedIndexRaw = Number(req.body?.methodIndex)
     const requestedIndex = Number.isInteger(requestedIndexRaw) ? requestedIndexRaw : -1
@@ -16302,6 +16652,7 @@ app.delete('/api/admin/consultations/:code/payment-methods/:paymentMethodId', as
     if (!roomCode) return res.status(400).json({ error: 'Consultation code is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const existingMethods = parseStoredPaymentMethods(room.state.answers.billing_payment_methods)
     const nextMethods = existingMethods.filter((entry) => String(entry?.stripePaymentMethodId || '') !== paymentMethodId)
     const nextMethod = nextMethods.at(-1) || ''
@@ -16333,6 +16684,7 @@ app.post('/api/session/:code/stripe/setup-intent', async (req, res) => {
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const customerId = await ensureStripeCustomerForRoom(roomCode, room)
     const requestedType = String(req.body?.paymentMethodType || 'card').trim().toLowerCase()
     const paymentMethodType = requestedType === 'us_bank_account' || requestedType === 'ach' ? 'us_bank_account' : 'card'
@@ -16377,6 +16729,7 @@ app.post('/api/session/:code/stripe/payment-methods', async (req, res) => {
     if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     let customerId = await ensureStripeCustomerForRoom(roomCode, room)
     let setupIntentCustomerId = ''
 
@@ -16420,6 +16773,7 @@ app.post('/api/session/:code/stripe/link-card', async (req, res) => {
     const roomCode = String(req.params.code || '').trim()
     if (!roomCode) return res.status(400).json({ error: 'Session code is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const cardholderName = String(req.body?.cardholderName || room.state.answers.payment_cardholder_name || room.state.answers.full_name || room.state.answers.name || '').trim()
     const cardNumber = String(req.body?.cardNumber || '').trim()
     const expiration = String(req.body?.expiration || '').trim()
@@ -16512,6 +16866,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     if (!Number.isInteger(scheduleIndex) || scheduleIndex < 0) return res.status(400).json({ error: 'A valid scheduleIndex is required' })
     if (!paymentMethodId) return res.status(400).json({ error: 'paymentMethodId is required' })
     const room = await ensureRoom(roomCode)
+    await hydrateRoomBillingAnswersFromProjection(roomCode, room)
     const cancellationStatus = String(room?.state?.answers?.cancellation_request_status || '').trim().toLowerCase()
     if (hasActiveCancellationRequestStatus(cancellationStatus)) {
       return res.status(409).json({ error: 'This record is marked as requesting cancellation. Payments are disabled.' })
@@ -16700,6 +17055,7 @@ app.post('/api/admin/consultations/:code/run-payment', async (req, res) => {
     if (roomCode && Number.isInteger(scheduleIndex) && scheduleIndex >= 0) {
       try {
         const room = await ensureRoom(roomCode)
+        await hydrateRoomBillingAnswersFromProjection(roomCode, room)
         const scheduleFieldKey = billingMode === 'resolution' ? 'resolution_billing_schedule' : 'investigation_billing_schedule'
         const parseScheduleValue = (value) => {
           if (Array.isArray(value)) return value
@@ -18083,6 +18439,7 @@ async function listAllConsultationDetails() {
         consultationProfile: durableProjectionMap.get(String(row.session_code || ''))?.profile || null,
         consultationCaseFacts: durableProjectionMap.get(String(row.session_code || ''))?.caseFacts || null,
         consultationFinancialProfile: durableProjectionMap.get(String(row.session_code || ''))?.financialProfile || null,
+        consultationBillingAccount: durableProjectionMap.get(String(row.session_code || ''))?.billingAccount || null,
         consultationBillingRows: durableProjectionMap.get(String(row.session_code || ''))?.billingRows || [],
         consultationDocumentReceipts: durableProjectionMap.get(String(row.session_code || ''))?.documentReceipts || [],
         consultationNotes: durableProjectionMap.get(String(row.session_code || ''))?.notes || [],

@@ -15,6 +15,7 @@ const FULL_TABLE_SPECS = [
   { name: 'ti_document_receipts', orderBy: 'updated_at desc' },
   { name: 'ti_consultation_profiles', orderBy: 'updated_at desc' },
   { name: 'ti_consultation_case_facts', orderBy: 'updated_at desc' },
+  { name: 'ti_billing_accounts', orderBy: 'updated_at desc' },
   { name: 'ti_billing_schedule_rows', orderBy: 'updated_at desc' },
   { name: 'ti_consultation_financial_profiles', orderBy: 'updated_at desc' },
   { name: 'ti_canopy_client_sync', orderBy: 'updated_at desc' },
@@ -28,12 +29,18 @@ const HISTORY_TABLE_SPECS = [
   { name: 'ti_canopy_sync_jobs', dateColumn: 'updated_at', orderBy: 'updated_at desc' },
 ]
 
+const BILLING_TABLE_NAMES = new Set(['ti_billing_accounts', 'ti_billing_schedule_rows', 'ti_billing_audit'])
+
 function requiredEnv(name) {
   const value = String(process.env[name] || '').trim()
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`)
   }
   return value
+}
+
+function optionalEnv(name) {
+  return String(process.env[name] || '').trim()
 }
 
 function optionalIntEnv(name, fallback) {
@@ -148,11 +155,13 @@ async function writeLocalCopy(archiveKey, payloadBuffer) {
 async function main() {
   const PROD_DATABASE_URL = requiredEnv('PROD_DATABASE_URL')
   const RECOVERY_DATABASE_URL = requiredEnv('RECOVERY_DATABASE_URL')
+  const BILLING_DATABASE_URL = optionalEnv('BILLING_DATABASE_URL')
   const BACKUP_ARCHIVE_HISTORY_DAYS = optionalIntEnv('BACKUP_ARCHIVE_HISTORY_DAYS', 45)
   const BACKUP_ARCHIVE_RETENTION_DAYS = optionalIntEnv('BACKUP_ARCHIVE_RETENTION_DAYS', 30)
   const BACKUP_ARCHIVE_REASON = String(process.env.BACKUP_ARCHIVE_REASON || 'scheduled_archive').trim() || 'scheduled_archive'
 
   const prodPool = new Pool({ connectionString: PROD_DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  const billingPool = BILLING_DATABASE_URL ? new Pool({ connectionString: BILLING_DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null
   const recoveryPool = new Pool({ connectionString: RECOVERY_DATABASE_URL, ssl: { rejectUnauthorized: false } })
 
   let backupRunId = 0
@@ -174,24 +183,31 @@ async function main() {
     backupRunId = Number(runInsert.rows?.[0]?.id || 0)
 
     const sourceIdentity = await getSourceIdentity(prodPool)
+    const billingSourceIdentity = billingPool ? await getSourceIdentity(billingPool) : null
     const tablePayload = {}
     const tableManifest = {}
     const exportStartedAt = new Date().toISOString()
 
     for (const spec of [...FULL_TABLE_SPECS, ...HISTORY_TABLE_SPECS]) {
+      const sourcePool = BILLING_TABLE_NAMES.has(spec.name) && billingPool ? billingPool : prodPool
+      const sourceRole = BILLING_TABLE_NAMES.has(spec.name) && billingPool ? 'billing' : 'primary'
+      const sourceMeta = sourceRole === 'billing' && billingSourceIdentity ? billingSourceIdentity : sourceIdentity
       const startedAt = Date.now()
-      const { rows, exported, reason } = await fetchTableRows(prodPool, spec, BACKUP_ARCHIVE_HISTORY_DAYS)
+      const { rows, exported, reason } = await fetchTableRows(sourcePool, spec, BACKUP_ARCHIVE_HISTORY_DAYS)
       const encodedRows = JSON.stringify(rows)
       tablePayload[spec.name] = rows
       tableManifest[spec.name] = {
         rowCount: rows.length,
         exported,
         reason,
+        sourceRole,
+        sourceDatabase: String(sourceMeta?.database_name || ''),
+        sourceHost: String(sourceMeta?.host || ''),
         historyWindowDays: spec.dateColumn ? BACKUP_ARCHIVE_HISTORY_DAYS : null,
         checksum: sha256(encodedRows),
         durationMs: Date.now() - startedAt,
       }
-      console.log(`[backup] ${spec.name}: ${rows.length} rows`)
+      console.log(`[backup] ${spec.name} (${sourceRole}): ${rows.length} rows`)
     }
 
     const payload = {
@@ -201,9 +217,18 @@ async function main() {
       exportedAt: new Date().toISOString(),
       exportStartedAt,
       source: {
-        database: String(sourceIdentity.database_name || ''),
-        host: String(sourceIdentity.host || ''),
-        serverVersion: String(sourceIdentity.server_version || ''),
+        primary: {
+          database: String(sourceIdentity.database_name || ''),
+          host: String(sourceIdentity.host || ''),
+          serverVersion: String(sourceIdentity.server_version || ''),
+        },
+        billing: billingSourceIdentity
+          ? {
+              database: String(billingSourceIdentity.database_name || ''),
+              host: String(billingSourceIdentity.host || ''),
+              serverVersion: String(billingSourceIdentity.server_version || ''),
+            }
+          : null,
       },
       tables: tablePayload,
     }
@@ -238,8 +263,8 @@ async function main() {
       `,
       [
         archiveKey,
-        String(payload.source.database || ''),
-        String(payload.source.host || ''),
+        String(payload.source.primary?.database || ''),
+        String(payload.source.primary?.host || ''),
         BACKUP_ARCHIVE_REASON,
         'v1',
         manifest,
@@ -301,7 +326,7 @@ async function main() {
     console.error('[backup] archive failed:', error)
     process.exitCode = 1
   } finally {
-    await Promise.allSettled([prodPool.end(), recoveryPool.end()])
+    await Promise.allSettled([prodPool.end(), billingPool ? billingPool.end() : Promise.resolve(), recoveryPool.end()])
   }
 }
 

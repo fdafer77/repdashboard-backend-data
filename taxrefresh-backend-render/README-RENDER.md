@@ -20,13 +20,15 @@ This package contains the Node backend needed by:
 This backend now uses three durability layers:
 
 1. Primary Postgres (`DATABASE_URL`) for live application state.
-2. Append-only internal backup and audit tables in the primary database:
+2. Optional dedicated live billing Postgres (`BILLING_DATABASE_URL`) for billing schedules, saved payment methods, invoice amounts, and billing audit history.
+3. Append-only internal backup and audit tables in the primary database:
    - `ti_session_backups`
    - `ti_billing_audit`
    - `ti_events`
-3. A separate recovery Postgres that receives compressed full-table archives on a schedule.
+4. A separate recovery Postgres that receives compressed full-table archives on a schedule.
 
 The goal is that the app keeps running off the primary database, while recovery archives live in a second database that is not part of the normal request path.
+When `BILLING_DATABASE_URL` is set, the billing workbench reads and writes its durable billing state from that separate database while the dashboard database keeps the broader consultation state.
 
 ## Before deploying
 
@@ -101,6 +103,7 @@ Canopy OAuth, when you want the backend to hold a saved bearer token from Canopy
 These are already set in `render.yaml`:
 
 - `DATABASE_URL` from the Render Postgres instance
+- `BILLING_DATABASE_URL` if you wire a dedicated live billing database manually in Render
 - `RECOVERY_DATABASE_URL` from the recovery Render Postgres instance
 - `DB_SSL=1`
 - `CLIENT_ORIGIN=https://taxrefreshdashboard.com,https://taxrefresh-auth.com,https://secure.taxrefresh.us`
@@ -252,6 +255,8 @@ BACKUP_ARCHIVE_KEY=backup-2026-10-30T17-00-00-000Z-abcd1234 npm run backup:downl
 
 Optional environment values for local backup work:
 
+- `PROD_DATABASE_URL`
+- `BILLING_DATABASE_URL`
 - `RECOVERY_DATABASE_URL`
 - `BACKUP_ARCHIVE_HISTORY_DAYS`
 - `BACKUP_ARCHIVE_RETENTION_DAYS`
@@ -263,9 +268,11 @@ Optional environment values for local backup work:
 
 Each scheduled archive stores:
 
-- full current-state tables like `ti_sessions`, `ti_billing_schedule_rows`, profile tables, notes, receipts, and financial profiles
+- full current-state tables like `ti_sessions`, `ti_billing_accounts`, `ti_billing_schedule_rows`, profile tables, notes, receipts, and financial profiles
 - recent append-only history from `ti_session_backups`, `ti_billing_audit`, and `ti_events`
 - a manifest with row counts, checksums, and gzip size
+
+When `BILLING_DATABASE_URL` is present, the archive job automatically reads billing tables from the billing database and everything else from the primary dashboard database.
 
 Archives are written to the recovery database in `ti_backup_archives`, and each cron execution is tracked in `ti_backup_runs`.
 
